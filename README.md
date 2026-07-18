@@ -97,6 +97,10 @@ Writable opens use copy-on-write files under the repository's private `.dfs/stag
 
 DFS preserves the mounted file's visible inode and timestamps while git-annex replaces the published regular file with its internal symlink. This prevents editors such as Vim from reporting a false external change during save.
 
+### Concurrent changes
+
+Peers may commit while disconnected. After they reconnect, concurrent edits retain both contents using deterministic `.variant-*` names; a modification concurrent with deletion is retained as a variant, and competing rename/move destinations are both kept. DFS disables Git's heuristic rename pairing during synchronization so independent operations on different paths with identical annex content cannot be mistaken for one another and discard a valid version. Repeated synchronization reaches the same Git tree on every peer.
+
 Mount startup holds an exclusive repository session and performs conservative recovery before exposing the filesystem. Interrupted write payloads, legacy staging files, partial annex transfers, and stale Git index locks are moved under `.dfs/recovery/<timestamp>/`; the last published destination is left untouched. Durable transaction manifests let DFS remove only proven empty placeholders from interrupted creates and recognize writes whose atomic rename completed before a crash. Pending Git index changes are committed, then Git and git-annex receive fast consistency checks. In-progress merges, rebases, cherry-picks, reverts, and bisects are copied to the recovery directory and block mounting for manual resolution rather than being destructively reset.
 
 ### Mount logging and debugging
@@ -218,7 +222,7 @@ make test
 make test-integration  # mounts a temporary FUSE filesystem
 ```
 
-The normal test suite includes a real two-peer Git/git-annex flow. The integration target additionally verifies copy-on-write publication, no-op writable opens, multiple writable handles, stable visible metadata across annex sync, and repeated Vim saves through a real FUSE mount.
+The normal test suite includes real two-peer Git/git-annex flows for connected operations, disconnected edit/edit, rename/move, modify/delete, identical-content edge cases, retained content, and stable tree convergence. The integration target additionally verifies copy-on-write publication, no-op writable opens, multiple writable handles, stable visible metadata across annex sync, and repeated Vim saves through a real FUSE mount.
 
 ## License
 

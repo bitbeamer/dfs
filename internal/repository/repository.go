@@ -207,7 +207,10 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 	if _, err := r.commitPendingLocked(ctx, "Synchronize local changes"); err != nil {
 		return err
 	}
-	args := []string{"annex", "sync"}
+	// A DFS move is committed as an add/delete pair. Disable Git's heuristic
+	// rename pairing during merges so concurrent operations on different paths
+	// with identical content cannot be cross-paired and lose a valid version.
+	args := []string{"-c", "merge.renames=false", "annex", "sync"}
 	if metadataOnly {
 		args = append(args, "--no-content")
 	}
