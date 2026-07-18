@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -33,7 +34,7 @@ func TestUnmountFailureDoesNotWaitForServe(t *testing.T) {
 
 func TestPrepareMountpointCreatesMissingDirectory(t *testing.T) {
 	mountpoint := filepath.Join(t.TempDir(), "nested", "mount")
-	if err := prepareMountpoint(mountpoint); err != nil {
+	if _, err := prepareMountpoint(mountpoint); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(mountpoint)
@@ -46,7 +47,7 @@ func TestPrepareMountpointCreatesMissingDirectory(t *testing.T) {
 }
 
 func TestPrepareMountpointAcceptsExistingDirectory(t *testing.T) {
-	if err := prepareMountpoint(t.TempDir()); err != nil {
+	if _, err := prepareMountpoint(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -56,7 +57,7 @@ func TestPrepareMountpointRejectsFile(t *testing.T) {
 	if err := os.WriteFile(mountpoint, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := prepareMountpoint(mountpoint)
+	_, err := prepareMountpoint(mountpoint)
 	if err == nil || !strings.Contains(err.Error(), "is not a directory") {
 		t.Fatalf("prepareMountpoint() error = %v, want not-a-directory error", err)
 	}
@@ -67,8 +68,47 @@ func TestPrepareMountpointExplainsInaccessibleMount(t *testing.T) {
 	if err := os.Symlink("loop", mountpoint); err != nil {
 		t.Fatal(err)
 	}
-	err := prepareMountpoint(mountpoint)
+	_, err := prepareMountpoint(mountpoint)
 	if err == nil || !strings.Contains(err.Error(), "unmount any stale DFS/FUSE mount") {
 		t.Fatalf("prepareMountpoint() error = %v, want stale-mount guidance", err)
+	}
+}
+
+func TestPrepareMountpointDetachesStaleFuseMount(t *testing.T) {
+	mountpoint := "/stale/mount"
+	directory := t.TempDir()
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statCalls := 0
+	cleanupCalls := 0
+	access := mountpointAccess{
+		stat: func(path string) (os.FileInfo, error) {
+			statCalls++
+			if statCalls == 1 {
+				return nil, &os.PathError{Op: "stat", Path: path, Err: syscall.ENOTCONN}
+			}
+			return info, nil
+		},
+		mkdirAll: os.MkdirAll,
+		clearStale: func(path string) error {
+			cleanupCalls++
+			if path != mountpoint {
+				t.Fatalf("clearStale() path = %q, want %q", path, mountpoint)
+			}
+			return nil
+		},
+	}
+
+	cleared, err := prepareMountpointWithAccess(mountpoint, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared {
+		t.Fatal("prepareMountpointWithAccess() did not report stale mount cleanup")
+	}
+	if cleanupCalls != 1 || statCalls != 2 {
+		t.Fatalf("cleanup calls = %d, stat calls = %d; want 1 and 2", cleanupCalls, statCalls)
 	}
 }

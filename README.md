@@ -89,7 +89,7 @@ mv ~/DFS/Documents/report.pdf ~/DFS/Archive/
 rm ~/DFS/Archive/old.pdf
 ```
 
-The mount process runs automatic metadata sync after completed transactions and every 30 seconds. Keep it running in a terminal for the MVP. Press Ctrl-C to cleanly unmount and stop it, or use `dfs unmount ~/DFS` from another terminal. SIGTERM uses the same clean shutdown path.
+The mount process runs automatic metadata sync after completed transactions and every 30 seconds. Keep it running in a terminal for the MVP. Press Ctrl-C to cleanly unmount and stop it, or use `dfs unmount ~/DFS` from another terminal. SIGTERM uses the same clean shutdown path. A later `dfs mount` automatically detaches a disconnected DFS/FUSE endpoint left behind by a crashed process; it does not replace a healthy existing mount.
 
 ### Transactional writes
 

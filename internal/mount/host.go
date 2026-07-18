@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/repository"
@@ -28,6 +30,12 @@ type fuseLogWriter struct{ logger *slog.Logger }
 
 type unmountServer interface {
 	Unmount() error
+}
+
+type mountpointAccess struct {
+	stat       func(string) (os.FileInfo, error)
+	mkdirAll   func(string, os.FileMode) error
+	clearStale func(string) error
 }
 
 func (w fuseLogWriter) Write(p []byte) (int, error) {
@@ -56,9 +64,13 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 		"cache_limit_bytes", repo.Config.CacheLimit,
 		"fuse_debug", options.FUSEDebug,
 	)
-	if err := prepareMountpoint(mountpoint); err != nil {
+	clearedStale, err := prepareMountpoint(mountpoint)
+	if err != nil {
 		logger.Error("creating mountpoint failed", "mountpoint", mountpoint, "error", err)
 		return err
+	}
+	if clearedStale {
+		logger.Info("stale mountpoint detached", "mountpoint", mountpoint)
 	}
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
 	scheduler.Start()
@@ -118,34 +130,70 @@ func unmountAndWait(server unmountServer, serveDone <-chan struct{}) error {
 	return nil
 }
 
-func prepareMountpoint(mountpoint string) error {
-	info, err := os.Stat(mountpoint)
+func prepareMountpoint(mountpoint string) (bool, error) {
+	return prepareMountpointWithAccess(mountpoint, mountpointAccess{
+		stat:       os.Stat,
+		mkdirAll:   os.MkdirAll,
+		clearStale: clearStaleMount,
+	})
+}
+
+func prepareMountpointWithAccess(mountpoint string, access mountpointAccess) (bool, error) {
+	info, err := access.stat(mountpoint)
+	clearedStale := false
+	if errors.Is(err, syscall.ENOTCONN) {
+		if cleanupErr := access.clearStale(mountpoint); cleanupErr != nil {
+			return false, fmt.Errorf("detach stale mountpoint %s: %w", mountpoint, cleanupErr)
+		}
+		clearedStale = true
+		info, err = access.stat(mountpoint)
+	}
 	if err == nil {
 		if !info.IsDir() {
-			return fmt.Errorf("mountpoint %s exists but is not a directory", mountpoint)
+			return clearedStale, fmt.Errorf("mountpoint %s exists but is not a directory", mountpoint)
 		}
-		return nil
+		return clearedStale, nil
 	}
 	if !os.IsNotExist(err) {
-		return fmt.Errorf("mountpoint %s is inaccessible: %w; unmount any stale DFS/FUSE mount before retrying", mountpoint, err)
+		return clearedStale, fmt.Errorf("mountpoint %s is inaccessible: %w; unmount any stale DFS/FUSE mount before retrying", mountpoint, err)
 	}
-	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
-		return fmt.Errorf("create mountpoint %s: %w", mountpoint, err)
+	if err := access.mkdirAll(mountpoint, 0o755); err != nil {
+		return clearedStale, fmt.Errorf("create mountpoint %s: %w", mountpoint, err)
 	}
-	return nil
+	return clearedStale, nil
 }
 
 func Unmount(mountpoint string) error {
+	return runUnmount(mountpoint, false)
+}
+
+func clearStaleMount(mountpoint string) error {
+	return runUnmount(mountpoint, true)
+}
+
+func runUnmount(mountpoint string, stale bool) error {
 	var command string
 	var args []string
 	if runtime.GOOS == "darwin" {
-		command, args = "umount", []string{mountpoint}
+		args = []string{mountpoint}
+		if stale {
+			args = append([]string{"-f"}, args...)
+		}
+		command = "umount"
 	} else {
-		command, args = "fusermount3", []string{"-u", mountpoint}
+		option := "-u"
+		if stale {
+			option = "-uz"
+		}
+		command, args = "fusermount3", []string{option, mountpoint}
 	}
 	output, err := exec.Command(command, args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("unmount %s: %s", mountpoint, string(output))
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("unmount %s: %s", mountpoint, detail)
 	}
 	return nil
 }
