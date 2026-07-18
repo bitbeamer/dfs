@@ -55,8 +55,11 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	}
 	defer mountLog.Close()
 	logger := slog.New(slog.NewTextHandler(mountLog, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	mountContext, cancelMount := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- dfsmount.Run(repo, mountpoint, dfsmount.Options{Logger: logger}) }()
+	go func() {
+		errCh <- dfsmount.Run(repo, mountpoint, dfsmount.Options{Context: mountContext, Logger: logger})
+	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(filepath.Join(mountpoint, ".gitignore")); err == nil {
@@ -68,7 +71,7 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	defer func() {
-		_ = dfsmount.Unmount(mountpoint)
+		cancelMount()
 		select {
 		case err := <-errCh:
 			if err != nil {
@@ -76,6 +79,16 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Error("mount did not stop")
+		}
+		logContent, err := os.ReadFile(mountLogPath)
+		if err != nil {
+			t.Errorf("read mount log after shutdown: %v", err)
+			return
+		}
+		for _, expected := range []string{"msg=\"shutdown requested\"", "msg=\"mount stopped\"", "reason=shutdown"} {
+			if !strings.Contains(string(logContent), expected) {
+				t.Errorf("mount shutdown log does not contain %q:\n%s", expected, logContent)
+			}
 		}
 	}()
 	file, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_CREATE|os.O_WRONLY, 0o644)
