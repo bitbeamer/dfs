@@ -267,8 +267,9 @@ func (a *App) mountCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use: "mount <mountpoint>", Args: cobra.ExactArgs(1), Short: "Mount the DFS namespace and run automatic sync",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			mountContext, stopSignals := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-			defer stopSignals()
+			mountSignals := make(chan os.Signal, 2)
+			signal.Notify(mountSignals, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(mountSignals)
 			logger, closer, err := newMountLogger(logLevel, logFile, a.Err, fuseDebug)
 			if err != nil {
 				return err
@@ -284,7 +285,7 @@ func (a *App) mountCommand() *cobra.Command {
 			defer repo.Close()
 			fmt.Fprintf(a.Out, "Mounting %s at %s; press Ctrl-C to stop\n", repo.Config.Repository, args[0])
 			return dfsmount.Run(repo, args[0], dfsmount.Options{
-				Context: mountContext, Logger: logger, FUSEDebug: fuseDebug,
+				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug, Signals: mountSignals,
 			})
 		},
 	}

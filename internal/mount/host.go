@@ -24,6 +24,7 @@ type Options struct {
 	Context   context.Context
 	Logger    *slog.Logger
 	FUSEDebug bool
+	Signals   <-chan os.Signal
 }
 
 type fuseLogWriter struct{ logger *slog.Logger }
@@ -114,9 +115,9 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 		server.Serve()
 		close(serveDone)
 	}()
-	select {
-	case <-ctx.Done():
-		logger.Info("shutdown requested", "reason", ctx.Err())
+	shutdown, shutdownReason := waitForMountStop(ctx, options.Signals, serveDone)
+	if shutdown {
+		logger.Info("shutdown requested", "reason", shutdownReason)
 		if err := unmountAndWait(server, serveDone, func() error { return forceUnmount(mountpoint) }, normalUnmountGrace); err != nil {
 			logger.Error("automatic unmount failed",
 				"mountpoint", mountpoint,
@@ -125,10 +126,20 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 			)
 			return fmt.Errorf("unmount DFS at %s during shutdown: %w", mountpoint, err)
 		}
-	case <-serveDone:
 	}
 	logger.Info("mount stopped", "mountpoint", mountpoint)
 	return nil
+}
+
+func waitForMountStop(ctx context.Context, signals <-chan os.Signal, serveDone <-chan struct{}) (bool, any) {
+	select {
+	case <-ctx.Done():
+		return true, ctx.Err()
+	case received := <-signals:
+		return true, received
+	case <-serveDone:
+		return false, nil
+	}
 }
 
 func unmountAndWait(server unmountServer, serveDone <-chan struct{}, force func() error, grace time.Duration) error {

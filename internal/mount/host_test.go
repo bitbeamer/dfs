@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -19,6 +20,15 @@ type blockingUnmountServer struct{ release <-chan struct{} }
 func (s blockingUnmountServer) Unmount() error {
 	<-s.release
 	return nil
+}
+
+func TestMountStopReceivesRawSignal(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	signals <- os.Interrupt
+	shutdown, reason := waitForMountStop(context.Background(), signals, make(chan struct{}))
+	if !shutdown || reason != os.Interrupt {
+		t.Fatalf("waitForMountStop() = (%v, %v), want signal shutdown", shutdown, reason)
+	}
 }
 
 func TestUnmountFallsBackToForcedDetach(t *testing.T) {
