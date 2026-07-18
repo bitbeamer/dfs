@@ -14,21 +14,62 @@ type failingUnmountServer struct{ err error }
 
 func (s failingUnmountServer) Unmount() error { return s.err }
 
-func TestUnmountFailureDoesNotWaitForServe(t *testing.T) {
-	wantErr := errors.New("mount is busy")
+type blockingUnmountServer struct{ release <-chan struct{} }
+
+func (s blockingUnmountServer) Unmount() error {
+	<-s.release
+	return nil
+}
+
+func TestUnmountFallsBackToForcedDetach(t *testing.T) {
+	serveDone := make(chan struct{})
+	close(serveDone)
+	forceCalls := 0
+	err := unmountAndWait(failingUnmountServer{err: errors.New("mount is busy")}, serveDone, func() error {
+		forceCalls++
+		return nil
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forceCalls != 1 {
+		t.Fatalf("forced detach calls = %d, want 1", forceCalls)
+	}
+}
+
+func TestUnmountDoubleFailureDoesNotWaitForServe(t *testing.T) {
+	normalErr := errors.New("mount is busy")
+	forceErr := errors.New("forced detach denied")
 	serveDone := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		result <- unmountAndWait(failingUnmountServer{err: wantErr}, serveDone)
+		result <- unmountAndWait(failingUnmountServer{err: normalErr}, serveDone, func() error { return forceErr }, time.Second)
 	}()
 
 	select {
 	case err := <-result:
-		if !errors.Is(err, wantErr) {
-			t.Fatalf("unmountAndWait() error = %v, want %v", err, wantErr)
+		if !errors.Is(err, forceErr) || !strings.Contains(err.Error(), normalErr.Error()) {
+			t.Fatalf("unmountAndWait() error = %v, want both unmount errors", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("unmountAndWait() waited for Serve after unmount failed")
+		t.Fatal("unmountAndWait() waited for Serve after both unmount attempts failed")
+	}
+}
+
+func TestUnmountForcesDetachWhenNormalUnmountBlocks(t *testing.T) {
+	releaseNormal := make(chan struct{})
+	serveDone := make(chan struct{})
+	forceCalls := 0
+	err := unmountAndWait(blockingUnmountServer{release: releaseNormal}, serveDone, func() error {
+		forceCalls++
+		return nil
+	}, time.Millisecond)
+	close(releaseNormal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forceCalls != 1 {
+		t.Fatalf("forced detach calls = %d, want 1", forceCalls)
 	}
 }
 

@@ -38,6 +38,8 @@ type mountpointAccess struct {
 	clearStale func(string) error
 }
 
+const normalUnmountGrace = time.Second
+
 func (w fuseLogWriter) Write(p []byte) (int, error) {
 	message := strings.TrimSpace(string(p))
 	if message != "" {
@@ -105,7 +107,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown requested", "reason", ctx.Err())
-		if err := unmountAndWait(server, serveDone); err != nil {
+		if err := unmountAndWait(server, serveDone, func() error { return forceUnmount(mountpoint) }, normalUnmountGrace); err != nil {
 			logger.Error("automatic unmount failed",
 				"mountpoint", mountpoint,
 				"error", err,
@@ -119,14 +121,46 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	return nil
 }
 
-func unmountAndWait(server unmountServer, serveDone <-chan struct{}) error {
-	if err := server.Unmount(); err != nil {
-		// A failed unmount leaves Serve running. Do not wait for it here: the
-		// caller must be able to return, restore normal signal handling, and
-		// report recovery instructions instead of swallowing every later Ctrl-C.
-		return err
+func unmountAndWait(server unmountServer, serveDone <-chan struct{}, force func() error, grace time.Duration) error {
+	normalDone := make(chan error, 1)
+	go func() { normalDone <- server.Unmount() }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	var normalErr error
+	select {
+	case normalErr = <-normalDone:
+		if normalErr == nil {
+			<-serveDone
+			return nil
+		}
+	case <-timer.C:
+		normalErr = fmt.Errorf("did not finish within %s", grace)
 	}
-	<-serveDone
+
+	// A shell or another process may have its working directory inside the
+	// mount. Detach it so existing references can drain without blocking DFS
+	// shutdown. If that also fails, return without waiting for Serve forever.
+	if forceErr := force(); forceErr != nil {
+		// The normal attempt may have won a race with the forced detach.
+		select {
+		case err := <-normalDone:
+			if err == nil {
+				<-serveDone
+				return nil
+			}
+		default:
+		}
+		select {
+		case <-serveDone:
+			return nil
+		default:
+		}
+		return fmt.Errorf("normal unmount failed: %v; forced detach failed: %w", normalErr, forceErr)
+	}
+	// A lazy/forced detach deliberately allows existing references to outlive
+	// the mount namespace entry. Serve may therefore remain active until this
+	// process exits; waiting for it would recreate the EBUSY shutdown hang.
 	return nil
 }
 
@@ -134,7 +168,7 @@ func prepareMountpoint(mountpoint string) (bool, error) {
 	return prepareMountpointWithAccess(mountpoint, mountpointAccess{
 		stat:       os.Stat,
 		mkdirAll:   os.MkdirAll,
-		clearStale: clearStaleMount,
+		clearStale: forceUnmount,
 	})
 }
 
@@ -180,7 +214,7 @@ func Unmount(mountpoint string) error {
 	return runUnmount(mountpoint, false)
 }
 
-func clearStaleMount(mountpoint string) error {
+func forceUnmount(mountpoint string) error {
 	return runUnmount(mountpoint, true)
 }
 
