@@ -156,6 +156,15 @@ func (r *Repository) SetLogger(logger *slog.Logger) {
 
 func (r *Repository) SaveConfig() error { return config.Save(r.Config) }
 
+// WithWorkTreeLock runs fn while repository operations that may replace paths
+// in the worktree are excluded. The callback must not call another Repository
+// method, because those methods acquire the same lock.
+func (r *Repository) WithWorkTreeLock(fn func() error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return fn()
+}
+
 func (r *Repository) CommitPending(ctx context.Context, message string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

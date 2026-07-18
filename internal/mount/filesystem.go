@@ -181,20 +181,57 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 		f.repo.Touch(path)
 		return &trackedFile{File: staged, filesystem: f, path: path}, fuse.OK
 	}
-	if annexSymlink(f.full(name)) {
-		if _, err := os.Stat(f.full(name)); err != nil {
-			if err := f.hydrate(name); err != nil {
-				return nil, status(err)
-			}
-		}
-	}
-	file, code := f.FileSystem.Open(path, flags, context)
-	if code != fuse.OK {
-		return nil, code
+	file, annexed, err := f.openBackingRead(path, flags)
+	if err != nil {
+		return nil, status(err)
 	}
 	f.repo.Touch(path)
 	f.logger.Debug("file opened", "path", path, "writable", false, "flags", flags)
-	return &trackedFile{File: file, filesystem: f, path: path}, fuse.OK
+	tracked := &trackedFile{File: file, filesystem: f, path: path}
+	if annexed {
+		// Git-annex publishes a new version by replacing the symlink in the
+		// worktree. Stable FUSE inode identities can otherwise retain pages from
+		// the previous target, so every fresh annex open must bypass that cache.
+		return &nodefs.WithFlags{File: tracked, FuseFlags: fuse.FOPEN_DIRECT_IO}, fuse.OK
+	}
+	return tracked, fuse.OK
+}
+
+// openBackingRead pins one worktree version to an open file descriptor while
+// excluding DFS sync/commit operations that replace annex links. A broken
+// annex link is hydrated outside the repository lock and then opened again.
+func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, bool, error) {
+	// Match go-fuse's loopback behavior: the kernel translates append writes to
+	// explicit offsets before they reach a file handle.
+	flags &^= syscall.O_APPEND
+	for attempt := 0; attempt < 2; attempt++ {
+		var (
+			handle     *os.File
+			annexed    bool
+			needsFetch bool
+		)
+		err := f.repo.WithWorkTreeLock(func() error {
+			fullPath := f.full(path)
+			annexed = annexSymlink(fullPath)
+			var openErr error
+			handle, openErr = os.OpenFile(fullPath, int(flags), 0)
+			if openErr != nil && annexed && errors.Is(openErr, os.ErrNotExist) {
+				needsFetch = true
+				return nil
+			}
+			return openErr
+		})
+		if err != nil {
+			return nil, annexed, err
+		}
+		if !needsFetch {
+			return nodefs.NewLoopbackFile(handle), annexed, nil
+		}
+		if err := f.hydrate(path); err != nil {
+			return nil, true, err
+		}
+	}
+	return nil, true, os.ErrNotExist
 }
 
 func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fuse.Context) (nodefs.File, fuse.Status) {

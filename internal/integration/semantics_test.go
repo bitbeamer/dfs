@@ -264,6 +264,61 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 			t.Fatalf("read normalized path = %q, %v", content, err)
 		}
 	})
+
+	t.Run("external annex replacements are visible on fresh open", func(t *testing.T) {
+		directory := semanticDirectory(t, mountpoint)
+		mountedPath := filepath.Join(directory, "remote.txt")
+		if err := os.WriteFile(mountedPath, []byte("one\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		relative, err := filepath.Rel(mountpoint, mountedPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backingPath := filepath.Join(repo.Config.Repository, relative)
+		waitForAnnexed(t, backingPath)
+		assertFileContent(t, mountedPath, "one\n")
+		versions := []string{"one\n", "one\ntwo\n", "one\ntwo\nthree\n", "one\ntwo\nthree\nfour\n"}
+		targets := make([]string, 1, len(versions))
+		initialTarget, err := os.Readlink(backingPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets[0] = initialTarget
+		for _, content := range versions[1:] {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := repo.Unlock(ctx, filepath.ToSlash(relative)); err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(backingPath, []byte(content), 0o644); err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			if committed, err := repo.CommitPending(ctx, "Replace annex key under mount"); err != nil || !committed {
+				cancel()
+				t.Fatalf("commit external replacement = %v, %v", committed, err)
+			}
+			cancel()
+			assertFileContent(t, mountedPath, content)
+			target, err := os.Readlink(backingPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targets = append(targets, target)
+		}
+		for index, target := range targets {
+			temporary := backingPath + ".swap"
+			_ = os.Remove(temporary)
+			if err := os.Symlink(target, temporary); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(temporary, backingPath); err != nil {
+				t.Fatal(err)
+			}
+			assertFileContent(t, mountedPath, versions[index])
+		}
+	})
 }
 
 func TestAdvisoryLockHelper(t *testing.T) {
@@ -422,6 +477,14 @@ func entryNames(entries []os.DirEntry) []string {
 		names = append(names, entry.Name())
 	}
 	return names
+}
+
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != want {
+		t.Fatalf("content of %s = %q, %v; want %q", path, content, err, want)
+	}
 }
 
 func makeWritable(root string) {
