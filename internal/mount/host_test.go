@@ -1,11 +1,35 @@
 package mount
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+type failingUnmountServer struct{ err error }
+
+func (s failingUnmountServer) Unmount() error { return s.err }
+
+func TestUnmountFailureDoesNotWaitForServe(t *testing.T) {
+	wantErr := errors.New("mount is busy")
+	serveDone := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- unmountAndWait(failingUnmountServer{err: wantErr}, serveDone)
+	}()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("unmountAndWait() error = %v, want %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unmountAndWait() waited for Serve after unmount failed")
+	}
+}
 
 func TestPrepareMountpointCreatesMissingDirectory(t *testing.T) {
 	mountpoint := filepath.Join(t.TempDir(), "nested", "mount")
