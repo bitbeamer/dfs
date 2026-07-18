@@ -217,6 +217,15 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 			time.Sleep(3 * time.Second)
 		}
 	}
+	for _, directory := range []string{"staging", "transactions"} {
+		entries, err := os.ReadDir(filepath.Join(repo.Config.Repository, ".dfs", directory))
+		if err != nil {
+			t.Fatalf("read %s directory: %v", directory, err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("completed writes left artifacts in .dfs/%s: %v", directory, entries)
+		}
+	}
 	logContent, err := os.ReadFile(mountLogPath)
 	if err != nil {
 		t.Fatal(err)

@@ -2,6 +2,7 @@ package mount
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,7 @@ import (
 type writeTransaction struct {
 	path        string
 	stagingPath string
+	recordPath  string
 	refs        int
 	dirty       bool
 	created     bool
@@ -83,6 +85,7 @@ func (f *FileSystem) openStaged(name string, flags uint32, mode os.FileMode, cre
 		if transaction.refs == 0 {
 			delete(f.writes, path)
 			_ = os.Remove(transaction.stagingPath)
+			_ = os.Remove(transaction.recordPath)
 			if transaction.created {
 				_ = os.Remove(f.full(transaction.path))
 			}
@@ -184,14 +187,24 @@ func (f *FileSystem) createTransaction(path string, flags uint32, mode os.FileMo
 			}
 		}
 	}
+	recordPath, err := persistTransactionRecord(f.root, transactionRecord{
+		Path: path, Staging: filepath.Base(stagingPath), DestinationExisted: exists,
+	})
+	if err != nil {
+		_ = os.Remove(stagingPath)
+		return nil, fmt.Errorf("record write transaction: %w", err)
+	}
 	if !exists {
 		placeholder, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode.Perm())
 		if err != nil {
 			_ = os.Remove(stagingPath)
+			_ = os.Remove(recordPath)
 			return nil, err
 		}
 		if err := placeholder.Close(); err != nil {
 			_ = os.Remove(stagingPath)
+			_ = os.Remove(destination)
+			_ = os.Remove(recordPath)
 			return nil, err
 		}
 		if stagedInfo, err := os.Stat(stagingPath); err == nil {
@@ -202,7 +215,7 @@ func (f *FileSystem) createTransaction(path string, flags uint32, mode os.FileMo
 	}
 
 	return &writeTransaction{
-		path: path, stagingPath: stagingPath, dirty: !exists || flags&syscall.O_TRUNC != 0,
+		path: path, stagingPath: stagingPath, recordPath: recordPath, dirty: !exists || flags&syscall.O_TRUNC != 0,
 		created: !exists, inode: inode,
 	}, nil
 }
@@ -237,7 +250,7 @@ func (f *FileSystem) finishWrite(transaction *writeTransaction, path string) fus
 		if transaction.dirty {
 			err = f.publishTransaction(transaction)
 		} else {
-			err = os.Remove(transaction.stagingPath)
+			err = errors.Join(os.Remove(transaction.stagingPath), os.Remove(transaction.recordPath))
 		}
 	}
 	f.writesMu.Unlock()
@@ -287,6 +300,15 @@ func (f *FileSystem) publishTransaction(transaction *writeTransaction) error {
 	destination := f.full(transaction.path)
 	if err := os.Rename(transaction.stagingPath, destination); err != nil {
 		return err
+	}
+	if err := syncDirectory(filepath.Dir(destination)); err != nil {
+		return fmt.Errorf("persist published transaction: %w", err)
+	}
+	if err := os.Remove(transaction.recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove completed transaction record: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(transaction.recordPath)); err != nil {
+		return fmt.Errorf("persist completed transaction record removal: %w", err)
 	}
 	if transaction.inode != 0 {
 		attr.Ino = transaction.inode

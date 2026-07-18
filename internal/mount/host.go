@@ -66,6 +66,16 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 		"cache_limit_bytes", repo.Config.CacheLimit,
 		"fuse_debug", options.FUSEDebug,
 	)
+	session, err := recoverStartup(ctx, repo, mountpoint, logger)
+	if err != nil {
+		logger.Error("startup recovery failed", "error", err)
+		return fmt.Errorf("recover DFS repository before mount: %w", err)
+	}
+	defer func() {
+		if err := session.Close(); err != nil {
+			logger.Error("removing mount session record failed", "error", err)
+		}
+	}()
 	clearedStale, err := prepareMountpoint(mountpoint)
 	if err != nil {
 		logger.Error("creating mountpoint failed", "mountpoint", mountpoint, "error", err)

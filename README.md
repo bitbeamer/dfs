@@ -95,7 +95,9 @@ The mount process runs automatic metadata sync after completed transactions and 
 
 Writable opens use copy-on-write files under the repository's private `.dfs/staging` directory. Reads through the mount see staged content, while the locked git-annex entry is left untouched until the final writable handle successfully flushes or closes. DFS publishes a dirty staging file with a same-filesystem atomic rename and then schedules annexing and synchronization. A writable open that performs no write, truncate, or handle-level metadata mutation discards its staging copy without changing Git or triggering sync.
 
-DFS preserves the mounted file's visible inode and timestamps while git-annex replaces the published regular file with its internal symlink. This prevents editors such as Vim from reporting a false external change during save. Unfinished staging files are not yet recovered automatically after a crash; that remains separate recovery work.
+DFS preserves the mounted file's visible inode and timestamps while git-annex replaces the published regular file with its internal symlink. This prevents editors such as Vim from reporting a false external change during save.
+
+Mount startup holds an exclusive repository session and performs conservative recovery before exposing the filesystem. Interrupted write payloads, legacy staging files, partial annex transfers, and stale Git index locks are moved under `.dfs/recovery/<timestamp>/`; the last published destination is left untouched. Durable transaction manifests let DFS remove only proven empty placeholders from interrupted creates and recognize writes whose atomic rename completed before a crash. Pending Git index changes are committed, then Git and git-annex receive fast consistency checks. In-progress merges, rebases, cherry-picks, reverts, and bisects are copied to the recovery directory and block mounting for manual resolution rather than being destructively reset.
 
 ### Mount logging and debugging
 

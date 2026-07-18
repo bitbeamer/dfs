@@ -162,6 +162,20 @@ func (r *Repository) CommitPending(ctx context.Context, message string) (bool, e
 	return r.commitPendingLocked(ctx, message)
 }
 
+// CheckConsistency validates Git object connectivity and lets git-annex repair
+// inexpensive metadata inconsistencies without hashing all stored content.
+func (r *Repository) CheckConsistency(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := r.runner.Run(ctx, "git", "fsck", "--no-dangling"); err != nil {
+		return err
+	}
+	if _, err := r.runner.Run(ctx, "git", "annex", "fsck", "--fast"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *Repository) commitPendingLocked(ctx context.Context, message string) (bool, error) {
 	// git-annex handles new and modified user files. Git then records deletions,
 	// renames, pointer updates, and ordinary control files.
