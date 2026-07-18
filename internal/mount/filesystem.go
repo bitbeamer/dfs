@@ -128,8 +128,14 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 	}
 	locked := annexSymlink(f.full(name))
 	if locked {
-		attr.Mode = (attr.Mode & 0o7777) | syscall.S_IFREG
+		// Loopback GetAttr describes the git-annex symlink here. Symlink modes
+		// differ by platform (typically 0777 on Linux and 0755 on macOS), so
+		// carrying those bits into a regular-file attribute makes every file
+		// appear executable and may make it appear world-writable. Use the annex
+		// object's permissions and add owner-write for the writable DFS view.
+		attr.Mode = syscall.S_IFREG | 0o644
 		if info, err := os.Stat(f.full(name)); err == nil {
+			attr.Mode = syscall.S_IFREG | uint32(info.Mode().Perm()|0o200)
 			attr.Size = uint64(info.Size())
 		} else {
 			f.sizesMu.Lock()
