@@ -141,7 +141,7 @@ func prepareMountpoint(mountpoint string) (bool, error) {
 func prepareMountpointWithAccess(mountpoint string, access mountpointAccess) (bool, error) {
 	info, err := access.stat(mountpoint)
 	clearedStale := false
-	if errors.Is(err, syscall.ENOTCONN) {
+	if isStaleMountError(err) {
 		if cleanupErr := access.clearStale(mountpoint); cleanupErr != nil {
 			return false, fmt.Errorf("detach stale mountpoint %s: %w", mountpoint, cleanupErr)
 		}
@@ -161,6 +161,19 @@ func prepareMountpointWithAccess(mountpoint string, access mountpointAccess) (bo
 		return clearedStale, fmt.Errorf("create mountpoint %s: %w", mountpoint, err)
 	}
 	return clearedStale, nil
+}
+
+func isStaleMountError(err error) bool {
+	return isStaleMountErrorForOS(err, runtime.GOOS)
+}
+
+func isStaleMountErrorForOS(err error, goos string) bool {
+	if errors.Is(err, syscall.ENOTCONN) {
+		return true
+	}
+	// A disconnected macFUSE endpoint is surfaced by stat as ENXIO
+	// ("Device not configured") rather than Linux's ENOTCONN.
+	return goos == "darwin" && errors.Is(err, syscall.ENXIO)
 }
 
 func Unmount(mountpoint string) error {

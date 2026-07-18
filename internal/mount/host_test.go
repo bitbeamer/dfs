@@ -112,3 +112,25 @@ func TestPrepareMountpointDetachesStaleFuseMount(t *testing.T) {
 		t.Fatalf("cleanup calls = %d, stat calls = %d; want 1 and 2", cleanupCalls, statCalls)
 	}
 }
+
+func TestStaleMountErrorsByPlatform(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		err  error
+		want bool
+	}{
+		{name: "Linux disconnected endpoint", goos: "linux", err: syscall.ENOTCONN, want: true},
+		{name: "macOS disconnected endpoint", goos: "darwin", err: syscall.ENXIO, want: true},
+		{name: "Linux unrelated device error", goos: "linux", err: syscall.ENXIO, want: false},
+		{name: "macOS permission error", goos: "darwin", err: syscall.EACCES, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := &os.PathError{Op: "stat", Path: "/mount", Err: test.err}
+			if got := isStaleMountErrorForOS(err, test.goos); got != test.want {
+				t.Fatalf("isStaleMountErrorForOS(%v, %q) = %v, want %v", err, test.goos, got, test.want)
+			}
+		})
+	}
+}
