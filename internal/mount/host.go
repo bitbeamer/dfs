@@ -61,7 +61,10 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	defer scheduler.Stop()
 
 	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))
-	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: true})
+	// The annex working tree may replace a regular file with a symlink after a
+	// transaction is committed. Let go-fuse own stable inode identities instead
+	// of exposing those internal inode changes to applications.
+	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,

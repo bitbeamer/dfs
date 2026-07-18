@@ -113,13 +113,135 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("mounted file was not annexed: %s: %v", output, err)
 	}
+	underlying := filepath.Join(repo.Config.Repository, "mounted.txt")
+	if info, err := os.Lstat(underlying); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("annexed file is not locked after sync: mode=%v err=%v", infoMode(info), err)
+	}
+	originalTarget, err := os.Readlink(underlying)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHead := gitOutput(t, ctx, repo.Config.Repository, "rev-parse", "HEAD")
+	noop, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := noop.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	if target, err := os.Readlink(underlying); err != nil || target != originalTarget {
+		t.Fatalf("mutation-free writable open changed annex entry: target=%q err=%v", target, err)
+	}
+	if head := gitOutput(t, ctx, repo.Config.Repository, "rev-parse", "HEAD"); head != originalHead {
+		t.Fatalf("mutation-free writable open created a commit: %s -> %s", originalHead, head)
+	}
+
+	first, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_RDWR, 0)
+	if err != nil {
+		_ = first.Close()
+		t.Fatal(err)
+	}
+	if _, err := first.WriteAt([]byte("shared\n"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Truncate(int64(len("shared\n"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(underlying); err != nil || target != originalTarget {
+		t.Fatalf("transaction published before all writable handles closed: target=%q err=%v", target, err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+
+	// A writable handle uses a copy-on-write staging file. Reads through the
+	// mount see the transaction, while git-annex's locked working-tree entry is
+	// not replaced until the final writable handle closes.
+	edit, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := edit.WriteAt([]byte("updated\n"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.Truncate(int64(len("updated\n"))); err != nil {
+		t.Fatal(err)
+	}
+	visibleDuringWrite, err := os.ReadFile(filepath.Join(mountpoint, "mounted.txt"))
+	if err != nil || string(visibleDuringWrite) != "updated\n" {
+		t.Fatalf("staged content during write = %q, %v", visibleDuringWrite, err)
+	}
+	if info, err := os.Lstat(underlying); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("writable open replaced annex entry before close: mode=%v err=%v", infoMode(info), err)
+	}
+	if err := edit.Close(); err != nil {
+		t.Fatal(err)
+	}
+	visibleAfterWrite, err := os.Stat(filepath.Join(mountpoint, "mounted.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	visibleAfterSync, err := os.Stat(filepath.Join(mountpoint, "mounted.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(visibleAfterWrite, visibleAfterSync) {
+		t.Fatalf("visible inode changed when git-annex rewrote its internal representation")
+	}
+	if !visibleAfterWrite.ModTime().Equal(visibleAfterSync.ModTime()) {
+		t.Fatalf("visible mtime changed during annex sync: %v -> %v", visibleAfterWrite.ModTime(), visibleAfterSync.ModTime())
+	}
+
+	if vim, err := exec.LookPath("vim"); err == nil {
+		for _, text := range []string{"vim-one", "vim-two"} {
+			vimCommand := exec.CommandContext(ctx, vim,
+				"-Nu", "NONE", "-i", "NONE", "-n", "-es",
+				filepath.Join(mountpoint, "mounted.txt"),
+				"-c", "normal! Go"+text,
+				"-c", "write",
+				"-c", "quit",
+			)
+			if output, err := vimCommand.CombinedOutput(); err != nil {
+				t.Fatalf("Vim save %q failed: %s: %v", text, output, err)
+			}
+			time.Sleep(3 * time.Second)
+		}
+	}
 	logContent, err := os.ReadFile(mountLogPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"msg=\"mount ready\"", "msg=\"file created\"", "msg=\"write completed\"", "msg=\"automatic sync completed\""} {
+	for _, expected := range []string{"msg=\"mount ready\"", "msg=\"file created\"", "msg=\"write transaction committed\"", "msg=\"automatic sync completed\""} {
 		if !strings.Contains(string(logContent), expected) {
 			t.Fatalf("mount info log does not contain %q:\n%s", expected, logContent)
 		}
 	}
+}
+
+func infoMode(info os.FileInfo) os.FileMode {
+	if info == nil {
+		return 0
+	}
+	return info.Mode()
+}
+
+func gitOutput(t *testing.T, ctx context.Context, directory string, args ...string) string {
+	t.Helper()
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = directory
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %s: %v", strings.Join(args, " "), output, err)
+	}
+	return strings.TrimSpace(string(output))
 }

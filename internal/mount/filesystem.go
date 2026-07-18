@@ -30,21 +30,24 @@ type FileSystem struct {
 	logger   *slog.Logger
 	sizesMu  sync.Mutex
 	sizes    map[string]uint64
+	writesMu sync.Mutex
+	writes   map[string]*writeTransaction
+	attrsMu  sync.Mutex
+	attrs    map[string]visibleState
 }
 
 type trackedFile struct {
 	nodefs.File
 	filesystem *FileSystem
 	path       string
-	writable   bool
-	once       sync.Once
 }
 
 func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
 	return &FileSystem{
 		FileSystem: pathfs.NewLoopbackFileSystem(repo.Config.Repository),
 		repo:       repo, root: repo.Config.Repository, notifier: notifier, logger: logger,
-		sizes: make(map[string]uint64),
+		sizes: make(map[string]uint64), writes: make(map[string]*writeTransaction),
+		attrs: make(map[string]visibleState),
 	}
 }
 
@@ -94,23 +97,6 @@ func (f *FileSystem) hydrate(name string) error {
 	return nil
 }
 
-func (f *FileSystem) prepareWrite(name string) error {
-	full := f.full(name)
-	if !annexSymlink(full) {
-		return nil
-	}
-	if _, err := os.Stat(full); err != nil {
-		if err := f.hydrate(name); err != nil {
-			return err
-		}
-	}
-	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 10*time.Minute)
-	defer cancel()
-	path := clean(name)
-	f.logger.Debug("unlocking annexed file for writing", "path", path)
-	return f.repo.Unlock(ctx, path)
-}
-
 func (f *FileSystem) changed(reason string, attrs ...any) {
 	f.sizesMu.Lock()
 	clear(f.sizes)
@@ -132,32 +118,39 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 	if hidden(name) {
 		return nil, fuse.ENOENT
 	}
+	path := clean(name)
+	if attr, ok := f.stagedAttr(path); ok {
+		return attr, fuse.OK
+	}
 	attr, code := f.FileSystem.GetAttr(name, context)
-	if code != fuse.OK || !annexSymlink(f.full(name)) {
+	if code != fuse.OK {
 		return attr, code
 	}
-	attr.Mode = (attr.Mode & 0o7777) | syscall.S_IFREG
-	if info, err := os.Stat(f.full(name)); err == nil {
-		attr.Size = uint64(info.Size())
-	} else {
-		path := clean(name)
-		f.sizesMu.Lock()
-		size, ok := f.sizes[path]
-		f.sizesMu.Unlock()
-		if !ok {
-			ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 30*time.Second)
-			value, sizeErr := f.repo.AnnexFileSize(ctx, path)
-			cancel()
-			if sizeErr == nil {
-				size = uint64(value)
-				f.sizesMu.Lock()
-				f.sizes[path] = size
-				f.sizesMu.Unlock()
+	locked := annexSymlink(f.full(name))
+	if locked {
+		attr.Mode = (attr.Mode & 0o7777) | syscall.S_IFREG
+		if info, err := os.Stat(f.full(name)); err == nil {
+			attr.Size = uint64(info.Size())
+		} else {
+			f.sizesMu.Lock()
+			size, ok := f.sizes[path]
+			f.sizesMu.Unlock()
+			if !ok {
+				ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 30*time.Second)
+				value, sizeErr := f.repo.AnnexFileSize(ctx, path)
+				cancel()
+				if sizeErr == nil {
+					size = uint64(value)
+					f.sizesMu.Lock()
+					f.sizes[path] = size
+					f.sizesMu.Unlock()
+				}
 			}
+			attr.Size = size
 		}
-		attr.Size = size
+		attr.Blocks = (attr.Size + 511) / 512
 	}
-	attr.Blocks = (attr.Size + 511) / 512
+	f.applyVisibleAttr(path, attr, locked)
 	return attr, code
 }
 
@@ -165,18 +158,20 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 	if hidden(name) {
 		return nil, fuse.ENOENT
 	}
+	path := clean(name)
 	writable := flags&syscall.O_ACCMODE != syscall.O_RDONLY
 	if writable {
-		if f.notifier != nil {
-			f.notifier.BeginWrite()
-		}
-		if err := f.prepareWrite(name); err != nil {
-			if f.notifier != nil {
-				f.notifier.EndWrite()
-			}
+		file, err := f.openStaged(path, flags, 0, false)
+		return file, status(err)
+	}
+	if staged, ok, err := f.openStagedRead(path); ok {
+		if err != nil {
 			return nil, status(err)
 		}
-	} else if annexSymlink(f.full(name)) {
+		f.repo.Touch(path)
+		return &trackedFile{File: staged, filesystem: f, path: path}, fuse.OK
+	}
+	if annexSymlink(f.full(name)) {
 		if _, err := os.Stat(f.full(name)); err != nil {
 			if err := f.hydrate(name); err != nil {
 				return nil, status(err)
@@ -185,34 +180,24 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 	}
 	file, code := f.FileSystem.Open(name, flags, context)
 	if code != fuse.OK {
-		if writable && f.notifier != nil {
-			f.notifier.EndWrite()
-		}
 		return nil, code
 	}
-	path := clean(name)
 	f.repo.Touch(path)
-	f.logger.Debug("file opened", "path", path, "writable", writable, "flags", flags)
-	return &trackedFile{File: file, filesystem: f, path: path, writable: writable}, fuse.OK
+	f.logger.Debug("file opened", "path", path, "writable", false, "flags", flags)
+	return &trackedFile{File: file, filesystem: f, path: path}, fuse.OK
 }
 
 func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
 	if hidden(name) {
 		return nil, fuse.EACCES
 	}
-	if f.notifier != nil {
-		f.notifier.BeginWrite()
-	}
-	file, code := f.FileSystem.Create(name, flags, mode, context)
-	if code != fuse.OK {
-		if f.notifier != nil {
-			f.notifier.EndWrite()
-		}
-		return nil, code
-	}
 	path := clean(name)
+	file, err := f.openStaged(path, flags, os.FileMode(mode), true)
+	if err != nil {
+		return nil, status(err)
+	}
 	f.logger.Info("file created", "path", path)
-	return &trackedFile{File: file, filesystem: f, path: path, writable: true}, fuse.OK
+	return file, fuse.OK
 }
 
 func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) {
@@ -222,16 +207,6 @@ func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status
 
 func (t *trackedFile) Release() {
 	t.File.Release()
-	if t.writable {
-		t.once.Do(func() {
-			t.filesystem.logger.Info("write completed", "path", t.path)
-			if t.filesystem.notifier != nil {
-				t.filesystem.notifier.EndWrite()
-			} else {
-				t.filesystem.changed("completed write", "path", t.path)
-			}
-		})
-	}
 }
 
 func (f *FileSystem) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntry, fuse.Status) {
@@ -252,13 +227,15 @@ func (f *FileSystem) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntr
 }
 
 func (f *FileSystem) Truncate(name string, size uint64, context *fuse.Context) fuse.Status {
-	if err := f.prepareWrite(name); err != nil {
+	file, err := f.openStaged(clean(name), syscall.O_WRONLY, 0, false)
+	if err != nil {
 		return status(err)
 	}
-	code := f.FileSystem.Truncate(name, size, context)
+	code := file.Truncate(size)
 	if code == fuse.OK {
-		f.changed("truncate", "path", clean(name), "size", size)
+		code = file.Flush()
 	}
+	file.Release()
 	return code
 }
 
@@ -290,6 +267,7 @@ func (f *FileSystem) Rename(oldName, newName string, context *fuse.Context) fuse
 	}
 	code := f.FileSystem.Rename(oldName, newName, context)
 	if code == fuse.OK {
+		f.renameVisible(clean(oldName), clean(newName))
 		f.changed("rename", "old_path", clean(oldName), "new_path", clean(newName))
 	}
 	return code
@@ -312,6 +290,7 @@ func (f *FileSystem) Unlink(name string, context *fuse.Context) fuse.Status {
 	}
 	code := f.FileSystem.Unlink(name, context)
 	if code == fuse.OK {
+		f.removeVisible(clean(name))
 		f.changed("unlink", "path", clean(name))
 	}
 	return code
@@ -342,6 +321,7 @@ func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse
 func (f *FileSystem) Chmod(name string, mode uint32, context *fuse.Context) fuse.Status {
 	code := f.FileSystem.Chmod(name, mode, context)
 	if code == fuse.OK {
+		f.captureVisible(clean(name))
 		f.changed("chmod", "path", clean(name), "mode", mode)
 	}
 	return code
@@ -350,6 +330,7 @@ func (f *FileSystem) Chmod(name string, mode uint32, context *fuse.Context) fuse
 func (f *FileSystem) Chown(name string, uid, gid uint32, context *fuse.Context) fuse.Status {
 	code := f.FileSystem.Chown(name, uid, gid, context)
 	if code == fuse.OK {
+		f.captureVisible(clean(name))
 		f.changed("chown", "path", clean(name), "uid", uid, "gid", gid)
 	}
 	return code
@@ -358,6 +339,7 @@ func (f *FileSystem) Chown(name string, uid, gid uint32, context *fuse.Context) 
 func (f *FileSystem) Utimens(name string, atime, mtime *time.Time, context *fuse.Context) fuse.Status {
 	code := f.FileSystem.Utimens(name, atime, mtime, context)
 	if code == fuse.OK {
+		f.captureVisible(clean(name))
 		f.changed("utimens", "path", clean(name))
 	}
 	return code

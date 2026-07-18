@@ -66,7 +66,6 @@ func (s *Scheduler) EndWrite() {
 		writers = 0
 	}
 	s.logger.Debug("writer closed", "open_writers", writers)
-	s.Notify("completed write")
 }
 
 func (s *Scheduler) loop() {

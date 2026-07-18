@@ -91,6 +91,12 @@ rm ~/DFS/Archive/old.pdf
 
 The mount process runs automatic metadata sync after completed transactions and every 30 seconds. Keep it running in a terminal for the MVP. Press Ctrl-C to cleanly unmount and stop it, or use `dfs unmount ~/DFS` from another terminal. SIGTERM uses the same clean shutdown path.
 
+### Transactional writes
+
+Writable opens use copy-on-write files under the repository's private `.dfs/staging` directory. Reads through the mount see staged content, while the locked git-annex entry is left untouched until the final writable handle successfully flushes or closes. DFS publishes a dirty staging file with a same-filesystem atomic rename and then schedules annexing and synchronization. A writable open that performs no write, truncate, or handle-level metadata mutation discards its staging copy without changing Git or triggering sync.
+
+DFS preserves the mounted file's visible inode and timestamps while git-annex replaces the published regular file with its internal symlink. This prevents editors such as Vim from reporting a false external change during save. Unfinished staging files are not yet recovered automatically after a crash; that remains separate recovery work.
+
 ### Mount logging and debugging
 
 Mount logging uses Go's structured `log/slog` text format. The default `error` level remains quiet unless an operation fails. Use `info` to see mount lifecycle, filesystem changes, hydration, synchronization, pin refresh, and cache-prune activity:
@@ -192,7 +198,7 @@ DFS transaction and quota scheduler
         └── S3: optional durable content
 ```
 
-The underlying Git working tree is an implementation detail. `.git` and `.dfs` are hidden from the mounted view. A locked git-annex symlink is presented as a normal file; opening missing content runs `git annex get`, and opening it for writing first hydrates and unlocks it.
+The underlying Git working tree is an implementation detail. `.git` and `.dfs` are hidden from the mounted view. A locked git-annex symlink is presented as a normal file; opening missing content runs `git annex get`, and opening it for writing first hydrates it into a private copy-on-write transaction.
 
 ## MVP limitations
 
@@ -210,7 +216,7 @@ make test
 make test-integration  # mounts a temporary FUSE filesystem
 ```
 
-The normal test suite includes a real two-peer Git/git-annex flow. The integration target additionally verifies that writes through FUSE are not annexed until close.
+The normal test suite includes a real two-peer Git/git-annex flow. The integration target additionally verifies copy-on-write publication, no-op writable opens, multiple writable handles, stable visible metadata across annex sync, and repeated Vim saves through a real FUSE mount.
 
 ## License
 
