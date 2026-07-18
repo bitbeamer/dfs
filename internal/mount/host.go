@@ -97,6 +97,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,
+		EnableLocks: true,
 	}
 	if options.FUSEDebug {
 		mountOptions.Logger = log.New(fuseLogWriter{logger.With("component", "fuse")}, "", 0)

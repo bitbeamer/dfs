@@ -14,6 +14,9 @@ Every peer sees the complete file and directory tree. File content is downloaded
 - Optional bare Git metadata relay.
 - On-demand hydration when an annexed file is opened.
 - Writes committed only after all writable mount handles have closed.
+- Advisory locks, durable `fsync`, atomic rename-overwrite, and open-then-unlink behavior.
+- Persistent permissions, timestamps, and extended attributes on Linux and macOS.
+- Case-preserving names and NFC-normalized Unicode paths.
 - Pin, fetch, unpin, safe eviction, and LRU quota enforcement.
 - Git history and non-destructive restore commits.
 - Encrypted S3-compatible git-annex storage.
@@ -95,7 +98,13 @@ The mount process runs automatic metadata sync after completed transactions and 
 
 Writable opens use copy-on-write files under the repository's private `.dfs/staging` directory. Reads through the mount see staged content, while the locked git-annex entry is left untouched until the final writable handle successfully flushes or closes. DFS publishes a dirty staging file with a same-filesystem atomic rename and then schedules annexing and synchronization. A writable open that performs no write, truncate, or handle-level metadata mutation discards its staging copy without changing Git or triggering sync.
 
+`fsync` first synchronizes the staging descriptor, then atomically publishes and directory-syncs a checkpoint without ending the open transaction. A later write can advance that checkpoint; after a crash, the last successfully synchronized destination remains valid and any newer unfinished staging payload is quarantined by startup recovery. Flush and `fsync` errors are returned to the application, mark the transaction failed, and prevent an unverified payload from being published on release.
+
+DFS forwards advisory record locks to FUSE and preserves POSIX open-file behavior across unlink and rename-overwrite. Renaming an open write transaction moves its eventual publication target; unlinking it detaches the pathname so closing the descriptor cannot recreate the deleted file.
+
 DFS preserves the mounted file's visible inode and timestamps while git-annex replaces the published regular file with its internal symlink. This prevents editors such as Vim from reporting a false external change during save.
+
+Permissions, ownership, timestamps, and extended attributes are stored in the peer's private DFS state database so they survive git-annex relocking and remounting without mutating content-addressed annex objects. They currently remain peer-local metadata and are not replicated through Git. Names created through DFS are normalized to Unicode NFC while preserving case; case-only renames are supported on both case-sensitive and case-insensitive hosts.
 
 ### Concurrent changes
 
@@ -211,7 +220,7 @@ The underlying Git working tree is an implementation detail. `.git` and `.dfs` a
 - Peer discovery and pairing are manual; mDNS is not implemented yet.
 - The conflict command lists conflicts but does not provide a full conflict-resolution UI.
 - History does not itself retain old annex objects. Replicate versions to durable storage before allowing their last copy to be dropped.
-- Open-file locking, memory mapping, sparse files, case-only renames, Unicode normalization, and large creative applications need more cross-platform stress testing.
+- Memory mapping, sparse files, ACL replication, cross-peer POSIX-metadata replication, and large creative applications need more cross-platform stress testing.
 - The mount process is foreground-only and there is no GUI or service installer yet.
 - Cloud storage is S3-compatible only in the CLI; additional providers can be added through git-annex special remotes later.
 
@@ -222,7 +231,7 @@ make test
 make test-integration  # mounts a temporary FUSE filesystem
 ```
 
-The normal test suite includes real two-peer Git/git-annex flows for connected operations, disconnected edit/edit, rename/move, modify/delete, identical-content edge cases, retained content, and stable tree convergence. The integration target additionally verifies copy-on-write publication, no-op writable opens, multiple writable handles, stable visible metadata across annex sync, and repeated Vim saves through a real FUSE mount.
+The normal test suite includes real two-peer Git/git-annex flows for connected operations, disconnected edit/edit, rename/move, modify/delete, identical-content edge cases, retained content, and stable tree convergence. The integration target additionally verifies copy-on-write publication, no-op and multiple writable handles, advisory locks, `fsync`, flush/error propagation, atomic rename-overwrite, open rename/unlink behavior, persistent permissions/timestamps/xattrs, case-only renames, NFC normalization, stable visible metadata across annex sync, and repeated Vim saves through a real FUSE mount.
 
 ## License
 

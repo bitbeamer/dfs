@@ -2,6 +2,8 @@ package mount
 
 import (
 	stdcontext "context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,9 +13,11 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/repository"
+	"github.com/bitbeamer/dfs/internal/store"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
 	"github.com/hanwen/go-fuse/v2/fuse/pathfs"
+	"golang.org/x/text/unicode/norm"
 )
 
 type changeNotifier interface {
@@ -56,7 +60,7 @@ func clean(name string) string {
 	if name == "." {
 		return ""
 	}
-	return strings.TrimPrefix(name, "/")
+	return norm.NFC.String(strings.TrimPrefix(name, "/"))
 }
 
 func hidden(name string) bool {
@@ -122,7 +126,7 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 	if attr, ok := f.stagedAttr(path); ok {
 		return attr, fuse.OK
 	}
-	attr, code := f.FileSystem.GetAttr(name, context)
+	attr, code := f.FileSystem.GetAttr(path, context)
 	if code != fuse.OK {
 		return attr, code
 	}
@@ -184,7 +188,7 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 			}
 		}
 	}
-	file, code := f.FileSystem.Open(name, flags, context)
+	file, code := f.FileSystem.Open(path, flags, context)
 	if code != fuse.OK {
 		return nil, code
 	}
@@ -219,13 +223,14 @@ func (f *FileSystem) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntr
 	if hidden(name) {
 		return nil, fuse.ENOENT
 	}
-	entries, code := f.FileSystem.OpenDir(name, context)
+	entries, code := f.FileSystem.OpenDir(clean(name), context)
 	if code != fuse.OK {
 		return nil, code
 	}
 	result := entries[:0]
 	for _, entry := range entries {
 		if entry.Name != ".git" && entry.Name != ".dfs" {
+			entry.Name = norm.NFC.String(entry.Name)
 			result = append(result, entry)
 		}
 	}
@@ -249,7 +254,7 @@ func (f *FileSystem) Mkdir(name string, mode uint32, context *fuse.Context) fuse
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Mkdir(name, mode, context)
+	code := f.FileSystem.Mkdir(clean(name), mode, context)
 	if code == fuse.OK {
 		f.changed("mkdir", "path", clean(name))
 	}
@@ -260,7 +265,7 @@ func (f *FileSystem) Mknod(name string, mode uint32, dev uint32, context *fuse.C
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Mknod(name, mode, dev, context)
+	code := f.FileSystem.Mknod(clean(name), mode, dev, context)
 	if code == fuse.OK {
 		f.changed("mknod", "path", clean(name))
 	}
@@ -271,10 +276,22 @@ func (f *FileSystem) Rename(oldName, newName string, context *fuse.Context) fuse
 	if hidden(oldName) || hidden(newName) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Rename(oldName, newName, context)
+	oldPath, newPath := clean(oldName), clean(newName)
+	if oldPath == newPath {
+		return fuse.OK
+	}
+	code := f.FileSystem.Rename(oldPath, newPath, context)
 	if code == fuse.OK {
-		f.renameVisible(clean(oldName), clean(newName))
-		f.changed("rename", "old_path", clean(oldName), "new_path", clean(newName))
+		if err := f.renameWrite(oldPath, newPath); err != nil {
+			return status(err)
+		}
+		if f.repo.Store != nil {
+			if err := f.repo.Store.RenameFileState(oldPath, newPath); err != nil {
+				return status(err)
+			}
+		}
+		f.renameVisible(oldPath, newPath)
+		f.changed("rename", "old_path", oldPath, "new_path", newPath)
 	}
 	return code
 }
@@ -283,8 +300,14 @@ func (f *FileSystem) Rmdir(name string, context *fuse.Context) fuse.Status {
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Rmdir(name, context)
+	code := f.FileSystem.Rmdir(clean(name), context)
 	if code == fuse.OK {
+		if f.repo.Store != nil {
+			if err := f.repo.Store.RemoveFileState(clean(name)); err != nil {
+				return status(err)
+			}
+		}
+		f.removeVisible(clean(name))
 		f.changed("rmdir", "path", clean(name))
 	}
 	return code
@@ -294,10 +317,17 @@ func (f *FileSystem) Unlink(name string, context *fuse.Context) fuse.Status {
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Unlink(name, context)
+	path := clean(name)
+	code := f.FileSystem.Unlink(path, context)
 	if code == fuse.OK {
-		f.removeVisible(clean(name))
-		f.changed("unlink", "path", clean(name))
+		f.unlinkWrite(path)
+		if f.repo.Store != nil {
+			if err := f.repo.Store.RemoveFileState(path); err != nil {
+				return status(err)
+			}
+		}
+		f.removeVisible(path)
+		f.changed("unlink", "path", path)
 	}
 	return code
 }
@@ -306,7 +336,7 @@ func (f *FileSystem) Link(oldName, newName string, context *fuse.Context) fuse.S
 	if hidden(oldName) || hidden(newName) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Link(oldName, newName, context)
+	code := f.FileSystem.Link(clean(oldName), clean(newName), context)
 	if code == fuse.OK {
 		f.changed("link", "old_path", clean(oldName), "new_path", clean(newName))
 	}
@@ -317,7 +347,7 @@ func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse
 	if hidden(linkName) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Symlink(value, linkName, context)
+	code := f.FileSystem.Symlink(value, clean(linkName), context)
 	if code == fuse.OK {
 		f.changed("symlink", "path", clean(linkName))
 	}
@@ -325,28 +355,224 @@ func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse
 }
 
 func (f *FileSystem) Chmod(name string, mode uint32, context *fuse.Context) fuse.Status {
-	code := f.FileSystem.Chmod(name, mode, context)
+	if hidden(name) {
+		return fuse.EACCES
+	}
+	path := clean(name)
+	if transaction := f.writeAt(path); transaction != nil {
+		if err := os.Chmod(transaction.stagingPath, os.FileMode(mode)); err != nil {
+			return status(err)
+		}
+		f.markDirty(transaction)
+		return status(f.captureVisible(path))
+	}
+	if annexSymlink(f.full(path)) {
+		attr, code := f.GetAttr(path, context)
+		if code != fuse.OK {
+			return code
+		}
+		attr.Mode = attr.Mode&syscall.S_IFMT | mode&0o7777
+		attr.Ctime, attr.Ctimensec = splitTime(time.Now())
+		if err := f.saveVisible(path, attr, f.visibleSignature(path)); err != nil {
+			return status(err)
+		}
+		f.changed("chmod", "path", path, "mode", mode)
+		return fuse.OK
+	}
+	code := f.FileSystem.Chmod(path, mode, context)
 	if code == fuse.OK {
-		f.captureVisible(clean(name))
-		f.changed("chmod", "path", clean(name), "mode", mode)
+		if err := f.captureVisible(path); err != nil {
+			return status(err)
+		}
+		f.changed("chmod", "path", path, "mode", mode)
 	}
 	return code
 }
 
 func (f *FileSystem) Chown(name string, uid, gid uint32, context *fuse.Context) fuse.Status {
-	code := f.FileSystem.Chown(name, uid, gid, context)
+	if hidden(name) {
+		return fuse.EACCES
+	}
+	path := clean(name)
+	if transaction := f.writeAt(path); transaction != nil {
+		if err := os.Chown(transaction.stagingPath, chownID(uid), chownID(gid)); err != nil {
+			return status(err)
+		}
+		f.markDirty(transaction)
+		return status(f.captureVisible(path))
+	}
+	if annexSymlink(f.full(path)) {
+		attr, code := f.GetAttr(path, context)
+		if code != fuse.OK {
+			return code
+		}
+		if uid != ^uint32(0) {
+			attr.Uid = uid
+		}
+		if gid != ^uint32(0) {
+			attr.Gid = gid
+		}
+		attr.Ctime, attr.Ctimensec = splitTime(time.Now())
+		if err := f.saveVisible(path, attr, f.visibleSignature(path)); err != nil {
+			return status(err)
+		}
+		f.changed("chown", "path", path, "uid", uid, "gid", gid)
+		return fuse.OK
+	}
+	code := f.FileSystem.Chown(path, uid, gid, context)
 	if code == fuse.OK {
-		f.captureVisible(clean(name))
-		f.changed("chown", "path", clean(name), "uid", uid, "gid", gid)
+		if err := f.captureVisible(path); err != nil {
+			return status(err)
+		}
+		f.changed("chown", "path", path, "uid", uid, "gid", gid)
 	}
 	return code
 }
 
 func (f *FileSystem) Utimens(name string, atime, mtime *time.Time, context *fuse.Context) fuse.Status {
-	code := f.FileSystem.Utimens(name, atime, mtime, context)
+	if hidden(name) {
+		return fuse.EACCES
+	}
+	path := clean(name)
+	if transaction := f.writeAt(path); transaction != nil {
+		if err := setStagedTimes(transaction.stagingPath, atime, mtime); err != nil {
+			return status(err)
+		}
+		f.markDirty(transaction)
+		return status(f.captureVisible(path))
+	}
+	if annexSymlink(f.full(path)) {
+		attr, code := f.GetAttr(path, context)
+		if code != fuse.OK {
+			return code
+		}
+		if atime != nil {
+			attr.Atime, attr.Atimensec = splitTime(*atime)
+		}
+		if mtime != nil {
+			attr.Mtime, attr.Mtimensec = splitTime(*mtime)
+		}
+		attr.Ctime, attr.Ctimensec = splitTime(time.Now())
+		if err := f.saveVisible(path, attr, f.visibleSignature(path)); err != nil {
+			return status(err)
+		}
+		f.changed("utimens", "path", path)
+		return fuse.OK
+	}
+	code := f.FileSystem.Utimens(path, atime, mtime, context)
 	if code == fuse.OK {
-		f.captureVisible(clean(name))
-		f.changed("utimens", "path", clean(name))
+		if err := f.captureVisible(path); err != nil {
+			return status(err)
+		}
+		f.changed("utimens", "path", path)
 	}
 	return code
+}
+
+func (f *FileSystem) GetXAttr(name, attr string, context *fuse.Context) ([]byte, fuse.Status) {
+	if hidden(name) {
+		return nil, fuse.ENOENT
+	}
+	if _, code := f.GetAttr(clean(name), context); code != fuse.OK {
+		return nil, code
+	}
+	if f.repo.Store == nil {
+		return nil, fuse.ENOSYS
+	}
+	value, err := f.repo.Store.XAttr(clean(name), attr)
+	if errors.Is(err, store.ErrXAttrNotFound) {
+		return nil, fuse.ENOATTR
+	}
+	return value, status(err)
+}
+
+func (f *FileSystem) SetXAttr(name, attr string, data []byte, flags int, context *fuse.Context) fuse.Status {
+	if hidden(name) {
+		return fuse.EACCES
+	}
+	path := clean(name)
+	if _, code := f.GetAttr(path, context); code != fuse.OK {
+		return code
+	}
+	if f.repo.Store == nil {
+		return fuse.ENOSYS
+	}
+	err := f.repo.Store.SetXAttr(path, attr, append([]byte(nil), data...), flags)
+	switch {
+	case errors.Is(err, store.ErrXAttrExists):
+		return status(syscall.EEXIST)
+	case errors.Is(err, store.ErrXAttrNotFound):
+		return fuse.ENOATTR
+	case err != nil:
+		return status(err)
+	}
+	f.changed("setxattr", "path", path, "attribute", attr)
+	return fuse.OK
+}
+
+func (f *FileSystem) ListXAttr(name string, context *fuse.Context) ([]string, fuse.Status) {
+	if hidden(name) {
+		return nil, fuse.ENOENT
+	}
+	if _, code := f.GetAttr(clean(name), context); code != fuse.OK {
+		return nil, code
+	}
+	if f.repo.Store == nil {
+		return nil, fuse.ENOSYS
+	}
+	names, err := f.repo.Store.ListXAttrs(clean(name))
+	return names, status(err)
+}
+
+func (f *FileSystem) RemoveXAttr(name, attr string, context *fuse.Context) fuse.Status {
+	if hidden(name) {
+		return fuse.EACCES
+	}
+	path := clean(name)
+	if _, code := f.GetAttr(path, context); code != fuse.OK {
+		return code
+	}
+	if f.repo.Store == nil {
+		return fuse.ENOSYS
+	}
+	err := f.repo.Store.RemoveXAttr(path, attr)
+	if errors.Is(err, store.ErrXAttrNotFound) {
+		return fuse.ENOATTR
+	}
+	if err != nil {
+		return status(err)
+	}
+	f.changed("removexattr", "path", path, "attribute", attr)
+	return fuse.OK
+}
+
+func splitTime(value time.Time) (uint64, uint32) {
+	return uint64(value.Unix()), uint32(value.Nanosecond())
+}
+
+func chownID(value uint32) int {
+	if value == ^uint32(0) {
+		return -1
+	}
+	return int(value)
+}
+
+func setStagedTimes(path string, atime, mtime *time.Time) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	attr := attrFromInfo(info)
+	if attr == nil {
+		return fmt.Errorf("read staged timestamps for %s", path)
+	}
+	access := time.Unix(int64(attr.Atime), int64(attr.Atimensec))
+	modified := time.Unix(int64(attr.Mtime), int64(attr.Mtimensec))
+	if atime != nil {
+		access = *atime
+	}
+	if mtime != nil {
+		modified = *mtime
+	}
+	return os.Chtimes(path, access, modified)
 }

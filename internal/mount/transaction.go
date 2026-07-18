@@ -12,18 +12,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/store"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
 )
 
 type writeTransaction struct {
-	path        string
-	stagingPath string
-	recordPath  string
-	refs        int
-	dirty       bool
-	created     bool
-	inode       uint64
+	path               string
+	stagingPath        string
+	recordPath         string
+	refs               int
+	dirty              bool
+	created            bool
+	unlinked           bool
+	destinationExisted bool
+	failure            fuse.Status
+	inode              uint64
 }
 
 type visibleState struct {
@@ -216,7 +220,7 @@ func (f *FileSystem) createTransaction(path string, flags uint32, mode os.FileMo
 
 	return &writeTransaction{
 		path: path, stagingPath: stagingPath, recordPath: recordPath, dirty: !exists || flags&syscall.O_TRUNC != 0,
-		created: !exists, inode: inode,
+		created: !exists, destinationExisted: exists, inode: inode,
 	}, nil
 }
 
@@ -246,11 +250,15 @@ func (f *FileSystem) finishWrite(transaction *writeTransaction, path string) fus
 	final := transaction.refs == 0
 	var err error
 	if final {
-		delete(f.writes, transaction.path)
-		if transaction.dirty {
-			err = f.publishTransaction(transaction)
-		} else {
+		if f.writes[transaction.path] == transaction {
+			delete(f.writes, transaction.path)
+		}
+		if transaction.failure != fuse.OK {
+			err = fmt.Errorf("write transaction failed before publication: %s", transaction.failure)
+		} else if transaction.unlinked || !transaction.dirty {
 			err = errors.Join(os.Remove(transaction.stagingPath), os.Remove(transaction.recordPath))
+		} else {
+			err = f.publishTransaction(transaction)
 		}
 	}
 	f.writesMu.Unlock()
@@ -262,7 +270,7 @@ func (f *FileSystem) finishWrite(transaction *writeTransaction, path string) fus
 		f.logger.Error("staged write publish failed", "path", path, "staging_path", transaction.stagingPath, "error", err)
 		return status(err)
 	}
-	if final && transaction.dirty {
+	if final && transaction.dirty && !transaction.unlinked {
 		f.logger.Info("write transaction committed", "path", path)
 		f.changed("completed write", "path", path)
 	}
@@ -313,10 +321,7 @@ func (f *FileSystem) publishTransaction(transaction *writeTransaction) error {
 	if transaction.inode != 0 {
 		attr.Ino = transaction.inode
 	}
-	f.attrsMu.Lock()
-	f.attrs[transaction.path] = visibleState{attr: *attr, signature: signature}
-	f.attrsMu.Unlock()
-	return nil
+	return f.saveVisible(transaction.path, attr, signature)
 }
 
 func (s *stagedFile) finish() fuse.Status {
@@ -383,15 +388,164 @@ func (s *stagedFile) GetAttr(out *fuse.Attr) fuse.Status {
 }
 
 func (s *stagedFile) Flush() fuse.Status {
-	if code := s.File.Flush(); code != fuse.OK {
-		return code
+	code := s.File.Flush()
+	if code != fuse.OK {
+		s.filesystem.markFailure(s.transaction, code)
 	}
-	return s.finish()
+	return code
 }
 
 func (s *stagedFile) Release() {
 	s.File.Release()
 	s.finish()
+}
+
+func (s *stagedFile) Fsync(flags int) fuse.Status {
+	if code := s.File.Fsync(flags); code != fuse.OK {
+		s.filesystem.markFailure(s.transaction, code)
+		return code
+	}
+	err := s.filesystem.checkpointTransaction(s.transaction)
+	code := status(err)
+	if code != fuse.OK {
+		s.filesystem.markFailure(s.transaction, code)
+	}
+	return code
+}
+
+func (f *FileSystem) markFailure(transaction *writeTransaction, code fuse.Status) {
+	f.writesMu.Lock()
+	if transaction.failure == fuse.OK {
+		transaction.failure = code
+	}
+	f.writesMu.Unlock()
+}
+
+func (f *FileSystem) checkpointTransaction(transaction *writeTransaction) error {
+	f.writesMu.Lock()
+	defer f.writesMu.Unlock()
+	if !transaction.dirty || transaction.unlinked {
+		return nil
+	}
+	source, err := os.Open(transaction.stagingPath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return err
+	}
+	attr := attrFromInfo(info)
+	if attr == nil {
+		return fmt.Errorf("read fsync checkpoint attributes for %s", transaction.path)
+	}
+	checkpoint, err := os.CreateTemp(filepath.Dir(transaction.stagingPath), "checkpoint-*")
+	if err != nil {
+		return err
+	}
+	checkpointPath := checkpoint.Name()
+	cleanup := func() {
+		_ = checkpoint.Close()
+		_ = os.Remove(checkpointPath)
+	}
+	if err := checkpoint.Chmod(info.Mode().Perm()); err != nil {
+		cleanup()
+		return err
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(checkpoint, hash), source); err != nil {
+		cleanup()
+		return err
+	}
+	accessTime := time.Unix(int64(attr.Atime), int64(attr.Atimensec))
+	if err := os.Chtimes(checkpointPath, accessTime, info.ModTime()); err != nil {
+		cleanup()
+		return err
+	}
+	if err := checkpoint.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := checkpoint.Close(); err != nil {
+		_ = os.Remove(checkpointPath)
+		return err
+	}
+	destination := f.full(transaction.path)
+	if err := os.Rename(checkpointPath, destination); err != nil {
+		_ = os.Remove(checkpointPath)
+		return err
+	}
+	if err := syncDirectory(filepath.Dir(destination)); err != nil {
+		return fmt.Errorf("persist fsync checkpoint: %w", err)
+	}
+	if transaction.inode != 0 {
+		attr.Ino = transaction.inode
+	}
+	if err := f.saveVisible(transaction.path, attr, fmt.Sprintf("%x", hash.Sum(nil))); err != nil {
+		return err
+	}
+	transaction.destinationExisted = true
+	recordPath, err := persistTransactionRecord(f.root, transactionRecord{
+		Path: transaction.path, Staging: filepath.Base(transaction.stagingPath), DestinationExisted: true,
+	})
+	if err != nil {
+		return fmt.Errorf("record fsync checkpoint: %w", err)
+	}
+	transaction.recordPath = recordPath
+	return nil
+}
+
+func (f *FileSystem) unlinkWrite(path string) {
+	f.writesMu.Lock()
+	defer f.writesMu.Unlock()
+	if transaction := f.writes[path]; transaction != nil {
+		transaction.unlinked = true
+		delete(f.writes, path)
+	}
+}
+
+func (f *FileSystem) renameWrite(oldPath, newPath string) error {
+	f.writesMu.Lock()
+	defer f.writesMu.Unlock()
+	sources := make(map[string]*writeTransaction)
+	for path, transaction := range f.writes {
+		if path == oldPath || strings.HasPrefix(path, oldPath+"/") {
+			sources[path] = transaction
+		}
+	}
+	for path, transaction := range f.writes {
+		if path != newPath && !strings.HasPrefix(path, newPath+"/") {
+			continue
+		}
+		if _, moving := sources[path]; moving {
+			continue
+		}
+		transaction.unlinked = true
+		delete(f.writes, path)
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	for path := range sources {
+		delete(f.writes, path)
+	}
+	for old, source := range sources {
+		destination := newPath + strings.TrimPrefix(old, oldPath)
+		source.path = destination
+		recordPath, err := persistTransactionRecord(f.root, transactionRecord{
+			Path: destination, Staging: filepath.Base(source.stagingPath), DestinationExisted: source.destinationExisted,
+		})
+		if err != nil {
+			for _, transaction := range sources {
+				transaction.unlinked = true
+			}
+			return fmt.Errorf("record renamed write transaction: %w", err)
+		}
+		source.recordPath = recordPath
+		f.writes[destination] = source
+	}
+	return nil
 }
 
 func (f *FileSystem) stagedAttr(path string) (*fuse.Attr, bool) {
@@ -419,21 +573,42 @@ func (f *FileSystem) stagedAttr(path string) (*fuse.Attr, bool) {
 
 func (f *FileSystem) applyVisibleAttr(path string, attr *fuse.Attr, locked bool) {
 	f.attrsMu.Lock()
-	defer f.attrsMu.Unlock()
 	visible, ok := f.attrs[path]
+	f.attrsMu.Unlock()
+	if !ok && f.repo.Store != nil {
+		metadata, found, err := f.repo.Store.FileMetadata(path)
+		if err == nil && found {
+			visible = visibleState{signature: metadata.Signature}
+			visible.attr.Mode = metadata.Mode
+			visible.attr.Uid, visible.attr.Gid = metadata.UID, metadata.GID
+			visible.attr.Atime, visible.attr.Atimensec = joinTime(metadata.AtimeNS)
+			visible.attr.Mtime, visible.attr.Mtimensec = joinTime(metadata.MtimeNS)
+			visible.attr.Ctime, visible.attr.Ctimensec = joinTime(metadata.CtimeNS)
+			f.attrsMu.Lock()
+			f.attrs[path] = visible
+			f.attrsMu.Unlock()
+			ok = true
+		}
+	}
 	if !ok {
 		return
 	}
 	if locked {
 		target, err := os.Readlink(f.full(path))
 		if err != nil || !strings.Contains(target, "--"+visible.signature) {
+			f.attrsMu.Lock()
 			delete(f.attrs, path)
+			f.attrsMu.Unlock()
 			return
 		}
 	}
-	attr.Ino = visible.attr.Ino
-	attr.Size = visible.attr.Size
-	attr.Blocks = visible.attr.Blocks
+	if visible.attr.Ino != 0 {
+		attr.Ino = visible.attr.Ino
+	}
+	if visible.attr.Size != 0 || attr.Size == 0 {
+		attr.Size = visible.attr.Size
+		attr.Blocks = visible.attr.Blocks
+	}
 	attr.Mtime = visible.attr.Mtime
 	attr.Mtimensec = visible.attr.Mtimensec
 	attr.Ctime = visible.attr.Ctime
@@ -443,32 +618,84 @@ func (f *FileSystem) applyVisibleAttr(path string, attr *fuse.Attr, locked bool)
 }
 
 func (f *FileSystem) renameVisible(oldPath, newPath string) {
+	if oldPath == newPath {
+		return
+	}
 	f.attrsMu.Lock()
 	defer f.attrsMu.Unlock()
-	if visible, ok := f.attrs[oldPath]; ok {
-		f.attrs[newPath] = visible
-		delete(f.attrs, oldPath)
+	for path := range f.attrs {
+		if path == newPath || strings.HasPrefix(path, newPath+"/") {
+			delete(f.attrs, path)
+		}
+	}
+	moved := make(map[string]visibleState)
+	for path, visible := range f.attrs {
+		if path == oldPath || strings.HasPrefix(path, oldPath+"/") {
+			moved[newPath+strings.TrimPrefix(path, oldPath)] = visible
+			delete(f.attrs, path)
+		}
+	}
+	for path, visible := range moved {
+		f.attrs[path] = visible
 	}
 }
 
 func (f *FileSystem) removeVisible(path string) {
 	f.attrsMu.Lock()
-	delete(f.attrs, path)
+	for candidate := range f.attrs {
+		if candidate == path || strings.HasPrefix(candidate, path+"/") {
+			delete(f.attrs, candidate)
+		}
+	}
 	f.attrsMu.Unlock()
 }
 
-func (f *FileSystem) captureVisible(path string) {
-	info, err := os.Stat(f.full(path))
+func (f *FileSystem) captureVisible(path string) error {
+	target := f.full(path)
+	if transaction := f.writeAt(path); transaction != nil {
+		target = transaction.stagingPath
+	}
+	info, err := os.Stat(target)
 	if err != nil {
-		return
+		return err
 	}
 	attr := attrFromInfo(info)
 	if attr == nil {
-		return
+		return fmt.Errorf("read visible attributes for %s", path)
 	}
+	return f.saveVisible(path, attr, f.visibleSignature(path))
+}
+
+func (f *FileSystem) writeAt(path string) *writeTransaction {
+	f.writesMu.Lock()
+	defer f.writesMu.Unlock()
+	return f.writes[path]
+}
+
+func (f *FileSystem) visibleSignature(path string) string {
 	f.attrsMu.Lock()
-	visible := f.attrs[path]
-	visible.attr = *attr
-	f.attrs[path] = visible
+	defer f.attrsMu.Unlock()
+	return f.attrs[path].signature
+}
+
+func (f *FileSystem) saveVisible(path string, attr *fuse.Attr, signature string) error {
+	f.attrsMu.Lock()
+	f.attrs[path] = visibleState{attr: *attr, signature: signature}
 	f.attrsMu.Unlock()
+	if f.repo.Store == nil {
+		return nil
+	}
+	return f.repo.Store.SaveFileMetadata(path, store.FileMetadata{
+		Mode: attr.Mode, UID: attr.Uid, GID: attr.Gid,
+		AtimeNS: combineTime(attr.Atime, attr.Atimensec), MtimeNS: combineTime(attr.Mtime, attr.Mtimensec),
+		CtimeNS: combineTime(attr.Ctime, attr.Ctimensec), Signature: signature,
+	})
+}
+
+func combineTime(seconds uint64, nanoseconds uint32) int64 {
+	return int64(seconds)*int64(time.Second) + int64(nanoseconds)
+}
+
+func joinTime(nanoseconds int64) (uint64, uint32) {
+	return uint64(nanoseconds / int64(time.Second)), uint32(nanoseconds % int64(time.Second))
 }
