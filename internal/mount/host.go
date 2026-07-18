@@ -2,9 +2,12 @@ package mount
 
 import (
 	"fmt"
+	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/repository"
@@ -14,28 +17,80 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse/pathfs"
 )
 
-func Run(repo *repository.Repository, mountpoint string, foreground bool) error {
-	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
-		return fmt.Errorf("create mountpoint: %w", err)
+type Options struct {
+	Logger    *slog.Logger
+	FUSEDebug bool
+}
+
+type fuseLogWriter struct{ logger *slog.Logger }
+
+func (w fuseLogWriter) Write(p []byte) (int, error) {
+	message := strings.TrimSpace(string(p))
+	if message != "" {
+		w.logger.Debug("FUSE request", "detail", message)
 	}
-	scheduler := syncer.New(repo, repo.Config.SyncInterval, os.Stderr)
+	return len(p), nil
+}
+
+func Run(repo *repository.Repository, mountpoint string, options Options) error {
+	logger := options.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	}
+	logger = logger.With("peer", repo.Config.Name)
+	repo.SetLogger(logger)
+	logger.Info("mount starting",
+		"repository", repo.Config.Repository,
+		"mountpoint", mountpoint,
+		"sync_interval", repo.Config.SyncInterval,
+		"cache_limit_bytes", repo.Config.CacheLimit,
+		"fuse_debug", options.FUSEDebug,
+	)
+	if err := prepareMountpoint(mountpoint); err != nil {
+		logger.Error("creating mountpoint failed", "mountpoint", mountpoint, "error", err)
+		return err
+	}
+	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
 	scheduler.Start()
 	defer scheduler.Stop()
 
-	filesystem := NewFileSystem(repo, scheduler)
+	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: true})
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
-		Options: []string{"default_permissions"},
+		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,
 	}
-	options := nodefs.NewOptions()
-	options.EntryTimeout = time.Second
-	options.AttrTimeout = time.Second
-	server, _, err := nodefs.Mount(mountpoint, pathNodes.Root(), mountOptions, options)
+	if options.FUSEDebug {
+		mountOptions.Logger = log.New(fuseLogWriter{logger.With("component", "fuse")}, "", 0)
+	}
+	nodeOptions := nodefs.NewOptions()
+	nodeOptions.EntryTimeout = time.Second
+	nodeOptions.AttrTimeout = time.Second
+	server, _, err := nodefs.Mount(mountpoint, pathNodes.Root(), mountOptions, nodeOptions)
 	if err != nil {
+		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
 		return fmt.Errorf("mount DFS at %s: %w", mountpoint, err)
 	}
+	logger.Info("mount ready", "mountpoint", mountpoint)
 	server.Serve()
+	logger.Info("mount stopped", "mountpoint", mountpoint)
+	return nil
+}
+
+func prepareMountpoint(mountpoint string) error {
+	info, err := os.Stat(mountpoint)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("mountpoint %s exists but is not a directory", mountpoint)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("mountpoint %s is inaccessible: %w; unmount any stale DFS/FUSE mount before retrying", mountpoint, err)
+	}
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return fmt.Errorf("create mountpoint %s: %w", mountpoint, err)
+	}
 	return nil
 }
 

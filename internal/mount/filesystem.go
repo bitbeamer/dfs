@@ -2,6 +2,7 @@ package mount
 
 import (
 	stdcontext "context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,7 @@ type FileSystem struct {
 	repo     *repository.Repository
 	root     string
 	notifier changeNotifier
+	logger   *slog.Logger
 	sizesMu  sync.Mutex
 	sizes    map[string]uint64
 }
@@ -38,10 +40,10 @@ type trackedFile struct {
 	once       sync.Once
 }
 
-func NewFileSystem(repo *repository.Repository, notifier changeNotifier) *FileSystem {
+func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
 	return &FileSystem{
 		FileSystem: pathfs.NewLoopbackFileSystem(repo.Config.Repository),
-		repo:       repo, root: repo.Config.Repository, notifier: notifier,
+		repo:       repo, root: repo.Config.Repository, notifier: notifier, logger: logger,
 		sizes: make(map[string]uint64),
 	}
 }
@@ -78,9 +80,18 @@ func annexSymlink(path string) bool {
 }
 
 func (f *FileSystem) hydrate(name string) error {
+	path := clean(name)
+	started := time.Now()
+	f.logger.Info("content hydration started", "path", path)
 	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 24*time.Hour)
 	defer cancel()
-	return f.repo.Fetch(ctx, clean(name), "")
+	err := f.repo.Fetch(ctx, path, "")
+	if err != nil {
+		f.logger.Error("content hydration failed", "path", path, "duration", time.Since(started), "error", err)
+		return err
+	}
+	f.logger.Info("content hydration completed", "path", path, "duration", time.Since(started))
+	return nil
 }
 
 func (f *FileSystem) prepareWrite(name string) error {
@@ -95,13 +106,16 @@ func (f *FileSystem) prepareWrite(name string) error {
 	}
 	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 10*time.Minute)
 	defer cancel()
-	return f.repo.Unlock(ctx, clean(name))
+	path := clean(name)
+	f.logger.Debug("unlocking annexed file for writing", "path", path)
+	return f.repo.Unlock(ctx, path)
 }
 
-func (f *FileSystem) changed(reason string) {
+func (f *FileSystem) changed(reason string, attrs ...any) {
 	f.sizesMu.Lock()
 	clear(f.sizes)
 	f.sizesMu.Unlock()
+	f.logger.Info("filesystem changed", append([]any{"operation", reason}, attrs...)...)
 	if f.notifier != nil {
 		f.notifier.Notify(reason)
 	}
@@ -176,8 +190,10 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 		}
 		return nil, code
 	}
-	f.repo.Touch(clean(name))
-	return &trackedFile{File: file, filesystem: f, path: clean(name), writable: writable}, fuse.OK
+	path := clean(name)
+	f.repo.Touch(path)
+	f.logger.Debug("file opened", "path", path, "writable", writable, "flags", flags)
+	return &trackedFile{File: file, filesystem: f, path: path, writable: writable}, fuse.OK
 }
 
 func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
@@ -194,7 +210,9 @@ func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fus
 		}
 		return nil, code
 	}
-	return &trackedFile{File: file, filesystem: f, path: clean(name), writable: true}, fuse.OK
+	path := clean(name)
+	f.logger.Info("file created", "path", path)
+	return &trackedFile{File: file, filesystem: f, path: path, writable: true}, fuse.OK
 }
 
 func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) {
@@ -206,10 +224,11 @@ func (t *trackedFile) Release() {
 	t.File.Release()
 	if t.writable {
 		t.once.Do(func() {
+			t.filesystem.logger.Info("write completed", "path", t.path)
 			if t.filesystem.notifier != nil {
 				t.filesystem.notifier.EndWrite()
 			} else {
-				t.filesystem.changed("completed write")
+				t.filesystem.changed("completed write", "path", t.path)
 			}
 		})
 	}
@@ -238,7 +257,7 @@ func (f *FileSystem) Truncate(name string, size uint64, context *fuse.Context) f
 	}
 	code := f.FileSystem.Truncate(name, size, context)
 	if code == fuse.OK {
-		f.changed("truncate")
+		f.changed("truncate", "path", clean(name), "size", size)
 	}
 	return code
 }
@@ -249,7 +268,7 @@ func (f *FileSystem) Mkdir(name string, mode uint32, context *fuse.Context) fuse
 	}
 	code := f.FileSystem.Mkdir(name, mode, context)
 	if code == fuse.OK {
-		f.changed("mkdir")
+		f.changed("mkdir", "path", clean(name))
 	}
 	return code
 }
@@ -260,7 +279,7 @@ func (f *FileSystem) Mknod(name string, mode uint32, dev uint32, context *fuse.C
 	}
 	code := f.FileSystem.Mknod(name, mode, dev, context)
 	if code == fuse.OK {
-		f.changed("mknod")
+		f.changed("mknod", "path", clean(name))
 	}
 	return code
 }
@@ -271,7 +290,7 @@ func (f *FileSystem) Rename(oldName, newName string, context *fuse.Context) fuse
 	}
 	code := f.FileSystem.Rename(oldName, newName, context)
 	if code == fuse.OK {
-		f.changed("rename")
+		f.changed("rename", "old_path", clean(oldName), "new_path", clean(newName))
 	}
 	return code
 }
@@ -282,7 +301,7 @@ func (f *FileSystem) Rmdir(name string, context *fuse.Context) fuse.Status {
 	}
 	code := f.FileSystem.Rmdir(name, context)
 	if code == fuse.OK {
-		f.changed("rmdir")
+		f.changed("rmdir", "path", clean(name))
 	}
 	return code
 }
@@ -293,7 +312,7 @@ func (f *FileSystem) Unlink(name string, context *fuse.Context) fuse.Status {
 	}
 	code := f.FileSystem.Unlink(name, context)
 	if code == fuse.OK {
-		f.changed("unlink")
+		f.changed("unlink", "path", clean(name))
 	}
 	return code
 }
@@ -304,7 +323,7 @@ func (f *FileSystem) Link(oldName, newName string, context *fuse.Context) fuse.S
 	}
 	code := f.FileSystem.Link(oldName, newName, context)
 	if code == fuse.OK {
-		f.changed("link")
+		f.changed("link", "old_path", clean(oldName), "new_path", clean(newName))
 	}
 	return code
 }
@@ -315,7 +334,7 @@ func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse
 	}
 	code := f.FileSystem.Symlink(value, linkName, context)
 	if code == fuse.OK {
-		f.changed("symlink")
+		f.changed("symlink", "path", clean(linkName))
 	}
 	return code
 }
@@ -323,7 +342,7 @@ func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse
 func (f *FileSystem) Chmod(name string, mode uint32, context *fuse.Context) fuse.Status {
 	code := f.FileSystem.Chmod(name, mode, context)
 	if code == fuse.OK {
-		f.changed("chmod")
+		f.changed("chmod", "path", clean(name), "mode", mode)
 	}
 	return code
 }
@@ -331,7 +350,7 @@ func (f *FileSystem) Chmod(name string, mode uint32, context *fuse.Context) fuse
 func (f *FileSystem) Chown(name string, uid, gid uint32, context *fuse.Context) fuse.Status {
 	code := f.FileSystem.Chown(name, uid, gid, context)
 	if code == fuse.OK {
-		f.changed("chown")
+		f.changed("chown", "path", clean(name), "uid", uid, "gid", gid)
 	}
 	return code
 }
@@ -339,7 +358,7 @@ func (f *FileSystem) Chown(name string, uid, gid uint32, context *fuse.Context) 
 func (f *FileSystem) Utimens(name string, atime, mtime *time.Time, context *fuse.Context) fuse.Status {
 	code := f.FileSystem.Utimens(name, atime, mtime, context)
 	if code == fuse.OK {
-		f.changed("utimens")
+		f.changed("utimens", "path", clean(name))
 	}
 	return code
 }

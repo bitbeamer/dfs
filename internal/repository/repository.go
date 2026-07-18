@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -142,6 +143,16 @@ func Open(path string) (*Repository, error) {
 }
 
 func (r *Repository) Close() error { return r.Store.Close() }
+
+// SetLogger enables diagnostic logging for commands run on behalf of this
+// repository. Call it before starting concurrent repository operations.
+func (r *Repository) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		r.runner.Logger = nil
+		return
+	}
+	r.runner.Logger = logger.With("component", "command")
+}
 
 func (r *Repository) SaveConfig() error { return config.Save(r.Config) }
 

@@ -91,6 +91,31 @@ rm ~/DFS/Archive/old.pdf
 
 The mount process runs automatic metadata sync after completed transactions and every 30 seconds. Keep it running in a terminal for the MVP. Use `dfs unmount ~/DFS` from another terminal to stop it.
 
+### Mount logging and debugging
+
+Mount logging uses Go's structured `log/slog` text format. The default `error` level remains quiet unless an operation fails. Use `info` to see mount lifecycle, filesystem changes, hydration, synchronization, pin refresh, and cache-prune activity:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository mount \
+  --log-level info ~/DFS
+```
+
+Use `debug` to additionally record Git and git-annex subprocesses and their durations. `--log-file` appends the same output to a mode `0600` file while continuing to write it to the terminal:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository mount \
+  --log-level debug --log-file ~/dfs-mount.log ~/DFS
+```
+
+For low-level kernel/FUSE request tracing, add `--fuse-debug`. This is very noisy and automatically enables debug-level logging:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository mount \
+  --fuse-debug --log-file ~/dfs-fuse.log ~/DFS
+```
+
+Accepted log levels are `debug`, `info`, `warn`, and `error`.
+
 ## Content placement
 
 ```sh

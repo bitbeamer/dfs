@@ -2,8 +2,7 @@ package syncer
 
 import (
 	"context"
-	"fmt"
-	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +13,7 @@ import (
 type Scheduler struct {
 	repo     *repository.Repository
 	interval time.Duration
-	log      io.Writer
+	logger   *slog.Logger
 	events   chan string
 	stop     chan struct{}
 	done     chan struct{}
@@ -22,14 +21,14 @@ type Scheduler struct {
 	writers  atomic.Int64
 }
 
-func New(repo *repository.Repository, interval time.Duration, log io.Writer) *Scheduler {
+func New(repo *repository.Repository, interval time.Duration, logger *slog.Logger) *Scheduler {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
 	return &Scheduler{
 		repo:     repo,
 		interval: interval,
-		log:      log,
+		logger:   logger,
 		events:   make(chan string, 128),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -37,6 +36,7 @@ func New(repo *repository.Repository, interval time.Duration, log io.Writer) *Sc
 }
 
 func (s *Scheduler) Start() {
+	s.logger.Info("sync scheduler started", "interval", s.interval)
 	go s.loop()
 	s.Notify("startup")
 }
@@ -47,18 +47,25 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) Notify(reason string) {
+	s.logger.Debug("sync requested", "reason", reason)
 	select {
 	case s.events <- reason:
 	default:
 	}
 }
 
-func (s *Scheduler) BeginWrite() { s.writers.Add(1) }
+func (s *Scheduler) BeginWrite() {
+	writers := s.writers.Add(1)
+	s.logger.Debug("writer opened", "open_writers", writers)
+}
 
 func (s *Scheduler) EndWrite() {
-	if s.writers.Add(-1) < 0 {
+	writers := s.writers.Add(-1)
+	if writers < 0 {
 		s.writers.Store(0)
+		writers = 0
 	}
+	s.logger.Debug("writer closed", "open_writers", writers)
 	s.Notify("completed write")
 }
 
@@ -75,6 +82,7 @@ func (s *Scheduler) loop() {
 				debounce.Stop()
 			}
 			s.sync("shutdown")
+			s.logger.Info("sync scheduler stopped")
 			return
 		case <-ticker.C:
 			s.sync("periodic")
@@ -99,34 +107,40 @@ func (s *Scheduler) loop() {
 }
 
 func (s *Scheduler) sync(reason string) {
-	if s.writers.Load() > 0 {
+	writers := s.writers.Load()
+	if writers > 0 {
+		s.logger.Debug("automatic sync skipped", "reason", reason, "open_writers", writers)
 		return
 	}
+	started := time.Now()
+	s.logger.Info("automatic sync started", "reason", reason)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	if err := s.repo.Sync(ctx, true); err != nil {
-		s.printf("automatic sync (%s) failed: %v\n", reason, err)
+		s.logger.Error("automatic sync failed", "reason", reason, "duration", time.Since(started), "error", err)
 		return
 	}
 	pins, err := s.repo.Store.Pins()
 	if err != nil {
-		s.printf("read pins: %v\n", err)
+		s.logger.Error("reading pins failed", "error", err)
 		return
 	}
+	refreshed := 0
 	for _, path := range pins {
 		if err := s.repo.Fetch(ctx, path, ""); err != nil {
-			s.printf("refresh pinned path %s: %v\n", path, err)
+			s.logger.Error("refreshing pinned path failed", "path", path, "error", err)
+		} else {
+			refreshed++
 		}
 	}
 	if dropped, err := s.repo.Prune(ctx); err != nil {
-		s.printf("cache prune: %v\n", err)
-	} else if len(dropped) > 0 {
-		s.printf("evicted %d file(s) to enforce cache quota\n", len(dropped))
-	}
-}
-
-func (s *Scheduler) printf(format string, args ...any) {
-	if s.log != nil {
-		_, _ = fmt.Fprintf(s.log, format, args...)
+		s.logger.Error("cache prune failed", "error", err)
+	} else {
+		s.logger.Info("automatic sync completed",
+			"reason", reason,
+			"duration", time.Since(started),
+			"pins_refreshed", refreshed,
+			"files_evicted", len(dropped),
+		)
 	}
 }

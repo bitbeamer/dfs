@@ -260,18 +260,32 @@ func (a *App) storageCommand() *cobra.Command {
 }
 
 func (a *App) mountCommand() *cobra.Command {
-	return &cobra.Command{
+	var logLevel, logFile string
+	var fuseDebug bool
+	cmd := &cobra.Command{
 		Use: "mount <mountpoint>", Args: cobra.ExactArgs(1), Short: "Mount the DFS namespace and run automatic sync",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			logger, closer, err := newMountLogger(logLevel, logFile, a.Err, fuseDebug)
+			if err != nil {
+				return err
+			}
+			if closer != nil {
+				defer closer.Close()
+			}
 			repo, err := a.open()
 			if err != nil {
+				logger.Error("opening repository failed", "error", err)
 				return err
 			}
 			defer repo.Close()
 			fmt.Fprintf(a.Out, "Mounting %s at %s; press Ctrl-C to stop\n", repo.Config.Repository, args[0])
-			return dfsmount.Run(repo, args[0], true)
+			return dfsmount.Run(repo, args[0], dfsmount.Options{Logger: logger, FUSEDebug: fuseDebug})
 		},
 	}
+	cmd.Flags().StringVar(&logLevel, "log-level", "error", "logging level: debug, info, warn, or error")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "append logs to this file as well as stderr")
+	cmd.Flags().BoolVar(&fuseDebug, "fuse-debug", false, "log low-level FUSE protocol requests and enable debug logging (very noisy)")
+	return cmd
 }
 
 func (a *App) unmountCommand() *cobra.Command {

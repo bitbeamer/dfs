@@ -2,9 +2,11 @@ package integration
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,8 +48,15 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	}
 	defer repo.Close()
 	mountpoint := filepath.Join(home, "mnt")
+	mountLogPath := filepath.Join(home, "mount.log")
+	mountLog, err := os.OpenFile(mountLogPath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mountLog.Close()
+	logger := slog.New(slog.NewTextHandler(mountLog, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	errCh := make(chan error, 1)
-	go func() { errCh <- dfsmount.Run(repo, mountpoint, true) }()
+	go func() { errCh <- dfsmount.Run(repo, mountpoint, dfsmount.Options{Logger: logger}) }()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(filepath.Join(mountpoint, ".gitignore")); err == nil {
@@ -90,5 +99,14 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	command.Dir = repo.Config.Repository
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("mounted file was not annexed: %s: %v", output, err)
+	}
+	logContent, err := os.ReadFile(mountLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"msg=\"mount ready\"", "msg=\"file created\"", "msg=\"write completed\"", "msg=\"automatic sync completed\""} {
+		if !strings.Contains(string(logContent), expected) {
+			t.Fatalf("mount info log does not contain %q:\n%s", expected, logContent)
+		}
 	}
 }
