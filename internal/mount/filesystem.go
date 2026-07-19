@@ -41,9 +41,8 @@ type FileSystem struct {
 	annexInodesMu sync.Mutex
 	annexInodes   map[string]uint64
 	invalidate    pathInvalidator
-	// macOS follows file changes through vnode events rather than polling the
-	// name as GNU tail does. Keep its open annex handles on the current object
-	// so a content notification can preserve the reader's offset.
+	// Keep open annex handles on the current object so a content notification
+	// can preserve a reader's offset across peer updates.
 	followAnnexReplacements bool
 }
 

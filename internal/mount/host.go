@@ -49,8 +49,8 @@ type nodePathInvalidator struct {
 func (i nodePathInvalidator) Invalidate(path string) {
 	if i.contentOnly {
 		// This is discovered from getattr. Notify after that request returns to
-		// avoid nesting a macFUSE upcall, while retaining the vnode and its read
-		// offset. BSD tail receives a content event without an ENXIO revocation.
+		// avoid nesting a FUSE upcall, while retaining the vnode and its read
+		// offset. Tail receives a content event without a replacement event.
 		time.AfterFunc(10*time.Millisecond, func() {
 			i.paths.FileNotify(path, 0, 0)
 		})
@@ -134,7 +134,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
-	filesystem.followAnnexReplacements = runtime.GOOS == "darwin"
+	filesystem.followAnnexReplacements = true
 	filesystem.invalidate = nodePathInvalidator{
 		paths: pathNodes, contentOnly: filesystem.followAnnexReplacements,
 	}
