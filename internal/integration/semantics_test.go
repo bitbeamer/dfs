@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -347,6 +348,22 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 		waitForTextContains(t, stdoutPath, stderrPath, "one\n", 5*time.Second)
 		swapSymlink(t, backingPath, targets[len(targets)-1])
 		waitForTextContains(t, stdoutPath, stderrPath, "four\n", 12*time.Second)
+		if runtime.GOOS == "darwin" {
+			output, err := os.ReadFile(stdoutPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			diagnostics, diagnosticsErr := os.ReadFile(stderrPath)
+			if string(output) != versions[len(versions)-1] {
+				t.Fatalf("tail replayed replaced content: %q; diagnostics=%q error=%v", output, diagnostics, diagnosticsErr)
+			}
+			if diagnosticsErr != nil {
+				t.Fatal(diagnosticsErr)
+			}
+			if strings.Contains(string(diagnostics), "Device not configured") {
+				t.Fatalf("tail observed a revoked vnode: %s", diagnostics)
+			}
+		}
 	})
 }
 

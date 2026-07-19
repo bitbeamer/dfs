@@ -28,17 +28,23 @@ type changeNotifier interface {
 
 type FileSystem struct {
 	pathfs.FileSystem
-	repo       *repository.Repository
-	root       string
-	notifier   changeNotifier
-	logger     *slog.Logger
-	sizesMu    sync.Mutex
-	sizes      map[string]uint64
-	writesMu   sync.Mutex
-	writes     map[string]*writeTransaction
-	attrsMu    sync.Mutex
-	attrs      map[string]visibleState
-	invalidate pathInvalidator
+	repo          *repository.Repository
+	root          string
+	notifier      changeNotifier
+	logger        *slog.Logger
+	sizesMu       sync.Mutex
+	sizes         map[string]uint64
+	writesMu      sync.Mutex
+	writes        map[string]*writeTransaction
+	attrsMu       sync.Mutex
+	attrs         map[string]visibleState
+	annexInodesMu sync.Mutex
+	annexInodes   map[string]uint64
+	invalidate    pathInvalidator
+	// macOS follows file changes through vnode events rather than polling the
+	// name as GNU tail does. Keep its open annex handles on the current object
+	// so a content notification can preserve the reader's offset.
+	followAnnexReplacements bool
 }
 
 type trackedFile struct {
@@ -46,6 +52,8 @@ type trackedFile struct {
 	filesystem     *FileSystem
 	path           string
 	annexTarget    string
+	openFlags      uint32
+	mu             sync.Mutex
 	invalidateOnce sync.Once
 }
 
@@ -58,7 +66,7 @@ func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger 
 		FileSystem: pathfs.NewLoopbackFileSystem(repo.Config.Repository),
 		repo:       repo, root: repo.Config.Repository, notifier: notifier, logger: logger,
 		sizes: make(map[string]uint64), writes: make(map[string]*writeTransaction),
-		attrs: make(map[string]visibleState),
+		attrs: make(map[string]visibleState), annexInodes: make(map[string]uint64),
 	}
 }
 
@@ -183,7 +191,24 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 		attr.Blocks = (attr.Size + 511) / 512
 	}
 	f.applyVisibleAttr(path, attr, locked)
+	if locked {
+		f.applyStableAnnexInode(path, attr)
+	}
 	return attr, code
+}
+
+func (f *FileSystem) applyStableAnnexInode(path string, attr *fuse.Attr) {
+	if !f.followAnnexReplacements || attr.Ino == 0 {
+		return
+	}
+	f.annexInodesMu.Lock()
+	defer f.annexInodesMu.Unlock()
+	inode := f.annexInodes[path]
+	if inode == 0 {
+		inode = attr.Ino
+		f.annexInodes[path] = inode
+	}
+	attr.Ino = inode
 }
 
 func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
@@ -209,7 +234,9 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 	}
 	f.repo.Touch(path)
 	f.logger.Debug("file opened", "path", path, "writable", false, "flags", flags)
-	tracked := &trackedFile{File: file, filesystem: f, path: path, annexTarget: annexTarget}
+	tracked := &trackedFile{
+		File: file, filesystem: f, path: path, annexTarget: annexTarget, openFlags: flags,
+	}
 	if annexTarget != "" {
 		// Git-annex publishes a new version by replacing the symlink in the
 		// worktree. Stable FUSE inode identities can otherwise retain pages from
@@ -272,14 +299,27 @@ func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fus
 
 func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) {
 	t.filesystem.repo.Touch(t.path)
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.File.Read(dest, off)
 }
 
 func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
+	refreshed := false
+	if t.filesystem.followAnnexReplacements && t.annexTarget != "" {
+		var code fuse.Status
+		refreshed, code = t.refreshAnnexTarget()
+		if code != fuse.OK {
+			return code
+		}
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	var code fuse.Status
 	changedTarget := false
 	err := t.filesystem.repo.WithWorkTreeLock(func() error {
-		if t.annexTarget != "" {
+		if !t.filesystem.followAnnexReplacements && t.annexTarget != "" {
 			if current, ok := annexLinkTarget(t.filesystem.full(t.path)); ok && current != t.annexTarget {
 				changedTarget = true
 			}
@@ -300,12 +340,17 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 		// internal representation change must not make fstat disagree with stat
 		// and cause name-following readers to reopen identical content.
 		t.filesystem.applyVisibleAttr(t.path, out, annexSymlink(t.filesystem.full(t.path)))
+		t.filesystem.applyStableAnnexInode(t.path, out)
 		return nil
 	})
 	if err != nil {
 		return status(err)
 	}
-	if changedTarget && t.filesystem.invalidate != nil {
+	if (changedTarget || refreshed) && t.filesystem.invalidate != nil {
+		if refreshed {
+			t.filesystem.invalidate.Invalidate(t.path)
+			return code
+		}
 		// Keep this node alive for the old descriptor, but detach its name so
 		// the kernel's next lookup creates a node for the replacement target.
 		t.invalidateOnce.Do(func() { t.filesystem.invalidate.Invalidate(t.path) })
@@ -313,7 +358,40 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	return code
 }
 
+func (t *trackedFile) refreshAnnexTarget() (bool, fuse.Status) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var current string
+	err := t.filesystem.repo.WithWorkTreeLock(func() error {
+		current, _ = annexLinkTarget(t.filesystem.full(t.path))
+		return nil
+	})
+	if err != nil {
+		return false, status(err)
+	}
+	if current == "" || current == t.annexTarget {
+		return false, fuse.OK
+	}
+
+	replacement, target, err := t.filesystem.openBackingRead(t.path, t.openFlags)
+	if err != nil {
+		return false, status(err)
+	}
+	if target == t.annexTarget {
+		replacement.Release()
+		return false, fuse.OK
+	}
+	previous := t.File
+	t.File = replacement
+	t.annexTarget = target
+	previous.Release()
+	return true, fuse.OK
+}
+
 func (t *trackedFile) Release() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.File.Release()
 }
 

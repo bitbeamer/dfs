@@ -241,6 +241,75 @@ func TestAnnexTargetChangeGivesFreshHandlePathInode(t *testing.T) {
 	}
 }
 
+func TestAnnexTargetChangeRefreshesFollowingHandle(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	filesystem.followAnnexReplacements = true
+	invalidator := &recordingInvalidator{}
+	filesystem.invalidate = invalidator
+	objects := filepath.Join(root, ".git", "annex", "objects")
+	oldObject := filepath.Join(objects, "old", "content")
+	newObject := filepath.Join(objects, "new", "content")
+	for path, content := range map[string]string{
+		oldObject: "old\n", newObject: "old\nnew\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(root, "annex.txt")
+	oldTarget, err := filepath.Rel(root, oldObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(oldTarget, link); err != nil {
+		t.Fatal(err)
+	}
+	initialAttr, code := filesystem.GetAttr("annex.txt", nil)
+	if code != fuse.OK {
+		t.Fatalf("initial GetAttr() = %v", code)
+	}
+	handle, code := filesystem.Open("annex.txt", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatalf("Open() = %v", code)
+	}
+	defer handle.Release()
+
+	newTarget, err := filepath.Rel(root, newObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(root, "replacement")
+	if err := os.Symlink(newTarget, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, link); err != nil {
+		t.Fatal(err)
+	}
+	var handleAttr fuse.Attr
+	if code := handle.GetAttr(&handleAttr); code != fuse.OK {
+		t.Fatalf("GetAttr() after replacement = %v", code)
+	}
+	if handleAttr.Ino != initialAttr.Ino {
+		t.Fatalf("following handle inode changed from %d to %d", initialAttr.Ino, handleAttr.Ino)
+	}
+	buffer := make([]byte, 4)
+	result, code := handle.Read(buffer, 4)
+	if code != fuse.OK {
+		t.Fatalf("Read() after replacement = %v", code)
+	}
+	content, code := result.Bytes(buffer)
+	if code != fuse.OK || string(content) != "new\n" {
+		t.Fatalf("Read() at prior EOF = %q, %v", content, code)
+	}
+	if len(invalidator.paths) != 1 || invalidator.paths[0] != "annex.txt" {
+		t.Fatalf("refreshed annex target invalidated paths %q", invalidator.paths)
+	}
+}
+
 func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)

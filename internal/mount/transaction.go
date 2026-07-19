@@ -623,7 +623,6 @@ func (f *FileSystem) renameVisible(oldPath, newPath string) {
 		return
 	}
 	f.attrsMu.Lock()
-	defer f.attrsMu.Unlock()
 	for path := range f.attrs {
 		if path == newPath || strings.HasPrefix(path, newPath+"/") {
 			delete(f.attrs, path)
@@ -639,6 +638,24 @@ func (f *FileSystem) renameVisible(oldPath, newPath string) {
 	for path, visible := range moved {
 		f.attrs[path] = visible
 	}
+	f.attrsMu.Unlock()
+	f.annexInodesMu.Lock()
+	for candidate := range f.annexInodes {
+		if candidate == newPath || strings.HasPrefix(candidate, newPath+"/") {
+			delete(f.annexInodes, candidate)
+		}
+	}
+	movedInodes := make(map[string]uint64)
+	for candidate, inode := range f.annexInodes {
+		if candidate == oldPath || strings.HasPrefix(candidate, oldPath+"/") {
+			movedInodes[newPath+strings.TrimPrefix(candidate, oldPath)] = inode
+			delete(f.annexInodes, candidate)
+		}
+	}
+	for candidate, inode := range movedInodes {
+		f.annexInodes[candidate] = inode
+	}
+	f.annexInodesMu.Unlock()
 }
 
 func (f *FileSystem) removeVisible(path string) {
@@ -649,6 +666,13 @@ func (f *FileSystem) removeVisible(path string) {
 		}
 	}
 	f.attrsMu.Unlock()
+	f.annexInodesMu.Lock()
+	for candidate := range f.annexInodes {
+		if candidate == path || strings.HasPrefix(candidate, path+"/") {
+			delete(f.annexInodes, candidate)
+		}
+	}
+	f.annexInodesMu.Unlock()
 }
 
 func (f *FileSystem) captureVisible(path string) error {

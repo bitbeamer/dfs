@@ -42,10 +42,20 @@ type mountpointAccess struct {
 }
 
 type nodePathInvalidator struct {
-	paths *pathfs.PathNodeFs
+	paths       *pathfs.PathNodeFs
+	contentOnly bool
 }
 
 func (i nodePathInvalidator) Invalidate(path string) {
+	if i.contentOnly {
+		// This is discovered from getattr. Notify after that request returns to
+		// avoid nesting a macFUSE upcall, while retaining the vnode and its read
+		// offset. BSD tail receives a content event without an ENXIO revocation.
+		time.AfterFunc(10*time.Millisecond, func() {
+			i.paths.FileNotify(path, 0, 0)
+		})
+		return
+	}
 	directory, name := filepath.Split(filepath.FromSlash(path))
 	directory = filepath.ToSlash(filepath.Clean(directory))
 	if directory == "." {
@@ -124,7 +134,10 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
-	filesystem.invalidate = nodePathInvalidator{paths: pathNodes}
+	filesystem.followAnnexReplacements = runtime.GOOS == "darwin"
+	filesystem.invalidate = nodePathInvalidator{
+		paths: pathNodes, contentOnly: filesystem.followAnnexReplacements,
+	}
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,
