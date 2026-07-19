@@ -329,7 +329,7 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 			t.Fatal(err)
 		}
 		tailContext, cancelTail := context.WithCancel(context.Background())
-		follow := exec.CommandContext(tailContext, tail, "-F", "-s", "0.1", mountedPath)
+		follow := exec.CommandContext(tailContext, tail, "-F", mountedPath)
 		follow.Stdout = stdout
 		follow.Stderr = stderr
 		if err := follow.Start(); err != nil {
@@ -346,7 +346,7 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 		})
 		waitForTextContains(t, stdoutPath, stderrPath, "one\n", 5*time.Second)
 		swapSymlink(t, backingPath, targets[len(targets)-1])
-		waitForTextContains(t, stdoutPath, stderrPath, "four\n", 5*time.Second)
+		waitForTextContains(t, stdoutPath, stderrPath, "four\n", 12*time.Second)
 	})
 }
 
