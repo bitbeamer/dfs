@@ -148,7 +148,7 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 			t.Fatal(err)
 		}
 		tailContext, cancelTail := context.WithCancel(ctx)
-		follow := exec.CommandContext(tailContext, tail, "-n", "+1", "--follow=name", "--retry", "--sleep-interval=0.1", "--max-unchanged-stats=1", filepath.Join(mountpoint, "mounted.txt"))
+		follow := exec.CommandContext(tailContext, tail, "-F", filepath.Join(mountpoint, "mounted.txt"))
 		follow.Stdout = stdout
 		follow.Stderr = stderr
 		if err := follow.Start(); err != nil {
