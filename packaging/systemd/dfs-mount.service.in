@@ -1,0 +1,21 @@
+[Unit]
+Description=DFS managed FUSE mount
+Documentation=https://github.com/bitbeamer/dfs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart="@DFS_BINARY@" --repo "@DFS_REPOSITORY@" mount --managed --log-level info --log-format json "@DFS_MOUNTPOINT@"
+ExecStartPost="@DFS_BINARY@" --repo "@DFS_REPOSITORY@" health
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=10min
+TimeoutStopSec=30s
+WatchdogSec=90s
+UMask=0077
+Environment="PATH=@DFS_PATH@"
+
+[Install]
+WantedBy=default.target

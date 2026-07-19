@@ -7,13 +7,16 @@ import (
 	"os"
 )
 
-func newMountLogger(levelName, logFile string, stderr io.Writer, forceDebug bool) (*slog.Logger, io.Closer, error) {
+func newMountLogger(levelName, formatName, logFile string, stderr io.Writer, forceDebug bool) (*slog.Logger, io.Closer, error) {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(levelName)); err != nil {
 		return nil, nil, fmt.Errorf("invalid log level %q (use debug, info, warn, or error)", levelName)
 	}
 	if forceDebug {
 		level = slog.LevelDebug
+	}
+	if formatName != "text" && formatName != "json" {
+		return nil, nil, fmt.Errorf("invalid log format %q (use text or json)", formatName)
 	}
 
 	writer := stderr
@@ -27,6 +30,14 @@ func newMountLogger(levelName, logFile string, stderr io.Writer, forceDebug bool
 		writer = io.MultiWriter(stderr, file)
 	}
 
-	logger := slog.New(slog.NewTextHandler(writer, &slog.HandlerOptions{Level: level}))
+	options := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	switch formatName {
+	case "text":
+		handler = slog.NewTextHandler(writer, options)
+	case "json":
+		handler = slog.NewJSONHandler(writer, options)
+	}
+	logger := slog.New(handler)
 	return logger, closer, nil
 }

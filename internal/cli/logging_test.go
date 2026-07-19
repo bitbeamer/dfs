@@ -11,7 +11,7 @@ import (
 func TestNewMountLoggerHonorsLevelAndLogFile(t *testing.T) {
 	var stderr bytes.Buffer
 	logFile := filepath.Join(t.TempDir(), "mount.log")
-	logger, closer, err := newMountLogger("info", logFile, &stderr, false)
+	logger, closer, err := newMountLogger("info", "text", logFile, &stderr, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,20 +42,38 @@ func TestNewMountLoggerHonorsLevelAndLogFile(t *testing.T) {
 }
 
 func TestNewMountLoggerRejectsInvalidLevel(t *testing.T) {
-	if _, _, err := newMountLogger("chatty", "", &bytes.Buffer{}, false); err == nil {
+	if _, _, err := newMountLogger("chatty", "text", "", &bytes.Buffer{}, false); err == nil {
 		t.Fatal("invalid log level unexpectedly succeeded")
+	}
+}
+
+func TestNewMountLoggerRejectsInvalidFormat(t *testing.T) {
+	if _, _, err := newMountLogger("info", "binary", "", &bytes.Buffer{}, false); err == nil {
+		t.Fatal("invalid log format unexpectedly succeeded")
 	}
 }
 
 func TestFuseDebugForcesDebugLogging(t *testing.T) {
 	var output bytes.Buffer
-	logger, _, err := newMountLogger("error", "", &output, true)
+	logger, _, err := newMountLogger("error", "text", "", &output, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	logger.Debug("fuse detail")
 	if !strings.Contains(output.String(), "fuse detail") {
 		t.Fatalf("fuse debug did not enable debug-level output: %s", output.String())
+	}
+}
+
+func TestNewMountLoggerSupportsJSON(t *testing.T) {
+	var output bytes.Buffer
+	logger, _, err := newMountLogger("info", "json", "", &output, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Info("mounted", "peer", "test")
+	if content := output.String(); !strings.Contains(content, `"msg":"mounted"`) || !strings.Contains(content, `"peer":"test"`) {
+		t.Fatalf("JSON log is not structured: %s", content)
 	}
 }
 

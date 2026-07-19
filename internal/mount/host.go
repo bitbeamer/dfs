@@ -63,7 +63,7 @@ func (w fuseLogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func Run(repo *repository.Repository, mountpoint string, options Options) error {
+func Run(repo *repository.Repository, mountpoint string, options Options) (runErr error) {
 	ctx := options.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -74,6 +74,15 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	}
 	logger = logger.With("peer", repo.Config.Name)
 	repo.SetLogger(logger)
+	health := newHealthReporter(repo.Config.Name, repo.Config.Repository, mountpoint, logger)
+	health.update("starting", false, nil)
+	notifySystemd("STATUS=Starting DFS mount")
+	defer func() {
+		if runErr != nil {
+			health.update("failed", false, runErr)
+			notifySystemd("STATUS=DFS mount failed: " + runErr.Error())
+		}
+	}()
 	logger.Info("mount starting",
 		"repository", repo.Config.Repository,
 		"mountpoint", mountpoint,
@@ -126,14 +135,26 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
 	}
 	logger.Info("mount ready", "mountpoint", mountpoint)
+	health.update("ready", true, nil)
+	notifySystemd("READY=1\nSTATUS=DFS mounted at " + mountpoint)
+	heartbeatStop := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	go func() {
+		health.heartbeat(heartbeatStop)
+		close(heartbeatDone)
+	}()
 	serveDone := make(chan struct{})
 	go func() {
 		server.Serve()
 		close(serveDone)
 	}()
 	shutdown, shutdownReason := waitForMountStop(ctx, options.Signals, serveDone)
+	close(heartbeatStop)
+	<-heartbeatDone
 	if shutdown {
 		logger.Info("shutdown requested", "reason", shutdownReason)
+		health.update("stopping", false, nil)
+		notifySystemd("STOPPING=1\nSTATUS=Unmounting DFS")
 		if err := unmountAndWait(server, serveDone, func() error { return forceUnmount(mountpoint) }, normalUnmountGrace); err != nil {
 			logger.Error("automatic unmount failed",
 				"mountpoint", mountpoint,
@@ -144,6 +165,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 		}
 	}
 	logger.Info("mount stopped", "mountpoint", mountpoint)
+	health.update("stopped", false, nil)
 	return nil
 }
 

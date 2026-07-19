@@ -5,7 +5,7 @@ DFS is an experimental, quota-aware distributed filesystem for Linux and macOS. 
 Every peer sees the complete file and directory tree. File content is downloaded only when opened, explicitly fetched, or pinned. Moves and renames therefore work even when the content is not stored locally.
 
 > [!WARNING]
-> This is an MVP. Use a separate test dataset and keep an independent backup. Linux is exercised by the integration suite; the macOS build is compile-checked but still needs broader application-compatibility testing.
+> This is an MVP. Use a separate test dataset and keep an independent backup. Linux and macOS are exercised with native FUSE integration tests, but broader application-compatibility testing is still needed.
 
 ## What works
 
@@ -20,6 +20,7 @@ Every peer sees the complete file and directory tree. File content is downloaded
 - Pin, fetch, unpin, safe eviction, and LRU quota enforcement.
 - Git history and non-destructive restore commits.
 - Encrypted S3-compatible git-annex storage.
+- Managed user services with health reporting on systemd and launchd.
 - One Go codebase for Linux and macOS.
 
 ## Requirements
@@ -60,6 +61,62 @@ make build
 
 The binary uses the native Go FUSE protocol implementation and does not link against libfuse. FUSE or macFUSE is still required at runtime.
 
+## Managed mount service
+
+The recommended setup runs the foreground mount process under the operating system's user service manager. The service manager handles login startup, restart after failure, SIGTERM shutdown, and log collection; DFS continues to own FUSE unmounting and repository recovery.
+
+Build DFS first, then install the service with the repository and mountpoint for that peer.
+
+### CachyOS/systemd
+
+```sh
+make build
+./scripts/install-cachyos.sh \
+  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+```
+
+This installs the binary as `~/.local/bin/dfs`, writes and enables `~/.config/systemd/user/dfs-mount.service`, waits for systemd's DFS readiness notification, and enables a watchdog. Useful commands are:
+
+```sh
+systemctl --user status dfs-mount
+journalctl --user -u dfs-mount -f
+systemctl --user restart dfs-mount
+systemctl --user stop dfs-mount
+dfs --repo ~/.local/share/dfs/repository health
+```
+
+User services normally start when the user logs in. To allow this mount to start during boot before login, an administrator can enable lingering once:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+### macOS/launchd
+
+```sh
+make build
+./scripts/install-macos.sh \
+  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+```
+
+This installs the binary under `~/Library/Application Support/DFS/bin`, creates `~/Library/LaunchAgents/io.bitbeamer.dfs.mount.plist`, loads it into the current GUI login session, and waits for the mount to report healthy. Inspect or control it with:
+
+```sh
+launchctl print gui/$(id -u)/io.bitbeamer.dfs.mount
+launchctl kickstart -k gui/$(id -u)/io.bitbeamer.dfs.mount
+dfs --repo ~/.local/share/dfs/repository health
+tail -F ~/Library/Logs/DFS/mount.stderr.log
+```
+
+Rerun the platform installer after building a new DFS version. To disable and remove a service definition while retaining the installed binary and repository data:
+
+```sh
+./scripts/install-cachyos.sh --uninstall  # CachyOS
+./scripts/install-macos.sh --uninstall    # macOS
+```
+
+Packagers can use the templates under `packaging/systemd` and `packaging/launchd`. The installers generate equivalent definitions with absolute, safely escaped local paths.
+
 ## Two-peer quick start
 
 On Linux:
@@ -92,7 +149,7 @@ mv ~/DFS/Documents/report.pdf ~/DFS/Archive/
 rm ~/DFS/Archive/old.pdf
 ```
 
-The mount process runs automatic metadata sync after completed transactions and every 30 seconds. Keep it running in a terminal for the MVP. Press Ctrl-C to cleanly unmount and stop it, or use `dfs unmount ~/DFS` from another terminal. SIGTERM uses the same clean shutdown path. If another process has its working directory inside the mount, shutdown falls back to a lazy/forced detach rather than hanging on `EBUSY`. A later `dfs mount` automatically detaches a disconnected DFS/FUSE endpoint left behind by a crashed process; it does not replace a healthy existing mount.
+The mount process runs automatic metadata sync after completed transactions and every 30 seconds. When running it manually, press Ctrl-C to cleanly unmount and stop it, or use `dfs unmount ~/DFS` from another terminal. SIGTERM from systemd or launchd uses the same clean shutdown path. If another process has its working directory inside the mount, shutdown falls back to a lazy/forced detach rather than hanging on `EBUSY`. A later service or manual start automatically detaches a disconnected DFS/FUSE endpoint left behind by a crashed process; it does not replace a healthy existing mount.
 
 ### Transactional writes
 
@@ -138,6 +195,21 @@ dfs --repo ~/.local/share/dfs/repository mount \
 ```
 
 Accepted log levels are `debug`, `info`, `warn`, and `error`.
+
+Managed services use `--log-format json --log-level info`. systemd sends these records to the user journal; launchd writes them under `~/Library/Logs/DFS`. Manual mounts default to the more readable structured text format. Either mode can explicitly select `--log-format text` or `--log-format json`.
+
+### Health and recovery
+
+While mounting, DFS atomically updates `.git/dfs/health.json` with its lifecycle state, PID, hostname, mountpoint, start time, heartbeat time, and last startup/shutdown error. It is private peer state and never appears in the mounted volume or Git history. Check it with:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository health
+dfs --repo ~/.local/share/dfs/repository health --json
+```
+
+The command succeeds only when the report is current, the owning process is alive on this host, and the mountpoint responds. States progress through `starting`, `ready`, and `stopping`/`stopped`; startup failures remain recorded as `failed`. systemd additionally waits for the `ready` transition and receives a watchdog heartbeat.
+
+On restart, DFS removes a dead same-host session record and detaches Linux `ENOTCONN` or macOS `ENXIO` FUSE endpoints before mounting. A session claiming to belong to another host still requires explicit `--recover-stale-session` after verifying that remote mount is gone; service supervision never overrides that safety check.
 
 ## Content placement
 
@@ -204,6 +276,9 @@ Restore creates a new commit and does not rewrite shared history.
 applications / Finder
         │
         ▼
+systemd / launchd supervision and health
+        │
+        ▼
 Go FUSE mounted view
         │ open, close, rename, delete
         ▼
@@ -223,7 +298,7 @@ The underlying Git working tree is an implementation detail. DFS keeps its peer-
 - The conflict command lists conflicts but does not provide a full conflict-resolution UI.
 - History does not itself retain old annex objects. Replicate versions to durable storage before allowing their last copy to be dropped.
 - Memory mapping, sparse files, ACL replication, cross-peer POSIX-metadata replication, and large creative applications need more cross-platform stress testing.
-- The mount process is foreground-only and there is no GUI or service installer yet.
+- There is no GUI; service installation and peer administration are command-line workflows.
 - Cloud storage is S3-compatible only in the CLI; additional providers can be added through git-annex special remotes later.
 
 ## Development

@@ -261,12 +261,7 @@ func sessionMayBeActive(record sessionRecord, hostname string, recoverStaleSessi
 	if record.PID <= 0 || record.Hostname == "" {
 		return false
 	}
-	process, err := os.FindProcess(record.PID)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return processAlive(record.PID)
 }
 
 func (session *recoverySession) Close() error {

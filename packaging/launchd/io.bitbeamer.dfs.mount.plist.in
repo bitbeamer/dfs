@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.bitbeamer.dfs.mount</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@DFS_BINARY@</string>
+    <string>--repo</string>
+    <string>@DFS_REPOSITORY@</string>
+    <string>mount</string>
+    <string>--managed</string>
+    <string>--log-level</string>
+    <string>info</string>
+    <string>--log-format</string>
+    <string>json</string>
+    <string>@DFS_MOUNTPOINT@</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>@DFS_STDOUT_LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@DFS_STDERR_LOG@</string>
+</dict>
+</plist>

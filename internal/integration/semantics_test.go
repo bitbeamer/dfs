@@ -497,12 +497,18 @@ func mountSemanticTestFS(t *testing.T) (string, *repository.Repository) {
 		errCh <- dfsmount.Run(repo, mountpoint, dfsmount.Options{Context: mountContext, Logger: logger})
 	}()
 	waitForPath(t, filepath.Join(mountpoint, readyName), 10*time.Second)
+	if health, err := dfsmount.CheckHealth(repo.Config.Repository); err != nil || health.State != "ready" {
+		t.Fatalf("mount health after startup = %+v, %v", health, err)
+	}
 	t.Cleanup(func() {
 		cancelMount()
 		select {
 		case err := <-errCh:
 			if err != nil {
 				t.Errorf("mount shutdown: %v", err)
+			}
+			if health, healthErr := dfsmount.ReadHealth(repo.Config.Repository); healthErr != nil || health.State != "stopped" {
+				t.Errorf("mount health after shutdown = %+v, %v", health, healthErr)
 			}
 		case <-time.After(10 * time.Second):
 			t.Error("mount did not stop")

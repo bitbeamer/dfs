@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -41,7 +42,7 @@ func New() *cobra.Command {
 	root.AddCommand(
 		app.initCommand(), app.joinCommand(), app.peerCommand(), app.relayCommand(),
 		app.storageCommand(),
-		app.mountCommand(), app.unmountCommand(), app.syncCommand(), app.statusCommand(),
+		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
 		app.cacheCommand(), app.historyCommand(), app.restoreCommand(), app.conflictsCommand(),
 		app.doctorCommand(),
@@ -262,15 +263,15 @@ func (a *App) storageCommand() *cobra.Command {
 }
 
 func (a *App) mountCommand() *cobra.Command {
-	var logLevel, logFile string
-	var fuseDebug, recoverStaleSession bool
+	var logLevel, logFormat, logFile string
+	var fuseDebug, recoverStaleSession, managed bool
 	cmd := &cobra.Command{
 		Use: "mount <mountpoint>", Args: cobra.ExactArgs(1), Short: "Mount the DFS namespace and run automatic sync",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mountSignals := make(chan os.Signal, 2)
 			signal.Notify(mountSignals, os.Interrupt, syscall.SIGTERM)
 			defer signal.Stop(mountSignals)
-			logger, closer, err := newMountLogger(logLevel, logFile, a.Err, fuseDebug)
+			logger, closer, err := newMountLogger(logLevel, logFormat, logFile, a.Err, fuseDebug)
 			if err != nil {
 				return err
 			}
@@ -283,7 +284,9 @@ func (a *App) mountCommand() *cobra.Command {
 				return err
 			}
 			defer repo.Close()
-			fmt.Fprintf(a.Out, "Mounting %s at %s; press Ctrl-C to stop\n", repo.Config.Repository, args[0])
+			if !managed {
+				fmt.Fprintf(a.Out, "Mounting %s at %s; press Ctrl-C to stop\n", repo.Config.Repository, args[0])
+			}
 			return dfsmount.Run(repo, args[0], dfsmount.Options{
 				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug,
 				RecoverStaleSession: recoverStaleSession, Signals: mountSignals,
@@ -291,9 +294,11 @@ func (a *App) mountCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&logLevel, "log-level", "error", "logging level: debug, info, warn, or error")
+	cmd.Flags().StringVar(&logFormat, "log-format", "text", "structured log format: text or json")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "append logs to this file as well as stderr")
 	cmd.Flags().BoolVar(&fuseDebug, "fuse-debug", false, "log low-level FUSE protocol requests and enable debug logging (very noisy)")
 	cmd.Flags().BoolVar(&recoverStaleSession, "recover-stale-session", false, "take over after verifying another host's recorded mount is inactive")
+	cmd.Flags().BoolVar(&managed, "managed", false, "run under a service manager without interactive output")
 	return cmd
 }
 
@@ -302,6 +307,33 @@ func (a *App) unmountCommand() *cobra.Command {
 		Use: "unmount <mountpoint>", Aliases: []string{"umount"}, Args: cobra.ExactArgs(1), Short: "Unmount a DFS namespace",
 		RunE: func(cmd *cobra.Command, args []string) error { return dfsmount.Unmount(args[0]) },
 	}
+}
+
+func (a *App) healthCommand() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use: "health", Args: cobra.NoArgs, Short: "Report managed mount health",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			report, healthErr := dfsmount.CheckHealth(repositoryPath)
+			if asJSON {
+				encoder := json.NewEncoder(a.Out)
+				encoder.SetIndent("", "  ")
+				if err := encoder.Encode(report); err != nil {
+					return err
+				}
+			} else if report.Version != 0 {
+				fmt.Fprintf(a.Out, "%s: peer %s mounted at %s (pid %d, updated %s)\n",
+					report.State, report.Peer, report.Mountpoint, report.PID, report.UpdatedAt.Format(time.RFC3339))
+			}
+			return healthErr
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the complete health report as JSON")
+	return cmd
 }
 
 func (a *App) syncCommand() *cobra.Command {
