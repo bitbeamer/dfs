@@ -414,6 +414,10 @@ func mountSemanticTestFS(t *testing.T) (string, *repository.Repository) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	readyName := ".mount-ready"
+	if err := os.WriteFile(filepath.Join(repo.Config.Repository, readyName), []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	mountpoint := filepath.Join(home, "mnt")
 	mountContext, cancelMount := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -421,7 +425,7 @@ func mountSemanticTestFS(t *testing.T) (string, *repository.Repository) {
 	go func() {
 		errCh <- dfsmount.Run(repo, mountpoint, dfsmount.Options{Context: mountContext, Logger: logger})
 	}()
-	waitForPath(t, filepath.Join(mountpoint, ".gitignore"), 10*time.Second)
+	waitForPath(t, filepath.Join(mountpoint, readyName), 10*time.Second)
 	t.Cleanup(func() {
 		cancelMount()
 		select {

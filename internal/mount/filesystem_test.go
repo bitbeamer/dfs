@@ -42,6 +42,15 @@ func testFileSystem(t *testing.T, root string) *FileSystem {
 	return NewFileSystem(repo, nil, logger)
 }
 
+func TestOnlyGitMetadataIsHidden(t *testing.T) {
+	if !hidden(".git/dfs/state.db") {
+		t.Fatal("Git metadata is visible")
+	}
+	if hidden(".dfs/user-data") {
+		t.Fatal("user-owned .dfs path is hidden")
+	}
+}
+
 func TestGetAttrUsesAnnexObjectPermissions(t *testing.T) {
 	root := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

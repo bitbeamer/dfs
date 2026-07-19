@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/config"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
@@ -47,6 +48,10 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repo.Close()
+	readyName := ".mount-ready"
+	if err := os.WriteFile(filepath.Join(repo.Config.Repository, readyName), []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	mountpoint := filepath.Join(home, "mnt")
 	mountLogPath := filepath.Join(home, "mount.log")
 	mountLog, err := os.OpenFile(mountLogPath, os.O_CREATE|os.O_WRONLY, 0o600)
@@ -62,13 +67,16 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := os.Stat(filepath.Join(mountpoint, ".gitignore")); err == nil {
+		if _, err := os.Stat(filepath.Join(mountpoint, readyName)); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("mount did not become ready")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(mountpoint, ".git", "dfs")); !os.IsNotExist(err) {
+		t.Fatalf("private DFS state is visible through mount: %v", err)
 	}
 	defer func() {
 		cancelMount()
@@ -275,12 +283,12 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 		}
 	}
 	for _, directory := range []string{"staging", "transactions"} {
-		entries, err := os.ReadDir(filepath.Join(repo.Config.Repository, ".dfs", directory))
+		entries, err := os.ReadDir(filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), directory))
 		if err != nil {
 			t.Fatalf("read %s directory: %v", directory, err)
 		}
 		if len(entries) != 0 {
-			t.Fatalf("completed writes left artifacts in .dfs/%s: %v", directory, entries)
+			t.Fatalf("completed writes left artifacts in %s/%s: %v", config.Directory, directory, entries)
 		}
 	}
 	logContent, err := os.ReadFile(mountLogPath)

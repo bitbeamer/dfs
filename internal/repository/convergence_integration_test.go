@@ -245,7 +245,7 @@ func trackedPaths(t *testing.T, ctx context.Context, repo *Repository) []string 
 	out := gitOutput(t, ctx, repo, "ls-tree", "-r", "--name-only", "HEAD")
 	var paths []string
 	for _, path := range strings.Split(out, "\n") {
-		if path != "" && path != ".gitignore" {
+		if path != "" {
 			paths = append(paths, path)
 		}
 	}

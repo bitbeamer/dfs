@@ -149,6 +149,9 @@ func recoverStartup(ctx context.Context, repo *repository.Repository, mountpoint
 	if err := run.quarantineAnnexTemps(); err != nil {
 		return fail(err)
 	}
+	if err := repo.RepairLegacyPrivateState(ctx); err != nil {
+		return fail(fmt.Errorf("remove legacy DFS state from Git: %w", err))
+	}
 	operation, err := run.snapshotIncompleteGitOperation()
 	if err != nil {
 		return fail(err)

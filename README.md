@@ -96,7 +96,7 @@ The mount process runs automatic metadata sync after completed transactions and 
 
 ### Transactional writes
 
-Writable opens use copy-on-write files under the repository's private `.dfs/staging` directory. Reads through the mount see staged content, while the locked git-annex entry is left untouched until the final writable handle successfully flushes or closes. DFS publishes a dirty staging file with a same-filesystem atomic rename and then schedules annexing and synchronization. A writable open that performs no write, truncate, or handle-level metadata mutation discards its staging copy without changing Git or triggering sync.
+Writable opens use copy-on-write files under the repository's private `.git/dfs/staging` directory. Reads through the mount see staged content, while the locked git-annex entry is left untouched until the final writable handle successfully flushes or closes. DFS publishes a dirty staging file with a same-filesystem atomic rename and then schedules annexing and synchronization. A writable open that performs no write, truncate, or handle-level metadata mutation discards its staging copy without changing Git or triggering sync.
 
 `fsync` first synchronizes the staging descriptor, then atomically publishes and directory-syncs a checkpoint without ending the open transaction. A later write can advance that checkpoint; after a crash, the last successfully synchronized destination remains valid and any newer unfinished staging payload is quarantined by startup recovery. Flush and `fsync` errors are returned to the application, mark the transaction failed, and prevent an unverified payload from being published on release.
 
@@ -110,9 +110,9 @@ Permissions, ownership, timestamps, and extended attributes are stored in the pe
 
 Peers may commit while disconnected. After they reconnect, concurrent edits retain both contents using deterministic `.variant-*` names; a modification concurrent with deletion is retained as a variant, and competing rename/move destinations are both kept. DFS disables Git's heuristic rename pairing during synchronization so independent operations on different paths with identical annex content cannot be mistaken for one another and discard a valid version. Repeated synchronization reaches the same Git tree on every peer.
 
-Mount startup holds an exclusive repository session and performs conservative recovery before exposing the filesystem. Interrupted write payloads, legacy staging files, partial annex transfers, and stale Git index locks are moved under `.dfs/recovery/<timestamp>/`; the last published destination is left untouched. Durable transaction manifests let DFS remove only proven empty placeholders from interrupted creates and recognize writes whose atomic rename completed before a crash. Pending Git index changes are committed, then Git and git-annex receive fast consistency checks. In-progress merges, rebases, cherry-picks, reverts, and bisects are copied to the recovery directory and block mounting for manual resolution rather than being destructively reset.
+Mount startup holds an exclusive repository session and performs conservative recovery before exposing the filesystem. Interrupted write payloads, legacy staging files, partial annex transfers, and stale Git index locks are moved under `.git/dfs/recovery/<timestamp>/`; the last published destination is left untouched. Durable transaction manifests let DFS remove only proven empty placeholders from interrupted creates and recognize writes whose atomic rename completed before a crash. Pending Git index changes are committed, then Git and git-annex receive fast consistency checks. In-progress merges, rebases, cherry-picks, reverts, and bisects are copied to the recovery directory and block mounting for manual resolution rather than being destructively reset.
 
-A session recorded by another hostname is assumed active because DFS cannot safely inspect arbitrary remote processes. After verifying that the reported mount is no longer active, pass `--recover-stale-session` to `dfs mount`. DFS preserves the displaced session record in `.dfs/recovery/` before continuing. The option never overrides a live mount on the current host.
+A session recorded by another hostname is assumed active because DFS cannot safely inspect arbitrary remote processes. After verifying that the reported mount is no longer active, pass `--recover-stale-session` to `dfs mount`. DFS preserves the displaced session record in `.git/dfs/recovery/` before continuing. The option never overrides a live mount on the current host.
 
 ### Mount logging and debugging
 
@@ -215,7 +215,7 @@ DFS transaction and quota scheduler
         └── S3: optional durable content
 ```
 
-The underlying Git working tree is an implementation detail. `.git` and `.dfs` are hidden from the mounted view. A locked git-annex symlink is presented as a normal file; opening missing content runs `git annex get`, and opening it for writing first hydrates it into a private copy-on-write transaction.
+The underlying Git working tree is an implementation detail. DFS keeps its peer-local configuration, database, mount session, staging, and recovery data under `.git/dfs`, so none of it is tracked by Git or exposed through the mount. A locked git-annex symlink is presented as a normal file; opening missing content runs `git annex get`, and opening it for writing first hydrates it into a private copy-on-write transaction.
 
 ## MVP limitations
 

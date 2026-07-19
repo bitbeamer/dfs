@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/store"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
@@ -137,7 +138,7 @@ func (f *FileSystem) createTransaction(path string, flags uint32, mode os.FileMo
 		}
 	}
 
-	stagingDirectory := filepath.Join(f.root, ".dfs", "staging")
+	stagingDirectory := filepath.Join(f.root, filepath.FromSlash(config.Directory), "staging")
 	if err := os.MkdirAll(stagingDirectory, 0o700); err != nil {
 		return nil, fmt.Errorf("create staging directory: %w", err)
 	}

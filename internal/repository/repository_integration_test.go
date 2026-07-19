@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/bitbeamer/dfs/internal/config"
 )
 
 func TestTwoPeerMetadataAndContentFlow(t *testing.T) {
@@ -27,6 +29,15 @@ func TestTwoPeerMetadataAndContentFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer linux.Close()
+	if _, err := os.Stat(filepath.Join(linux.Config.Repository, ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("DFS init created a user-visible .gitignore: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(linux.Config.Repository, config.LegacyDirectory)); !os.IsNotExist(err) {
+		t.Fatalf("DFS init created legacy worktree state: %v", err)
+	}
+	if _, err := os.Stat(config.Path(linux.Config.Repository)); err != nil {
+		t.Fatalf("private DFS config is not under Git metadata: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(linux.Config.Repository, "hello.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

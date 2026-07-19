@@ -77,10 +77,6 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 	if _, err := runner.Run(ctx, "git", "config", "annex.largefiles", "anything"); err != nil {
 		return nil, err
 	}
-	ignore := ".dfs/\n.DS_Store\n"
-	if err := os.WriteFile(filepath.Join(path, ".gitignore"), []byte(ignore), 0o644); err != nil {
-		return nil, err
-	}
 	cfg := config.Default(name, path)
 	if cacheLimit > 0 {
 		cfg.CacheLimit = cacheLimit
@@ -88,10 +84,7 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 	if err := config.Save(cfg); err != nil {
 		return nil, err
 	}
-	if _, err := runner.Run(ctx, "git", "add", ".gitignore"); err != nil {
-		return nil, err
-	}
-	if _, err := runner.Run(ctx, "git", "commit", "-m", "Initialize DFS repository"); err != nil {
+	if _, err := runner.Run(ctx, "git", "commit", "--allow-empty", "-m", "Initialize DFS repository"); err != nil {
 		return nil, err
 	}
 	return Open(path)
@@ -135,7 +128,7 @@ func Open(path string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	state, err := store.Open(filepath.Join(cfg.Repository, config.Directory, "state.db"))
+	state, err := store.Open(filepath.Join(cfg.Repository, filepath.FromSlash(config.Directory), "state.db"))
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +164,15 @@ func (r *Repository) CommitPending(ctx context.Context, message string) (bool, e
 	return r.commitPendingLocked(ctx, message)
 }
 
+// RepairLegacyPrivateState removes runtime files that older DFS versions kept
+// in the worktree from Git's index. If they are the only merge conflicts left
+// by git-annex sync, it also completes that cleanup merge.
+func (r *Repository) RepairLegacyPrivateState(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.repairLegacyPrivateStateLocked(ctx)
+}
+
 // CheckConsistency validates Git object connectivity and lets git-annex repair
 // inexpensive metadata inconsistencies without hashing all stored content.
 func (r *Repository) CheckConsistency(ctx context.Context) error {
@@ -186,6 +188,9 @@ func (r *Repository) CheckConsistency(ctx context.Context) error {
 }
 
 func (r *Repository) commitPendingLocked(ctx context.Context, message string) (bool, error) {
+	if err := r.repairLegacyPrivateStateLocked(ctx); err != nil {
+		return false, err
+	}
 	// git-annex handles new and modified user files. Git then records deletions,
 	// renames, pointer updates, and ordinary control files.
 	if _, err := r.runner.Run(ctx, "git", "annex", "add", "."); err != nil {
@@ -208,6 +213,63 @@ func (r *Repository) commitPendingLocked(ctx context.Context, message string) (b
 		return false, err
 	}
 	return true, nil
+}
+
+var legacyPrivatePaths = []string{
+	".dfs/config.json",
+	".dfs/mount.lock",
+	".dfs/state.db",
+	".dfs/state.db-shm",
+	".dfs/state.db-wal",
+	".dfs/recovery",
+	".dfs/staging",
+	".dfs/transactions",
+}
+
+func legacyPrivatePath(path string) bool {
+	path = filepath.ToSlash(path)
+	for _, private := range legacyPrivatePaths {
+		if path == private || strings.HasPrefix(path, private+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Repository) repairLegacyPrivateStateLocked(ctx context.Context) error {
+	unmerged, err := r.runner.Run(ctx, "git", "diff", "--name-only", "--diff-filter=U", "-z")
+	if err != nil {
+		return err
+	}
+	var conflictPaths []string
+	for _, path := range strings.Split(unmerged, "\x00") {
+		if path != "" {
+			conflictPaths = append(conflictPaths, path)
+		}
+	}
+	args := []string{"rm", "-r", "-f", "--cached", "--ignore-unmatch", "--"}
+	args = append(args, legacyPrivatePaths...)
+	if _, err := r.runner.Run(ctx, "git", args...); err != nil {
+		return fmt.Errorf("remove legacy DFS state from Git: %w", err)
+	}
+	if len(conflictPaths) == 0 {
+		return nil
+	}
+	for _, path := range conflictPaths {
+		if !legacyPrivatePath(path) {
+			return nil
+		}
+	}
+	if _, err := os.Stat(filepath.Join(r.Config.Repository, ".git", "MERGE_HEAD")); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if _, err := r.runner.Run(ctx, "git", "commit", "-m", "Remove DFS private state from shared history"); err != nil {
+		return fmt.Errorf("complete legacy DFS state cleanup merge: %w", err)
+	}
+	return nil
 }
 
 func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {

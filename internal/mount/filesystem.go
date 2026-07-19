@@ -66,7 +66,7 @@ func clean(name string) string {
 func hidden(name string) bool {
 	name = clean(name)
 	first := strings.Split(name, "/")[0]
-	return first == ".git" || first == ".dfs"
+	return first == ".git"
 }
 
 func (f *FileSystem) full(name string) string {
@@ -300,7 +300,7 @@ func (f *FileSystem) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntr
 	}
 	result := entries[:0]
 	for _, entry := range entries {
-		if entry.Name != ".git" && entry.Name != ".dfs" {
+		if entry.Name != ".git" {
 			entry.Name = norm.NFC.String(entry.Name)
 			result = append(result, entry)
 		}

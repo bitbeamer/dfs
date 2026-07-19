@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	Directory = ".dfs"
-	FileName  = "config.json"
+	Directory       = ".git/dfs"
+	LegacyDirectory = ".dfs"
+	FileName        = "config.json"
 )
 
 type Config struct {
@@ -42,6 +43,9 @@ func Path(repository string) string {
 func Load(repository string) (Config, error) {
 	repository, err := ResolveRepository(repository)
 	if err != nil {
+		return Config{}, err
+	}
+	if err := migrateLegacyState(repository); err != nil {
 		return Config{}, err
 	}
 	b, err := os.ReadFile(Path(repository))
@@ -97,6 +101,9 @@ func ResolveRepository(repository string) (string, error) {
 		if _, err := os.Stat(Path(current)); err == nil {
 			return current, nil
 		}
+		if _, err := os.Stat(filepath.Join(current, LegacyDirectory, FileName)); err == nil {
+			return current, nil
+		}
 		parent := filepath.Dir(current)
 		if parent == current {
 			break
@@ -104,6 +111,29 @@ func ResolveRepository(repository string) (string, error) {
 		current = parent
 	}
 	return "", errors.New("not inside a DFS repository; pass --repo or set DFS_REPO")
+}
+
+func migrateLegacyState(repository string) error {
+	legacy := filepath.Join(repository, LegacyDirectory)
+	destination := filepath.Join(repository, filepath.FromSlash(Directory))
+	if _, err := os.Stat(filepath.Join(destination, FileName)); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect DFS state directory: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, FileName)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect legacy DFS state directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return fmt.Errorf("prepare DFS state migration: %w", err)
+	}
+	if err := os.Rename(legacy, destination); err != nil {
+		return fmt.Errorf("move DFS state from %s to %s: %w", legacy, destination, err)
+	}
+	return nil
 }
 
 func ParseSize(value string) (int64, error) {
