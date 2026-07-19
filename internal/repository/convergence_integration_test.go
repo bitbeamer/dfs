@@ -15,8 +15,15 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 	if _, err := exec.LookPath("git-annex"); err != nil {
 		t.Skip("git-annex is not installed")
 	}
+	home := t.TempDir()
+	gitconfig := []byte("[user]\n\tname = DFS Test\n\temail = dfs@example.invalid\n")
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), gitconfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
 
 	t.Run("edits retain both versions", func(t *testing.T) {
+		t.Parallel()
 		linux, mac, ctx := newConvergencePeers(t, "shared.txt", "baseline\n")
 
 		writePeerFile(t, ctx, linux, "shared.txt", "edited on linux\n")
@@ -34,6 +41,7 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 	})
 
 	t.Run("rename and move retain both destinations", func(t *testing.T) {
+		t.Parallel()
 		linux, mac, ctx := newConvergencePeers(t, "document.txt", "same content\n")
 
 		renamePeerFile(t, linux, "document.txt", "renamed.txt")
@@ -50,6 +58,7 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 	})
 
 	t.Run("modification survives concurrent deletion", func(t *testing.T) {
+		t.Parallel()
 		linux, mac, ctx := newConvergencePeers(t, "notes.txt", "baseline\n")
 
 		if err := os.Remove(filepath.Join(linux.Config.Repository, "notes.txt")); err != nil {
@@ -68,6 +77,7 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 	})
 
 	t.Run("connected operations propagate without variants", func(t *testing.T) {
+		t.Parallel()
 		linux, mac, ctx := newConvergencePeers(t, "online.txt", "baseline\n")
 
 		writePeerFile(t, ctx, linux, "online.txt", "connected edit\n")
@@ -95,6 +105,7 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 	})
 
 	t.Run("identical baselines do not cross-pair concurrent operations", func(t *testing.T) {
+		t.Parallel()
 		linux, mac, ctx := newConvergencePeers(t, "edit.txt", "identical baseline\n")
 		for _, path := range []string{"relocate.txt", "delete.txt"} {
 			writePeerFile(t, ctx, linux, path, "identical baseline\n")
@@ -135,17 +146,12 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 
 func newConvergencePeers(t *testing.T, path, content string) (*Repository, *Repository, context.Context) {
 	t.Helper()
-	home := t.TempDir()
-	t.Cleanup(func() { makeTreeWritable(home) })
-	gitconfig := []byte("[user]\n\tname = DFS Test\n\temail = dfs@example.invalid\n")
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), gitconfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", home)
+	root := t.TempDir()
+	t.Cleanup(func() { makeTreeWritable(root) })
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
 
-	linux, err := Init(ctx, filepath.Join(home, "linux"), "linux", 10<<20)
+	linux, err := Init(ctx, filepath.Join(root, "linux"), "linux", 10<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +159,7 @@ func newConvergencePeers(t *testing.T, path, content string) (*Repository, *Repo
 	writePeerFile(t, ctx, linux, path, content)
 	commitPeerChange(t, ctx, linux)
 
-	mac, err := Join(ctx, linux.Config.Repository, filepath.Join(home, "mac"), "mac", 10<<20)
+	mac, err := Join(ctx, linux.Config.Repository, filepath.Join(root, "mac"), "mac", 10<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
