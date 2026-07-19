@@ -55,12 +55,11 @@ func (i nodePathInvalidator) Invalidate(path string) {
 	if parent == nil {
 		return
 	}
-	child := parent.RmChild(name)
-	if child != nil {
-		i.paths.Connector().DeleteNotify(parent, child, name)
-	} else {
-		i.paths.EntryNotify(directory, name)
-	}
+	// Do not send a synchronous FUSE notification here. Invalidation is
+	// discovered from within an active getattr request, and macFUSE can block
+	// when a notification is nested inside that request. Detaching the child is
+	// sufficient: normal dentry expiry makes the next lookup create a new node.
+	parent.RmChild(name)
 }
 
 const normalUnmountGrace = time.Second
