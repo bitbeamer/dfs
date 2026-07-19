@@ -158,19 +158,57 @@ func TestMountSessionRejectsLiveOwnerAndReclaimsDeadOwner(t *testing.T) {
 
 	writeSession(os.Getpid(), "live")
 	run := newRecoveryRun(t, root)
-	if _, _, err := run.acquireSession("/new"); err == nil || !strings.Contains(err.Error(), "already mounted") {
+	if _, _, err := run.acquireSession("/new", false); err == nil || !strings.Contains(err.Error(), "already mounted") {
 		t.Fatalf("live session error = %v", err)
+	}
+	if _, _, err := run.acquireSession("/new", true); err == nil || !strings.Contains(err.Error(), "already mounted") {
+		t.Fatalf("explicit recovery overrode live local session: %v", err)
 	}
 	if err := os.Remove(lockPath); err != nil {
 		t.Fatal(err)
 	}
 	writeSession(1<<30, "dead")
-	session, stale, err := run.acquireSession("/new")
+	session, stale, err := run.acquireSession("/new", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stale == "" {
 		t.Fatal("dead session was not reclaimed")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMountSessionRequiresExplicitRecoveryForAnotherHost(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, config.Directory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(directory, "mount.lock")
+	record := sessionRecord{Version: 1, PID: 1234, Hostname: "another-host", Token: "stale", Mountpoint: "/old"}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := newRecoveryRun(t, root)
+	if _, _, err := run.acquireSession("/new", false); err == nil || !strings.Contains(err.Error(), "--recover-stale-session") {
+		t.Fatalf("cross-host session error = %v", err)
+	}
+	session, stale, err := run.acquireSession("/new", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale == "" {
+		t.Fatal("explicit recovery did not reclaim cross-host session")
+	}
+	if content, err := os.ReadFile(stale); err != nil || string(content) != string(data) {
+		t.Fatalf("recovered session record = %q, %v", content, err)
 	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
@@ -188,7 +226,7 @@ func TestMountSessionDoesNotStealFreshPartialClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := newRecoveryRun(t, root)
-	if _, _, err := run.acquireSession("/new"); err == nil || !strings.Contains(err.Error(), "retry shortly") {
+	if _, _, err := run.acquireSession("/new", false); err == nil || !strings.Contains(err.Error(), "retry shortly") {
 		t.Fatalf("partial session claim error = %v", err)
 	}
 	if content, err := os.ReadFile(lockPath); err != nil || string(content) != "{" {
@@ -225,7 +263,7 @@ func TestRecoverySnapshotsIncompleteGitOperationWithoutRemovingIt(t *testing.T) 
 func TestSessionRecordClosePreservesReplacementOwner(t *testing.T) {
 	root := t.TempDir()
 	run := newRecoveryRun(t, root)
-	session, _, err := run.acquireSession("/mnt")
+	session, _, err := run.acquireSession("/mnt", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +366,7 @@ func TestRecoverStartupPreservesLastPublishedVersion(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	session, err := recoverStartup(ctx, repo, filepath.Join(home, "mnt"), logger)
+	session, err := recoverStartup(ctx, repo, filepath.Join(home, "mnt"), logger, false)
 	if err != nil {
 		t.Fatal(err)
 	}

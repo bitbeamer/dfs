@@ -112,6 +112,8 @@ Peers may commit while disconnected. After they reconnect, concurrent edits reta
 
 Mount startup holds an exclusive repository session and performs conservative recovery before exposing the filesystem. Interrupted write payloads, legacy staging files, partial annex transfers, and stale Git index locks are moved under `.dfs/recovery/<timestamp>/`; the last published destination is left untouched. Durable transaction manifests let DFS remove only proven empty placeholders from interrupted creates and recognize writes whose atomic rename completed before a crash. Pending Git index changes are committed, then Git and git-annex receive fast consistency checks. In-progress merges, rebases, cherry-picks, reverts, and bisects are copied to the recovery directory and block mounting for manual resolution rather than being destructively reset.
 
+A session recorded by another hostname is assumed active because DFS cannot safely inspect arbitrary remote processes. After verifying that the reported mount is no longer active, pass `--recover-stale-session` to `dfs mount`. DFS preserves the displaced session record in `.dfs/recovery/` before continuing. The option never overrides a live mount on the current host.
+
 ### Mount logging and debugging
 
 Mount logging uses Go's structured `log/slog` text format. The default `error` level remains quiet unless an operation fails. Use `info` to see mount lifecycle, filesystem changes, hydration, synchronization, pin refresh, and cache-prune activity:

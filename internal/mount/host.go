@@ -21,10 +21,11 @@ import (
 )
 
 type Options struct {
-	Context   context.Context
-	Logger    *slog.Logger
-	FUSEDebug bool
-	Signals   <-chan os.Signal
+	Context             context.Context
+	Logger              *slog.Logger
+	FUSEDebug           bool
+	RecoverStaleSession bool
+	Signals             <-chan os.Signal
 }
 
 type fuseLogWriter struct{ logger *slog.Logger }
@@ -67,7 +68,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 		"cache_limit_bytes", repo.Config.CacheLimit,
 		"fuse_debug", options.FUSEDebug,
 	)
-	session, err := recoverStartup(ctx, repo, mountpoint, logger)
+	session, err := recoverStartup(ctx, repo, mountpoint, logger, options.RecoverStaleSession)
 	if err != nil {
 		logger.Error("startup recovery failed", "error", err)
 		return fmt.Errorf("recover DFS repository before mount: %w", err)

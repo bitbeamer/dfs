@@ -122,9 +122,9 @@ func syncDirectory(path string) error {
 	return err
 }
 
-func recoverStartup(ctx context.Context, repo *repository.Repository, mountpoint string, logger *slog.Logger) (*recoverySession, error) {
+func recoverStartup(ctx context.Context, repo *repository.Repository, mountpoint string, logger *slog.Logger, recoverStaleSession bool) (*recoverySession, error) {
 	run := &recoveryRun{root: repo.Config.Repository, token: randomToken(), logger: logger.With("component", "recovery")}
-	session, staleLock, err := run.acquireSession(mountpoint)
+	session, staleLock, err := run.acquireSession(mountpoint, recoverStaleSession)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +170,7 @@ func recoverStartup(ctx context.Context, repo *repository.Repository, mountpoint
 	return session, nil
 }
 
-func (run *recoveryRun) acquireSession(mountpoint string) (*recoverySession, string, error) {
+func (run *recoveryRun) acquireSession(mountpoint string, recoverStaleSession bool) (*recoverySession, string, error) {
 	directory := filepath.Join(run.root, config.Directory)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, "", err
@@ -217,8 +217,12 @@ func (run *recoveryRun) acquireSession(mountpoint string) (*recoverySession, str
 			return nil, "", err
 		}
 		existing, readErr := readSessionRecord(lockPath)
-		if readErr == nil && sessionMayBeActive(existing, hostname) {
-			return nil, "", fmt.Errorf("repository is already mounted by pid %d on %s at %s", existing.PID, existing.Hostname, existing.Mountpoint)
+		if readErr == nil && sessionMayBeActive(existing, hostname, recoverStaleSession) {
+			message := fmt.Sprintf("repository is already mounted by pid %d on %s at %s", existing.PID, existing.Hostname, existing.Mountpoint)
+			if existing.Hostname != "" && existing.Hostname != hostname {
+				message += "; if that mount is no longer active, retry with --recover-stale-session"
+			}
+			return nil, "", errors.New(message)
 		}
 		if readErr != nil {
 			if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) < sessionClaimGrace {
@@ -247,9 +251,9 @@ func readSessionRecord(path string) (sessionRecord, error) {
 	return record, err
 }
 
-func sessionMayBeActive(record sessionRecord, hostname string) bool {
+func sessionMayBeActive(record sessionRecord, hostname string, recoverStaleSession bool) bool {
 	if record.Hostname != "" && record.Hostname != hostname {
-		return true
+		return !recoverStaleSession
 	}
 	if record.PID <= 0 || record.Hostname == "" {
 		return false

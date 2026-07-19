@@ -263,7 +263,7 @@ func (a *App) storageCommand() *cobra.Command {
 
 func (a *App) mountCommand() *cobra.Command {
 	var logLevel, logFile string
-	var fuseDebug bool
+	var fuseDebug, recoverStaleSession bool
 	cmd := &cobra.Command{
 		Use: "mount <mountpoint>", Args: cobra.ExactArgs(1), Short: "Mount the DFS namespace and run automatic sync",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -285,13 +285,15 @@ func (a *App) mountCommand() *cobra.Command {
 			defer repo.Close()
 			fmt.Fprintf(a.Out, "Mounting %s at %s; press Ctrl-C to stop\n", repo.Config.Repository, args[0])
 			return dfsmount.Run(repo, args[0], dfsmount.Options{
-				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug, Signals: mountSignals,
+				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug,
+				RecoverStaleSession: recoverStaleSession, Signals: mountSignals,
 			})
 		},
 	}
 	cmd.Flags().StringVar(&logLevel, "log-level", "error", "logging level: debug, info, warn, or error")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "append logs to this file as well as stderr")
 	cmd.Flags().BoolVar(&fuseDebug, "fuse-debug", false, "log low-level FUSE protocol requests and enable debug logging (very noisy)")
+	cmd.Flags().BoolVar(&recoverStaleSession, "recover-stale-session", false, "take over after verifying another host's recorded mount is inactive")
 	return cmd
 }
 
