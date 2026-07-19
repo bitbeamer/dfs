@@ -121,6 +121,63 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if tail, err := exec.LookPath("tail"); err == nil {
+		if err := repo.Unlock(ctx, "mounted.txt"); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Lstat(underlying); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("unlocked annex file is not regular: mode=%v err=%v", infoMode(info), err)
+		}
+		stdoutPath := filepath.Join(home, "tail.stdout")
+		stderrPath := filepath.Join(home, "tail.stderr")
+		stdout, err := os.Create(stdoutPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stderr, err := os.Create(stderrPath)
+		if err != nil {
+			_ = stdout.Close()
+			t.Fatal(err)
+		}
+		tailContext, cancelTail := context.WithCancel(ctx)
+		follow := exec.CommandContext(tailContext, tail, "-n", "+1", "--follow=name", "--retry", "--sleep-interval=0.1", "--max-unchanged-stats=1", filepath.Join(mountpoint, "mounted.txt"))
+		follow.Stdout = stdout
+		follow.Stderr = stderr
+		if err := follow.Start(); err != nil {
+			cancelTail()
+			_ = stdout.Close()
+			_ = stderr.Close()
+			t.Fatal(err)
+		}
+		waitForFileContent(t, stdoutPath, "mounted\n", 5*time.Second)
+		if _, err := repo.CommitPending(ctx, "Relock unchanged annex content"); err != nil {
+			t.Fatal(err)
+		}
+		waitForAnnexed(t, underlying)
+		time.Sleep(500 * time.Millisecond)
+		cancelTail()
+		_ = follow.Wait()
+		if err := stdout.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := stderr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		output, err := os.ReadFile(stdoutPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		diagnostics, err := os.ReadFile(stderrPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(output) != "mounted\n" {
+			t.Fatalf("tail replayed content after annex relock: %q", output)
+		}
+		if strings.Contains(string(diagnostics), "has been replaced") {
+			t.Fatalf("tail observed internal annex replacement: %s", diagnostics)
+		}
+	}
 	originalHead := gitOutput(t, ctx, repo.Config.Repository, "rev-parse", "HEAD")
 	noop, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_RDWR, 0)
 	if err != nil {
@@ -242,6 +299,20 @@ func infoMode(info os.FileInfo) os.FileMode {
 		return 0
 	}
 	return info.Mode()
+}
+
+func waitForFileContent(t *testing.T, path, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(path)
+		if err == nil && string(content) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	content, err := os.ReadFile(path)
+	t.Fatalf("file content did not become %q: got %q, %v", want, content, err)
 }
 
 func gitOutput(t *testing.T, ctx context.Context, directory string, args ...string) string {

@@ -256,6 +256,21 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	var code fuse.Status
 	err := t.filesystem.repo.WithWorkTreeLock(func() error {
 		code = t.File.GetAttr(out)
+		if code != fuse.OK {
+			return nil
+		}
+		if attr, ok := t.filesystem.stagedAttr(t.path); ok {
+			if attr.Ino != 0 {
+				out.Ino = attr.Ino
+			}
+			return nil
+		}
+		// FileSystem.GetAttr presents the inode and metadata captured when a
+		// write was published. Apply the same view to open handles: git-annex
+		// may replace the worktree file with a symlink to an object, but that
+		// internal representation change must not make fstat disagree with stat
+		// and cause name-following readers to reopen identical content.
+		t.filesystem.applyVisibleAttr(t.path, out, annexSymlink(t.filesystem.full(t.path)))
 		return nil
 	})
 	if err != nil {

@@ -19,10 +19,14 @@ import (
 type attrFile struct {
 	nodefs.File
 	called chan struct{}
+	attr   fuse.Attr
 }
 
-func (f *attrFile) GetAttr(*fuse.Attr) fuse.Status {
-	close(f.called)
+func (f *attrFile) GetAttr(out *fuse.Attr) fuse.Status {
+	if f.called != nil {
+		close(f.called)
+	}
+	*out = f.attr
 	return fuse.OK
 }
 
@@ -164,5 +168,25 @@ func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("handle attributes did not resume after the annex update")
+	}
+}
+
+func TestTrackedFileGetAttrUsesVisibleInode(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	filesystem.attrs["annex.txt"] = visibleState{
+		attr: fuse.Attr{Ino: 42, Size: 7, Mode: syscall.S_IFREG | 0o644},
+	}
+	file := &trackedFile{
+		File:       &attrFile{File: nodefs.NewDefaultFile(), attr: fuse.Attr{Ino: 99, Size: 7}},
+		filesystem: filesystem,
+		path:       "annex.txt",
+	}
+	var attr fuse.Attr
+	if code := file.GetAttr(&attr); code != fuse.OK {
+		t.Fatalf("GetAttr() = %v", code)
+	}
+	if attr.Ino != 42 {
+		t.Fatalf("GetAttr().Ino = %d, want preserved visible inode 42", attr.Ino)
 	}
 }
