@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/repository"
@@ -14,6 +15,16 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
 )
+
+type attrFile struct {
+	nodefs.File
+	called chan struct{}
+}
+
+func (f *attrFile) GetAttr(*fuse.Attr) fuse.Status {
+	close(f.called)
+	return fuse.OK
+}
 
 func testFileSystem(t *testing.T, root string) *FileSystem {
 	t.Helper()
@@ -115,5 +126,43 @@ func TestOpenAnnexFileUsesDirectIO(t *testing.T) {
 	content, code := result.Bytes(buffer)
 	if code != fuse.OK || string(content) != "current version\n" {
 		t.Fatalf("Read() = %q, %v", content, code)
+	}
+}
+
+func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = filesystem.repo.WithWorkTreeLock(func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
+
+	called := make(chan struct{})
+	done := make(chan struct{})
+	file := &trackedFile{
+		File:       &attrFile{File: nodefs.NewDefaultFile(), called: called},
+		filesystem: filesystem,
+		path:       "annex.txt",
+	}
+	go func() {
+		file.GetAttr(&fuse.Attr{})
+		close(done)
+	}()
+	select {
+	case <-called:
+		t.Fatal("handle attributes observed the worktree during an annex update")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handle attributes did not resume after the annex update")
 	}
 }

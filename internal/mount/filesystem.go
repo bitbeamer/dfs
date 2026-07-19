@@ -252,6 +252,18 @@ func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status
 	return t.File.Read(dest, off)
 }
 
+func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
+	var code fuse.Status
+	err := t.filesystem.repo.WithWorkTreeLock(func() error {
+		code = t.File.GetAttr(out)
+		return nil
+	})
+	if err != nil {
+		return status(err)
+	}
+	return code
+}
+
 func (t *trackedFile) Release() {
 	t.File.Release()
 }
