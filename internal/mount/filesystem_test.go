@@ -133,6 +133,79 @@ func TestOpenAnnexFileUsesDirectIO(t *testing.T) {
 	}
 }
 
+func TestAnnexTargetChangeGivesFreshHandlePathInode(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	objects := filepath.Join(root, ".git", "annex", "objects")
+	oldObject := filepath.Join(objects, "SHA256E-s4--old", "content")
+	newObject := filepath.Join(objects, "SHA256E-s4--new", "content")
+	for path, content := range map[string]string{oldObject: "old\n", newObject: "new\n"} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(root, "annex.txt")
+	oldTarget, err := filepath.Rel(root, oldObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(oldTarget, link); err != nil {
+		t.Fatal(err)
+	}
+	filesystem.attrs["annex.txt"] = visibleState{
+		attr:      fuse.Attr{Ino: 42, Size: 4, Mode: syscall.S_IFREG | 0o644},
+		signature: "old",
+	}
+
+	oldHandle, code := filesystem.Open("annex.txt", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatalf("open old target: %v", code)
+	}
+	defer oldHandle.Release()
+
+	newTarget, err := filepath.Rel(root, newObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(root, "replacement")
+	if err := os.Symlink(newTarget, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, link); err != nil {
+		t.Fatal(err)
+	}
+
+	pathAttr, code := filesystem.GetAttr("annex.txt", nil)
+	if code != fuse.OK {
+		t.Fatalf("GetAttr() after target change = %v", code)
+	}
+	freshHandle, code := filesystem.Open("annex.txt", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatalf("open new target: %v", code)
+	}
+	defer freshHandle.Release()
+	var freshAttr fuse.Attr
+	if code := freshHandle.GetAttr(&freshAttr); code != fuse.OK {
+		t.Fatalf("fresh handle GetAttr() = %v", code)
+	}
+	if pathAttr.Ino != freshAttr.Ino {
+		t.Fatalf("path inode %d does not identify fresh handle inode %d", pathAttr.Ino, freshAttr.Ino)
+	}
+
+	buffer := make([]byte, 4)
+	result, code := freshHandle.Read(buffer, 0)
+	if code != fuse.OK {
+		t.Fatalf("fresh handle Read() = %v", code)
+	}
+	content, code := result.Bytes(buffer)
+	if code != fuse.OK || string(content) != "new\n" {
+		t.Fatalf("fresh handle content = %q, %v", content, code)
+	}
+}
+
 func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)

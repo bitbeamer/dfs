@@ -141,6 +141,13 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 		if info, err := os.Stat(f.full(name)); err == nil {
 			attr.Mode = syscall.S_IFREG | uint32(info.Mode().Perm()|0o200)
 			attr.Size = uint64(info.Size())
+			// Loopback GetAttr uses lstat, but Open follows the annex link and
+			// returns a descriptor for its object. Report that object's inode so
+			// stat(path) and fstat(a freshly opened path) agree. Name-following
+			// readers use this equality to accept the replacement descriptor.
+			if targetAttr := attrFromInfo(info); targetAttr != nil {
+				attr.Ino = targetAttr.Ino
+			}
 		} else {
 			f.sizesMu.Lock()
 			size, ok := f.sizes[path]
