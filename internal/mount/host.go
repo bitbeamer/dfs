@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -41,41 +40,16 @@ type mountpointAccess struct {
 	clearStale func(string) error
 }
 
-type nodePathInvalidator struct {
-	paths       *pathfs.PathNodeFs
-	contentOnly bool
+type nodeContentInvalidator struct {
+	paths *pathfs.PathNodeFs
 }
 
-func (i nodePathInvalidator) Invalidate(path string) {
-	if i.contentOnly {
-		// This is discovered from getattr. Notify after that request returns to
-		// avoid nesting a FUSE upcall, while retaining the vnode and its read
-		// offset. Tail receives a content event without a replacement event.
-		time.AfterFunc(10*time.Millisecond, func() {
-			i.paths.FileNotify(path, 0, 0)
-		})
-		return
-	}
-	directory, name := filepath.Split(filepath.FromSlash(path))
-	directory = filepath.ToSlash(filepath.Clean(directory))
-	if directory == "." {
-		directory = ""
-	}
-	parent := i.paths.Node(directory)
-	if parent == nil {
-		return
-	}
-	child := parent.RmChild(name)
-	if child == nil {
-		return
-	}
-	// Invalidation is discovered from within an active getattr request.
-	// macFUSE can block if a delete notification is nested inside that request,
-	// while BSD tail needs the resulting vnode event to re-open by name. Send it
-	// just after getattr has returned; the old node remains alive for its open
-	// descriptors and the detached name resolves to a fresh node.
+func (i nodeContentInvalidator) InvalidateContent(path string) {
+	// This is discovered from getattr. Notify after that request returns to
+	// avoid nesting a FUSE upcall, while retaining the vnode and its read
+	// offset. Tail receives a content event without a replacement event.
 	time.AfterFunc(10*time.Millisecond, func() {
-		i.paths.Connector().DeleteNotify(parent, child, name)
+		i.paths.FileNotify(path, 0, 0)
 	})
 }
 
@@ -134,10 +108,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
-	filesystem.followAnnexReplacements = true
-	filesystem.invalidate = nodePathInvalidator{
-		paths: pathNodes, contentOnly: filesystem.followAnnexReplacements,
-	}
+	filesystem.cacheInvalidator = nodeContentInvalidator{paths: pathNodes}
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,

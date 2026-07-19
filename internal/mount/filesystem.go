@@ -28,36 +28,32 @@ type changeNotifier interface {
 
 type FileSystem struct {
 	pathfs.FileSystem
-	repo          *repository.Repository
-	root          string
-	notifier      changeNotifier
-	logger        *slog.Logger
-	sizesMu       sync.Mutex
-	sizes         map[string]uint64
-	writesMu      sync.Mutex
-	writes        map[string]*writeTransaction
-	attrsMu       sync.Mutex
-	attrs         map[string]visibleState
-	annexInodesMu sync.Mutex
-	annexInodes   map[string]uint64
-	invalidate    pathInvalidator
-	// Keep open annex handles on the current object so a content notification
-	// can preserve a reader's offset across peer updates.
-	followAnnexReplacements bool
+	repo             *repository.Repository
+	root             string
+	notifier         changeNotifier
+	logger           *slog.Logger
+	sizesMu          sync.Mutex
+	sizes            map[string]uint64
+	writesMu         sync.Mutex
+	writes           map[string]*writeTransaction
+	attrsMu          sync.Mutex
+	attrs            map[string]visibleState
+	annexInodesMu    sync.Mutex
+	annexInodes      map[string]uint64
+	cacheInvalidator contentInvalidator
 }
 
 type trackedFile struct {
 	nodefs.File
-	filesystem     *FileSystem
-	path           string
-	annexTarget    string
-	openFlags      uint32
-	mu             sync.Mutex
-	invalidateOnce sync.Once
+	filesystem  *FileSystem
+	path        string
+	annexTarget string
+	openFlags   uint32
+	mu          sync.Mutex
 }
 
-type pathInvalidator interface {
-	Invalidate(path string)
+type contentInvalidator interface {
+	InvalidateContent(path string)
 }
 
 func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
@@ -65,7 +61,8 @@ func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger 
 		FileSystem: pathfs.NewLoopbackFileSystem(repo.Config.Repository),
 		repo:       repo, root: repo.Config.Repository, notifier: notifier, logger: logger,
 		sizes: make(map[string]uint64), writes: make(map[string]*writeTransaction),
-		attrs: make(map[string]visibleState), annexInodes: make(map[string]uint64),
+		attrs:       make(map[string]visibleState),
+		annexInodes: make(map[string]uint64),
 	}
 }
 
@@ -197,7 +194,7 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 }
 
 func (f *FileSystem) applyStableAnnexInode(path string, attr *fuse.Attr) {
-	if !f.followAnnexReplacements || attr.Ino == 0 {
+	if attr.Ino == 0 {
 		return
 	}
 	f.annexInodesMu.Lock()
@@ -305,7 +302,7 @@ func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status
 
 func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	refreshed := false
-	if t.filesystem.followAnnexReplacements && t.annexTarget != "" {
+	if t.annexTarget != "" {
 		var code fuse.Status
 		refreshed, code = t.refreshAnnexTarget()
 		if code != fuse.OK {
@@ -316,13 +313,7 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var code fuse.Status
-	changedTarget := false
 	err := t.filesystem.repo.WithWorkTreeLock(func() error {
-		if !t.filesystem.followAnnexReplacements && t.annexTarget != "" {
-			if current, ok := annexLinkTarget(t.filesystem.full(t.path)); ok && current != t.annexTarget {
-				changedTarget = true
-			}
-		}
 		code = t.File.GetAttr(out)
 		if code != fuse.OK {
 			return nil
@@ -345,14 +336,8 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	if err != nil {
 		return status(err)
 	}
-	if (changedTarget || refreshed) && t.filesystem.invalidate != nil {
-		if refreshed {
-			t.filesystem.invalidate.Invalidate(t.path)
-			return code
-		}
-		// Keep this node alive for the old descriptor, but detach its name so
-		// the kernel's next lookup creates a node for the replacement target.
-		t.invalidateOnce.Do(func() { t.filesystem.invalidate.Invalidate(t.path) })
+	if refreshed && t.filesystem.cacheInvalidator != nil {
+		t.filesystem.cacheInvalidator.InvalidateContent(t.path)
 	}
 	return code
 }
