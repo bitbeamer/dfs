@@ -308,17 +308,64 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 			targets = append(targets, target)
 		}
 		for index, target := range targets {
-			temporary := backingPath + ".swap"
-			_ = os.Remove(temporary)
-			if err := os.Symlink(target, temporary); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Rename(temporary, backingPath); err != nil {
-				t.Fatal(err)
-			}
+			swapSymlink(t, backingPath, target)
 			assertFileContent(t, mountedPath, versions[index])
 		}
+
+		tail, err := exec.LookPath("tail")
+		if err != nil {
+			t.Skip("tail is not installed")
+		}
+		swapSymlink(t, backingPath, targets[0])
+		stdoutPath := filepath.Join(t.TempDir(), "tail.stdout")
+		stdout, err := os.Create(stdoutPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tailContext, cancelTail := context.WithCancel(context.Background())
+		follow := exec.CommandContext(tailContext, tail, "-n", "+1", "--follow=name", "--retry", "--sleep-interval=0.1", "--max-unchanged-stats=1", mountedPath)
+		follow.Stdout = stdout
+		follow.Stderr = io.Discard
+		if err := follow.Start(); err != nil {
+			cancelTail()
+			_ = stdout.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			cancelTail()
+			_ = follow.Wait()
+			_ = stdout.Close()
+		})
+		waitForTextContains(t, stdoutPath, "one\n", 5*time.Second)
+		swapSymlink(t, backingPath, targets[len(targets)-1])
+		waitForTextContains(t, stdoutPath, "four\n", 5*time.Second)
 	})
+}
+
+func swapSymlink(t *testing.T, path, target string) {
+	t.Helper()
+	temporary := path + ".swap"
+	_ = os.Remove(temporary)
+	if err := os.Symlink(target, temporary); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForTextContains(t *testing.T, path, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(path)
+		if err == nil && strings.Contains(string(content), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	content, err := os.ReadFile(path)
+	t.Fatalf("%s did not contain %q: content=%q error=%v", path, want, content, err)
 }
 
 func TestAdvisoryLockHelper(t *testing.T) {

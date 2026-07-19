@@ -22,6 +22,14 @@ type attrFile struct {
 	attr   fuse.Attr
 }
 
+type recordingInvalidator struct {
+	paths []string
+}
+
+func (i *recordingInvalidator) Invalidate(path string) {
+	i.paths = append(i.paths, path)
+}
+
 func (f *attrFile) GetAttr(out *fuse.Attr) fuse.Status {
 	if f.called != nil {
 		close(f.called)
@@ -104,6 +112,8 @@ func TestGetAttrUsesAnnexObjectPermissions(t *testing.T) {
 func TestOpenAnnexFileUsesDirectIO(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)
+	invalidator := &recordingInvalidator{}
+	filesystem.invalidate = invalidator
 	object := filepath.Join(root, ".git", "annex", "objects", "key", "content")
 	if err := os.MkdirAll(filepath.Dir(object), 0o700); err != nil {
 		t.Fatal(err)
@@ -140,11 +150,20 @@ func TestOpenAnnexFileUsesDirectIO(t *testing.T) {
 	if code != fuse.OK || string(content) != "current version\n" {
 		t.Fatalf("Read() = %q, %v", content, code)
 	}
+	var attr fuse.Attr
+	if code := file.GetAttr(&attr); code != fuse.OK {
+		t.Fatalf("GetAttr() status = %v", code)
+	}
+	if len(invalidator.paths) != 0 {
+		t.Fatalf("unchanged annex target invalidated paths %q", invalidator.paths)
+	}
 }
 
 func TestAnnexTargetChangeGivesFreshHandlePathInode(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)
+	invalidator := &recordingInvalidator{}
+	filesystem.invalidate = invalidator
 	objects := filepath.Join(root, ".git", "annex", "objects")
 	oldObject := filepath.Join(objects, "SHA256E-s4--old", "content")
 	newObject := filepath.Join(objects, "SHA256E-s4--new", "content")
@@ -185,6 +204,13 @@ func TestAnnexTargetChangeGivesFreshHandlePathInode(t *testing.T) {
 	}
 	if err := os.Rename(replacement, link); err != nil {
 		t.Fatal(err)
+	}
+	var oldAttr fuse.Attr
+	if code := oldHandle.GetAttr(&oldAttr); code != fuse.OK {
+		t.Fatalf("old handle GetAttr() after target change = %v", code)
+	}
+	if len(invalidator.paths) != 1 || invalidator.paths[0] != "annex.txt" {
+		t.Fatalf("changed annex target invalidated paths %q", invalidator.paths)
 	}
 
 	pathAttr, code := filesystem.GetAttr("annex.txt", nil)

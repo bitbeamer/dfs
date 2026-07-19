@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -38,6 +39,28 @@ type mountpointAccess struct {
 	stat       func(string) (os.FileInfo, error)
 	mkdirAll   func(string, os.FileMode) error
 	clearStale func(string) error
+}
+
+type nodePathInvalidator struct {
+	paths *pathfs.PathNodeFs
+}
+
+func (i nodePathInvalidator) Invalidate(path string) {
+	directory, name := filepath.Split(filepath.FromSlash(path))
+	directory = filepath.ToSlash(filepath.Clean(directory))
+	if directory == "." {
+		directory = ""
+	}
+	parent := i.paths.Node(directory)
+	if parent == nil {
+		return
+	}
+	child := parent.RmChild(name)
+	if child != nil {
+		i.paths.Connector().DeleteNotify(parent, child, name)
+	} else {
+		i.paths.EntryNotify(directory, name)
+	}
 }
 
 const normalUnmountGrace = time.Second
@@ -95,6 +118,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) error 
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
+	filesystem.invalidate = nodePathInvalidator{paths: pathNodes}
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,

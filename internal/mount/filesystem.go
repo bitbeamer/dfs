@@ -28,22 +28,29 @@ type changeNotifier interface {
 
 type FileSystem struct {
 	pathfs.FileSystem
-	repo     *repository.Repository
-	root     string
-	notifier changeNotifier
-	logger   *slog.Logger
-	sizesMu  sync.Mutex
-	sizes    map[string]uint64
-	writesMu sync.Mutex
-	writes   map[string]*writeTransaction
-	attrsMu  sync.Mutex
-	attrs    map[string]visibleState
+	repo       *repository.Repository
+	root       string
+	notifier   changeNotifier
+	logger     *slog.Logger
+	sizesMu    sync.Mutex
+	sizes      map[string]uint64
+	writesMu   sync.Mutex
+	writes     map[string]*writeTransaction
+	attrsMu    sync.Mutex
+	attrs      map[string]visibleState
+	invalidate pathInvalidator
 }
 
 type trackedFile struct {
 	nodefs.File
-	filesystem *FileSystem
-	path       string
+	filesystem     *FileSystem
+	path           string
+	annexTarget    string
+	invalidateOnce sync.Once
+}
+
+type pathInvalidator interface {
+	Invalidate(path string)
 }
 
 func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
@@ -74,16 +81,24 @@ func (f *FileSystem) full(name string) string {
 }
 
 func annexSymlink(path string) bool {
+	_, ok := annexLinkTarget(path)
+	return ok
+}
+
+func annexLinkTarget(path string) (string, bool) {
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
-		return false
+		return "", false
 	}
 	target, err := os.Readlink(path)
 	if err != nil {
-		return false
+		return "", false
 	}
-	target = filepath.ToSlash(target)
-	return strings.Contains(target, "/.git/annex/objects/") || strings.HasPrefix(target, ".git/annex/objects/")
+	normalized := filepath.ToSlash(target)
+	if !strings.Contains(normalized, "/.git/annex/objects/") && !strings.HasPrefix(normalized, ".git/annex/objects/") {
+		return "", false
+	}
+	return normalized, true
 }
 
 func (f *FileSystem) hydrate(name string) error {
@@ -188,14 +203,14 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 		f.repo.Touch(path)
 		return &trackedFile{File: staged, filesystem: f, path: path}, fuse.OK
 	}
-	file, annexed, err := f.openBackingRead(path, flags)
+	file, annexTarget, err := f.openBackingRead(path, flags)
 	if err != nil {
 		return nil, status(err)
 	}
 	f.repo.Touch(path)
 	f.logger.Debug("file opened", "path", path, "writable", false, "flags", flags)
-	tracked := &trackedFile{File: file, filesystem: f, path: path}
-	if annexed {
+	tracked := &trackedFile{File: file, filesystem: f, path: path, annexTarget: annexTarget}
+	if annexTarget != "" {
 		// Git-annex publishes a new version by replacing the symlink in the
 		// worktree. Stable FUSE inode identities can otherwise retain pages from
 		// the previous target, so every fresh annex open must bypass that cache.
@@ -207,19 +222,20 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 // openBackingRead pins one worktree version to an open file descriptor while
 // excluding DFS sync/commit operations that replace annex links. A broken
 // annex link is hydrated outside the repository lock and then opened again.
-func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, bool, error) {
+func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, string, error) {
 	// Match go-fuse's loopback behavior: the kernel translates append writes to
 	// explicit offsets before they reach a file handle.
 	flags &^= syscall.O_APPEND
 	for attempt := 0; attempt < 2; attempt++ {
 		var (
-			handle     *os.File
-			annexed    bool
-			needsFetch bool
+			handle      *os.File
+			annexTarget string
+			needsFetch  bool
 		)
 		err := f.repo.WithWorkTreeLock(func() error {
 			fullPath := f.full(path)
-			annexed = annexSymlink(fullPath)
+			var annexed bool
+			annexTarget, annexed = annexLinkTarget(fullPath)
 			var openErr error
 			handle, openErr = os.OpenFile(fullPath, int(flags), 0)
 			if openErr != nil && annexed && errors.Is(openErr, os.ErrNotExist) {
@@ -229,16 +245,16 @@ func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, bo
 			return openErr
 		})
 		if err != nil {
-			return nil, annexed, err
+			return nil, annexTarget, err
 		}
 		if !needsFetch {
-			return nodefs.NewLoopbackFile(handle), annexed, nil
+			return nodefs.NewLoopbackFile(handle), annexTarget, nil
 		}
 		if err := f.hydrate(path); err != nil {
-			return nil, true, err
+			return nil, annexTarget, err
 		}
 	}
-	return nil, true, os.ErrNotExist
+	return nil, "", os.ErrNotExist
 }
 
 func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
@@ -261,7 +277,13 @@ func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status
 
 func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	var code fuse.Status
+	changedTarget := false
 	err := t.filesystem.repo.WithWorkTreeLock(func() error {
+		if t.annexTarget != "" {
+			if current, ok := annexLinkTarget(t.filesystem.full(t.path)); ok && current != t.annexTarget {
+				changedTarget = true
+			}
+		}
 		code = t.File.GetAttr(out)
 		if code != fuse.OK {
 			return nil
@@ -282,6 +304,11 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 	})
 	if err != nil {
 		return status(err)
+	}
+	if changedTarget && t.filesystem.invalidate != nil {
+		// Keep this node alive for the old descriptor, but detach its name so
+		// the kernel's next lookup creates a node for the replacement target.
+		t.invalidateOnce.Do(func() { t.filesystem.invalidate.Invalidate(t.path) })
 	}
 	return code
 }
