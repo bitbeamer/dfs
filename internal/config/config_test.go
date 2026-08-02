@@ -58,10 +58,43 @@ func TestLoadMigratesLegacyStateIntoGitDirectory(t *testing.T) {
 	if loaded.Name != "legacy" {
 		t.Fatalf("loaded peer name = %q", loaded.Name)
 	}
+	if loaded.Version != 2 || loaded.PeerID == "" || loaded.NetworkName != filepath.Base(repository) {
+		t.Fatalf("migrated identity = version %d, peer %q, network %q", loaded.Version, loaded.PeerID, loaded.NetworkName)
+	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Fatalf("legacy state directory remains: %v", err)
 	}
 	if content, err := os.ReadFile(filepath.Join(repository, filepath.FromSlash(Directory), "state.db")); err != nil || string(content) != "state" {
 		t.Fatalf("migrated state = %q, %v", content, err)
+	}
+}
+
+func TestLoadUpgradesPeerIdentity(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "family-files")
+	if err := os.MkdirAll(filepath.Join(repository, Directory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := Config{Version: 1, Name: "desktop", Repository: repository, CacheLimit: 1024}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(Path(repository), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != 2 || loaded.PeerID == "" || loaded.NetworkName != "family-files" {
+		t.Fatalf("upgraded config = %#v", loaded)
+	}
+	reloaded, err := Load(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.PeerID != loaded.PeerID {
+		t.Fatalf("peer ID changed across loads: %q != %q", reloaded.PeerID, loaded.PeerID)
 	}
 }

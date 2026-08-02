@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/syncer"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -21,11 +22,13 @@ import (
 )
 
 type Options struct {
-	Context             context.Context
-	Logger              *slog.Logger
-	FUSEDebug           bool
-	RecoverStaleSession bool
-	Signals             <-chan os.Signal
+	Context              context.Context
+	Logger               *slog.Logger
+	FUSEDebug            bool
+	RecoverStaleSession  bool
+	Signals              <-chan os.Signal
+	PairingPort          int
+	DisablePeerDiscovery bool
 }
 
 type fuseLogWriter struct{ logger *slog.Logger }
@@ -133,6 +136,21 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	if err != nil {
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
+	}
+	if !options.DisablePeerDiscovery {
+		peerService, peerErr := peer.Start(repo, logger, options.PairingPort)
+		if peerErr != nil {
+			// Multicast is unavailable on some networks. Keep the filesystem usable
+			// and leave manual SSH joining available, but make the missing onboarding
+			// service visible in managed-service logs.
+			logger.Warn("peer discovery unavailable", "error", peerErr)
+		} else {
+			defer func() {
+				if err := peerService.Close(); err != nil {
+					logger.Warn("stopping peer discovery failed", "error", err)
+				}
+			}()
+		}
 	}
 	logger.Info("mount ready", "mountpoint", mountpoint)
 	health.update("ready", true, nil)

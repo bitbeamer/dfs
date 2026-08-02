@@ -15,6 +15,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
+	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/spf13/cobra"
 )
@@ -40,7 +41,7 @@ func New() *cobra.Command {
 	root.SetErr(app.Err)
 	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (or set DFS_REPO)")
 	root.AddCommand(
-		app.initCommand(), app.joinCommand(), app.peerCommand(), app.relayCommand(),
+		app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(),
 		app.storageCommand(),
 		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
@@ -48,6 +49,176 @@ func New() *cobra.Command {
 		app.doctorCommand(),
 	)
 	return root
+}
+
+func (a *App) networkCommand() *cobra.Command {
+	network := &cobra.Command{Use: "network", Short: "Discover and join DFS networks"}
+	var discoverTimeout time.Duration
+	var asJSON bool
+	discover := &cobra.Command{
+		Use: "discover", Args: cobra.NoArgs, Short: "Discover DFS networks on the local network",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), discoverTimeout+2*time.Second)
+			defer cancel()
+			offers, err := peer.Discover(ctx, discoverTimeout)
+			if err != nil {
+				return err
+			}
+			networks := peer.GroupOffers(offers)
+			if asJSON {
+				encoder := json.NewEncoder(a.Out)
+				encoder.SetIndent("", "  ")
+				return encoder.Encode(networks)
+			}
+			if len(networks) == 0 {
+				fmt.Fprintln(a.Out, "No DFS networks discovered")
+				return nil
+			}
+			fmt.Fprintln(a.Out, "NETWORK\tPEERS\tFILESYSTEM ID\tOFFERED BY")
+			for _, network := range networks {
+				id := network.FileSystemID
+				if len(id) > 12 {
+					id = id[:12]
+				}
+				var names []string
+				for _, offer := range network.Offers {
+					names = append(names, offer.PeerName)
+				}
+				fmt.Fprintf(a.Out, "%s\t%d\t%s\t%s\n", network.NetworkName, len(network.Offers), id, strings.Join(names, ", "))
+			}
+			return nil
+		},
+	}
+	discover.Flags().DurationVar(&discoverTimeout, "timeout", 2*time.Second, "how long to listen for local advertisements")
+	discover.Flags().BoolVar(&asJSON, "json", false, "emit discovered services as JSON")
+
+	var name, limit string
+	var joinTimeout time.Duration
+	var noReverse bool
+	join := &cobra.Command{
+		Use: "join <invitation> <repository>", Args: cobra.ExactArgs(2),
+		Short: "Join a discovered DFS network with a pairing invitation",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			bytes, err := config.ParseSize(limit)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
+			result, err := peer.PairAndJoin(ctx, args[0], args[1], name, bytes, joinTimeout, !noReverse)
+			if err != nil {
+				return err
+			}
+			defer result.Repository.Close()
+			fmt.Fprintf(a.Out, "Joined DFS network %s through %s as %s at %s\n",
+				result.NetworkName, result.OfferingPeer, result.Repository.Config.Name, result.Repository.Config.Repository)
+			if result.ReverseRemoteName != "" {
+				fmt.Fprintf(a.Out, "Configured reciprocal peer %s\n", result.ReverseRemoteName)
+			}
+			return nil
+		},
+	}
+	join.Flags().StringVar(&name, "name", "", "peer name (defaults to hostname)")
+	join.Flags().StringVar(&limit, "cache-limit", "100GiB", "maximum local content cache")
+	join.Flags().DurationVar(&joinTimeout, "timeout", 3*time.Second, "how long to discover the invited network")
+	join.Flags().BoolVar(&noReverse, "no-reverse", false, "do not register this device as a direct source on the approving peer")
+
+	setName := &cobra.Command{
+		Use: "set-name <name>", Args: cobra.ExactArgs(1), Short: "Set the local display name advertised for this DFS network",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			return repo.SetNetworkName(args[0])
+		},
+	}
+	complete := &cobra.Command{
+		Use: "complete", Args: cobra.NoArgs, Short: "Retry completion of an interrupted peer pairing",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
+			result, err := peer.CompletePairing(ctx, repositoryPath)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Completed reciprocal DFS pairing as %s\n", result.RemoteName)
+			return nil
+		},
+	}
+	network.AddCommand(discover, join, complete, setName)
+	return network
+}
+
+func (a *App) pairCommand() *cobra.Command {
+	pairing := &cobra.Command{Use: "pair", Short: "Manage secure peer-pairing invitations"}
+	var expires time.Duration
+	var cloneURL string
+	invite := &cobra.Command{
+		Use: "invite", Args: cobra.NoArgs, Short: "Create a one-use pairing invitation",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			invitation, err := peer.CreateInvitation(repo, expires, cloneURL)
+			if err != nil {
+				return err
+			}
+			encoded, err := invitation.Encode()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(a.Out, encoded)
+			return nil
+		},
+	}
+	invite.Flags().DurationVar(&expires, "expires", 10*time.Minute, "invitation lifetime (maximum 24h)")
+	invite.Flags().StringVar(&cloneURL, "clone-url", "", "override the SSH clone URL returned after authentication")
+
+	list := &cobra.Command{
+		Use: "list", Args: cobra.NoArgs, Short: "List active pairing invitations",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			invitations, err := peer.ListInvitations(repositoryPath, time.Now())
+			if err != nil {
+				return err
+			}
+			if len(invitations) == 0 {
+				fmt.Fprintln(a.Out, "No active pairing invitations")
+				return nil
+			}
+			for _, invitation := range invitations {
+				state := "available"
+				if invitation.Pending {
+					state = "pairing"
+				}
+				fmt.Fprintf(a.Out, "%s\t%s\t%s\n", invitation.ID, state, invitation.ExpiresAt.Format(time.RFC3339))
+			}
+			return nil
+		},
+	}
+	revoke := &cobra.Command{
+		Use: "revoke <invitation-id>", Args: cobra.ExactArgs(1), Short: "Revoke an unused or pending pairing invitation",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			return peer.RevokeInvitation(repositoryPath, args[0])
+		},
+	}
+	pairing.AddCommand(invite, list, revoke)
+	return pairing
 }
 
 func Execute() error { return New().Execute() }
@@ -59,7 +230,7 @@ func commandContext(command *cobra.Command) (context.Context, context.CancelFunc
 }
 
 func (a *App) initCommand() *cobra.Command {
-	var name, limit, relay string
+	var name, networkName, limit, relay string
 	cmd := &cobra.Command{
 		Use:   "init <repository>",
 		Short: "Create a new DFS repository",
@@ -76,6 +247,11 @@ func (a *App) initCommand() *cobra.Command {
 				return err
 			}
 			defer repo.Close()
+			if networkName != "" {
+				if err := repo.SetNetworkName(networkName); err != nil {
+					return err
+				}
+			}
 			if relay != "" {
 				if err := repo.SetRelay(ctx, relay); err != nil {
 					return err
@@ -86,6 +262,7 @@ func (a *App) initCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "peer name (defaults to hostname)")
+	cmd.Flags().StringVar(&networkName, "network-name", "", "display name advertised for this DFS network")
 	cmd.Flags().StringVar(&limit, "cache-limit", "100GiB", "maximum local content cache")
 	cmd.Flags().StringVar(&relay, "relay", "", "optional bare Git metadata relay URL")
 	return cmd
@@ -119,8 +296,18 @@ func (a *App) joinCommand() *cobra.Command {
 }
 
 func (a *App) peerCommand() *cobra.Command {
-	peer := &cobra.Command{Use: "peer", Short: "Manage direct Git/git-annex peers"}
-	peer.AddCommand(
+	peers := &cobra.Command{Use: "peer", Short: "Manage direct Git/git-annex peers"}
+	serve := &cobra.Command{
+		Use: "serve", Args: cobra.NoArgs, Hidden: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			return peer.ServeSSH(repositoryPath)
+		},
+	}
+	peers.AddCommand(
 		&cobra.Command{
 			Use: "add <name> <ssh-url>", Args: cobra.ExactArgs(2), Short: "Add a peer",
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -144,9 +331,12 @@ func (a *App) peerCommand() *cobra.Command {
 				defer repo.Close()
 				ctx, cancel := commandContext(cmd)
 				defer cancel()
-				return repo.RemovePeer(ctx, args[0])
+				if err := repo.RemovePeer(ctx, args[0]); err != nil {
+					return err
+				}
+				return peer.RevokePeerAuthorization(args[0])
 			},
-		},
+		}, serve,
 		&cobra.Command{
 			Use: "list", Args: cobra.NoArgs, Short: "List peers and remotes",
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -168,7 +358,7 @@ func (a *App) peerCommand() *cobra.Command {
 			},
 		},
 	)
-	return peer
+	return peers
 }
 
 func (a *App) relayCommand() *cobra.Command {
@@ -264,6 +454,8 @@ func (a *App) storageCommand() *cobra.Command {
 
 func (a *App) mountCommand() *cobra.Command {
 	var logLevel, logFormat, logFile string
+	var pairingPort int
+	var discovery bool
 	var fuseDebug, recoverStaleSession, managed bool
 	cmd := &cobra.Command{
 		Use: "mount <mountpoint>", Args: cobra.ExactArgs(1), Short: "Mount the DFS namespace and run automatic sync",
@@ -289,7 +481,8 @@ func (a *App) mountCommand() *cobra.Command {
 			}
 			return dfsmount.Run(repo, args[0], dfsmount.Options{
 				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug,
-				RecoverStaleSession: recoverStaleSession, Signals: mountSignals,
+				RecoverStaleSession: recoverStaleSession, Signals: mountSignals, PairingPort: pairingPort,
+				DisablePeerDiscovery: !discovery,
 			})
 		},
 	}
@@ -299,6 +492,8 @@ func (a *App) mountCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&fuseDebug, "fuse-debug", false, "log low-level FUSE protocol requests and enable debug logging (very noisy)")
 	cmd.Flags().BoolVar(&recoverStaleSession, "recover-stale-session", false, "take over after verifying another host's recorded mount is inactive")
 	cmd.Flags().BoolVar(&managed, "managed", false, "run under a service manager without interactive output")
+	cmd.Flags().IntVar(&pairingPort, "pair-port", peer.DefaultPairingPort, "TCP port for authenticated peer pairing")
+	cmd.Flags().BoolVar(&discovery, "discovery", true, "advertise this DFS network and accept authenticated pairing")
 	return cmd
 }
 
@@ -619,7 +814,7 @@ func (a *App) doctorCommand() *cobra.Command {
 	return &cobra.Command{
 		Use: "doctor", Args: cobra.NoArgs, Short: "Check build and runtime dependencies",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			commands := []string{"git", "git-annex", "ssh", "rsync"}
+			commands := []string{"git", "git-annex", "git-annex-shell", "ssh", "ssh-keygen", "rsync"}
 			if runtime.GOOS == "linux" {
 				commands = append(commands, "fusermount3")
 			}

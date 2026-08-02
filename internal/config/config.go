@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ const (
 type Config struct {
 	Version      int           `json:"version"`
 	Name         string        `json:"name"`
+	PeerID       string        `json:"peer_id"`
+	NetworkName  string        `json:"network_name"`
 	Repository   string        `json:"repository"`
 	CacheLimit   int64         `json:"cache_limit_bytes"`
 	SyncInterval time.Duration `json:"sync_interval"`
@@ -28,8 +31,10 @@ type Config struct {
 
 func Default(name, repository string) Config {
 	return Config{
-		Version:      1,
+		Version:      2,
 		Name:         name,
+		PeerID:       randomID(),
+		NetworkName:  filepath.Base(filepath.Clean(repository)),
 		Repository:   repository,
 		CacheLimit:   100 * 1024 * 1024 * 1024,
 		SyncInterval: 30 * time.Second,
@@ -57,10 +62,40 @@ func Load(repository string) (Config, error) {
 		return Config{}, fmt.Errorf("decode DFS configuration: %w", err)
 	}
 	cfg.Repository = repository
+	upgraded := false
+	if cfg.Version < 2 {
+		cfg.Version = 2
+		upgraded = true
+	}
+	if cfg.PeerID == "" {
+		cfg.PeerID = randomID()
+		upgraded = true
+	}
+	if cfg.NetworkName == "" {
+		cfg.NetworkName = filepath.Base(filepath.Clean(repository))
+		upgraded = true
+	}
 	if cfg.SyncInterval <= 0 {
 		cfg.SyncInterval = 30 * time.Second
+		upgraded = true
+	}
+	if upgraded {
+		if err := Save(cfg); err != nil {
+			return Config{}, fmt.Errorf("upgrade DFS configuration: %w", err)
+		}
 	}
 	return cfg, nil
+}
+
+func randomID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		// The operating system random source is expected to be available on all
+		// supported platforms. Keep configuration creation total if it is not;
+		// the timestamp keeps this fallback distinct enough to be replaced later.
+		return fmt.Sprintf("peer-%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", value[:])
 }
 
 func Save(cfg Config) error {

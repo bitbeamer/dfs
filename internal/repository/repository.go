@@ -91,6 +91,10 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 }
 
 func Join(ctx context.Context, remote, path, name string, cacheLimit int64) (*Repository, error) {
+	return JoinWithSSH(ctx, remote, path, name, cacheLimit, "")
+}
+
+func JoinWithSSH(ctx context.Context, remote, path, name string, cacheLimit int64, sshCommand string) (*Repository, error) {
 	if err := CheckDependencies(); err != nil {
 		return nil, err
 	}
@@ -103,7 +107,12 @@ func Join(ctx context.Context, remote, path, name string, cacheLimit int64) (*Re
 		return nil, err
 	}
 	runner := command.Runner{Directory: parent}
-	if _, err := runner.Run(ctx, "git", "clone", remote, path); err != nil {
+	cloneArgs := []string{}
+	if sshCommand != "" {
+		cloneArgs = append(cloneArgs, "-c", "core.sshCommand="+sshCommand)
+	}
+	cloneArgs = append(cloneArgs, "clone", remote, path)
+	if _, err := runner.Run(ctx, "git", cloneArgs...); err != nil {
 		return nil, err
 	}
 	if name == "" {
@@ -148,6 +157,51 @@ func (r *Repository) SetLogger(logger *slog.Logger) {
 }
 
 func (r *Repository) SaveConfig() error { return config.Save(r.Config) }
+
+// FileSystemID returns a stable identity shared by every clone of this DFS
+// repository. The initial commit is immutable shared Git metadata, unlike the
+// peer-local configuration under .git/dfs.
+func (r *Repository) FileSystemID(ctx context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out, err := r.runner.Run(ctx, "git", "rev-list", "--max-parents=0", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("determine DFS filesystem identity: %w", err)
+	}
+	var roots []string
+	for _, root := range strings.Fields(out) {
+		if root != "" {
+			roots = append(roots, root)
+		}
+	}
+	if len(roots) == 0 {
+		return "", errors.New("DFS repository has no root commit")
+	}
+	sort.Strings(roots)
+	return roots[0], nil
+}
+
+func (r *Repository) SetNetworkName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("network name cannot be empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Config.NetworkName = name
+	return r.SaveConfig()
+}
+
+func (r *Repository) ConfigureSSHCommand(ctx context.Context, sshCommand string) error {
+	sshCommand = strings.TrimSpace(sshCommand)
+	if sshCommand == "" {
+		return errors.New("SSH command cannot be empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.runner.Run(ctx, "git", "config", "core.sshCommand", sshCommand)
+	return err
+}
 
 // WithWorkTreeLock runs fn while repository operations that may replace paths
 // in the worktree are excluded. The callback must not call another Repository
@@ -341,6 +395,81 @@ func (r *Repository) AddRemote(ctx context.Context, name, url string) error {
 	}
 	_, err := r.runner.Run(ctx, "git", "remote", "add", name, url)
 	return err
+}
+
+// AddPairedRemote creates or refreshes the deterministic remote used for an
+// authenticated DFS peer. Peer IDs, rather than display names, prevent name
+// collisions and make a renamed device retain the same remote.
+func (r *Repository) AddPairedRemote(ctx context.Context, peerID, url string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	peerID = strings.ToLower(strings.TrimSpace(peerID))
+	url = strings.TrimSpace(url)
+	if peerID == "" || url == "" {
+		return "", errors.New("paired peer ID and URL are required")
+	}
+	for _, value := range peerID {
+		if (value < 'a' || value > 'z') && (value < '0' || value > '9') && value != '-' {
+			return "", fmt.Errorf("invalid paired peer ID %q", peerID)
+		}
+	}
+	shortID := peerID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	name := "dfs-peer-" + shortID
+	remotes, err := r.remotesLocked(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, remote := range remotes {
+		if remote.Name != name {
+			continue
+		}
+		if remote.URL == url {
+			return name, nil
+		}
+		if _, err := r.runner.Run(ctx, "git", "remote", "set-url", name, url); err != nil {
+			return "", err
+		}
+		return name, nil
+	}
+	if _, err := r.runner.Run(ctx, "git", "remote", "add", name, url); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func (r *Repository) AdoptClonedPeer(ctx context.Context, peerID string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	peerID = strings.ToLower(strings.TrimSpace(peerID))
+	if peerID == "" {
+		return "", errors.New("paired peer ID is required")
+	}
+	shortID := peerID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	name := "dfs-peer-" + shortID
+	remotes, err := r.remotesLocked(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, remote := range remotes {
+		if remote.Name == name {
+			return name, nil
+		}
+	}
+	for _, remote := range remotes {
+		if remote.Name == "origin" {
+			if _, err := r.runner.Run(ctx, "git", "remote", "rename", "origin", name); err != nil {
+				return "", err
+			}
+			return name, nil
+		}
+	}
+	return "", errors.New("cloned DFS repository has no origin remote")
 }
 
 func (r *Repository) SetRelay(ctx context.Context, url string) error {

@@ -11,6 +11,7 @@ Every peer sees the complete file and directory tree. File content is downloaded
 
 - A complete Git-backed namespace on every peer.
 - Direct Git/git-annex peers over SSH or a local path.
+- Local-network discovery with authenticated, one-use peer pairing.
 - Optional bare Git metadata relay.
 - On-demand hydration when an annexed file is opened.
 - Writes committed only after all writable mount handles have closed.
@@ -41,7 +42,7 @@ sudo pacman -S --needed go git git-annex openssh rsync fuse3
 Debian/Ubuntu:
 
 ```sh
-sudo apt install golang-go git git-annex openssh-client rsync fuse3
+sudo apt install golang-go git git-annex openssh-client openssh-server rsync fuse3
 ```
 
 macOS:
@@ -50,7 +51,7 @@ macOS:
 brew install go git git-annex
 ```
 
-Install the current macFUSE package from [macfuse.io](https://macfuse.io/). Direct SSH access to a macOS peer also requires enabling Remote Login.
+Install the current macFUSE package from [macfuse.io](https://macfuse.io/). Direct SSH access to a macOS peer also requires enabling Remote Login. A device that should send content directly to another paired device needs an SSH server reachable on the LAN; pairing installs repository-restricted keys but does not enable the operating system's SSH service.
 
 ## Build
 
@@ -117,7 +118,55 @@ Rerun the platform installer after building a new DFS version. To disable and re
 
 Packagers can use the templates under `packaging/systemd` and `packaging/launchd`. The installers generate equivalent definitions with absolute, safely escaped local paths.
 
-## Two-peer quick start
+## Discover and pair a peer
+
+The mounted DFS process advertises its network over mDNS/DNS-SD as `_dfs._tcp.local`. Give the network a recognizable name before starting or restarting the mount:
+
+```sh
+dfs init ~/.local/share/dfs/repository \
+  --name desktop --network-name "Home Files" --cache-limit 100GiB
+dfs --repo ~/.local/share/dfs/repository mount ~/DFS
+```
+
+In another terminal on that peer, create a one-use invitation. It expires after ten minutes by default:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository pair invite
+```
+
+The command prints an invitation beginning with `dfs1_`. Send it to the user of the new device through a trusted channel. On the new device, inspect nearby networks and join:
+
+```sh
+dfs network discover
+dfs network join 'dfs1_...' \
+  ~/.local/share/dfs/repository --name laptop --cache-limit 50GiB
+dfs --repo ~/.local/share/dfs/repository mount ~/DFS
+```
+
+The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; the forced command delegates to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository, so it does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
+
+Useful invitation and naming commands are:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository pair list
+dfs --repo ~/.local/share/dfs/repository pair revoke <invitation-id>
+dfs --repo ~/.local/share/dfs/repository network complete
+dfs --repo ~/.local/share/dfs/repository network set-name "Archive"
+dfs --repo ~/.local/share/dfs/repository peer list
+dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<id>
+```
+
+Restart the mount after changing the advertised network name. Removing a paired remote also removes its matching repository-restricted authorization on that device. Revocation cannot erase data that a peer already downloaded.
+
+Pairing records the completion token privately after the clone. If the final reciprocal-registration request is interrupted, the joined repository remains usable and the command reports the exact `network complete` command needed to resume safely.
+
+mDNS normally stays within one LAN and may be blocked by guest Wi-Fi isolation or VLAN boundaries. A currently mounted inviter embeds its `.local` pairing endpoint in the invitation as a fallback. `pair invite --clone-url <url>` can override the authenticated clone URL for routed or advanced setups; the manual join flow remains available.
+
+A default-drop host firewall must allow UDP 5353 for mDNS and TCP 7843 for the pairing endpoint from the trusted LAN on both devices. The pairing port can be changed with `dfs mount --pair-port <port>`; managed-service definitions must use the same fixed port allowed by the firewall. DFS logs a warning and continues mounting when discovery or the pairing listener cannot start.
+
+Use `dfs mount --discovery=false` when a peer must not advertise the filesystem or run a pairing endpoint. Manual configured remotes continue to work.
+
+## Manual two-peer quick start
 
 On Linux:
 
@@ -286,7 +335,8 @@ DFS transaction and quota scheduler
         ├── Git: namespace, history, merges
         ├── git-annex: hashes, locations, safe copies
         ├── SQLite: pins and last-access times
-        ├── SSH/rsync: direct peer content
+        ├── mDNS + pinned TLS: discovery and pairing
+        ├── restricted SSH/rsync: direct peer content
         └── S3: optional durable content
 ```
 
@@ -294,7 +344,9 @@ The underlying Git working tree is an implementation detail. DFS keeps its peer-
 
 ## MVP limitations
 
-- Peer discovery and pairing are manual; mDNS is not implemented yet.
+- mDNS discovery is LAN-local and depends on multicast support. Routed discovery and relay-assisted invitations are not implemented yet.
+- Pairing currently uses the operating system's SSH service for Git/git-annex transport after securely exchanging restricted device keys; a DFS-managed transport is not implemented yet.
+- Membership is configured between the two paired devices. Signed network-wide membership, administrator roles, and automatic reconciliation with every existing peer are not implemented yet.
 - The conflict command lists conflicts but does not provide a full conflict-resolution UI.
 - History does not itself retain old annex objects. Replicate versions to durable storage before allowing their last copy to be dropped.
 - Memory mapping, sparse files, ACL replication, cross-peer POSIX-metadata replication, and large creative applications need more cross-platform stress testing.
