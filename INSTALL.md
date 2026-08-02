@@ -1,0 +1,57 @@
+# Install DFS on a New Peer
+
+DFS is experimental. Start with test data and keep an independent backup.
+
+## 1. Install and build
+
+Install Go 1.26+, Git, git-annex, OpenSSH, rsync, and FUSE 3 (Linux) or macFUSE (macOS). Then:
+
+```sh
+git clone https://github.com/bitbeamer/dfs.git
+cd dfs
+make build
+./bin/dfs doctor
+```
+
+The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353 and TCP 7843 from the trusted LAN.
+
+## 2. Create an invitation
+
+On an existing, mounted DFS peer:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository pair invite
+```
+
+Send the resulting `dfs1_...` invitation to the new peer through a trusted channel. It is a temporary secret.
+
+## 3. Join and mount
+
+On the new peer, from the cloned DFS source directory:
+
+```sh
+./bin/dfs network discover
+./bin/dfs network join 'dfs1_...' \
+  ~/.local/share/dfs/repository --name laptop --cache-limit 50GiB
+```
+
+Install the managed mount service:
+
+```sh
+# Linux with systemd
+./scripts/install-cachyos.sh \
+  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+
+# macOS with launchd
+./scripts/install-macos.sh \
+  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+```
+
+Verify the peer:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository health
+dfs --repo ~/.local/share/dfs/repository peer list
+```
+
+See [README.md](README.md) for platform-specific dependencies, manual mounting, troubleshooting, and advanced configuration.
