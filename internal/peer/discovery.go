@@ -5,8 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"net/url"
 	"sort"
@@ -14,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hashicorp/mdns"
+	"github.com/grandcat/zeroconf"
 )
 
 type Offer struct {
@@ -61,32 +59,38 @@ func Discover(ctx context.Context, timeout time.Duration) ([]Offer, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	entries := make(chan *mdns.ServiceEntry, 128)
-	interfaces := interfaceProvider()
-	if len(interfaces) == 0 {
-		interfaces = []*net.Interface{nil}
-	}
-	done := make(chan error, len(interfaces)*2)
-	queries := 0
-	for _, networkInterface := range interfaces {
-		for _, family := range []string{"ipv4", "ipv6"} {
-			params := mdns.DefaultParams(ServiceType)
-			params.Timeout = timeout
-			params.Interface = networkInterface
-			params.Entries = entries
-			params.DisableIPv4 = family == "ipv6"
-			params.DisableIPv6 = family == "ipv4"
-			params.Logger = log.New(io.Discard, "", 0)
-			queries++
-			go func() { done <- mdns.QueryContext(ctx, params) }()
+	interfacePointers := interfaceProvider()
+	interfaces := make([]net.Interface, 0, len(interfacePointers))
+	for _, networkInterface := range interfacePointers {
+		if networkInterface != nil {
+			interfaces = append(interfaces, *networkInterface)
 		}
+	}
+	var options []zeroconf.ClientOption
+	if len(interfaces) > 0 {
+		options = append(options, zeroconf.SelectIfaces(interfaces))
+	}
+	resolver, err := zeroconf.NewResolver(options...)
+	if err != nil {
+		return nil, fmt.Errorf("discover DFS networks: %w", err)
+	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	entries := make(chan *zeroconf.ServiceEntry, 128)
+	if err := resolver.Browse(discoveryCtx, ServiceType, "local.", entries); err != nil {
+		return nil, fmt.Errorf("discover DFS networks: %w", err)
 	}
 
 	unique := make(map[string]Offer)
-	remaining := queries
 	for {
 		select {
-		case entry := <-entries:
+		case entry, open := <-entries:
+			if !open {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return sortedOffers(unique), nil
+			}
 			if entry == nil {
 				continue
 			}
@@ -94,39 +98,30 @@ func Discover(ctx context.Context, timeout time.Duration) ([]Offer, error) {
 				key := offer.FileSystemID + "\x00" + offer.PeerID + "\x00" + offer.Endpoint
 				unique[key] = offer
 			}
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				remaining--
-				if remaining > 0 {
-					continue
-				}
-				if len(unique) == 0 {
-					return nil, fmt.Errorf("discover DFS networks: %w", err)
-				}
-			} else {
-				remaining--
-				if remaining > 0 {
-					continue
-				}
+		case <-discoveryCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-			result := make([]Offer, 0, len(unique))
-			for _, offer := range unique {
-				result = append(result, offer)
-			}
-			sort.Slice(result, func(i, j int) bool {
-				if result[i].NetworkName != result[j].NetworkName {
-					return result[i].NetworkName < result[j].NetworkName
-				}
-				if result[i].PeerName != result[j].PeerName {
-					return result[i].PeerName < result[j].PeerName
-				}
-				return result[i].Endpoint < result[j].Endpoint
-			})
-			return result, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
+			return sortedOffers(unique), nil
 		}
 	}
+}
+
+func sortedOffers(unique map[string]Offer) []Offer {
+	result := make([]Offer, 0, len(unique))
+	for _, offer := range unique {
+		result = append(result, offer)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].NetworkName != result[j].NetworkName {
+			return result[i].NetworkName < result[j].NetworkName
+		}
+		if result[i].PeerName != result[j].PeerName {
+			return result[i].PeerName < result[j].PeerName
+		}
+		return result[i].Endpoint < result[j].Endpoint
+	})
+	return result
 }
 
 func multicastInterfaces() []*net.Interface {
@@ -145,9 +140,9 @@ func multicastInterfaces() []*net.Interface {
 
 var interfaceProvider = multicastInterfaces
 
-func offersFromEntry(entry *mdns.ServiceEntry) []Offer {
+func offersFromEntry(entry *zeroconf.ServiceEntry) []Offer {
 	fields := make(map[string]string)
-	for _, field := range entry.InfoFields {
+	for _, field := range entry.Text {
 		key, value, found := strings.Cut(field, "=")
 		if found {
 			fields[key] = value
@@ -167,18 +162,12 @@ func offersFromEntry(entry *mdns.ServiceEntry) []Offer {
 	}
 	base := Offer{
 		FileSystemID: fields["fs"], NetworkName: networkName,
-		PeerID: fields["peer"], PeerName: peerName, Host: strings.TrimSuffix(entry.Host, "."),
+		PeerID: fields["peer"], PeerName: peerName, Host: strings.TrimSuffix(entry.HostName, "."),
 		Port: entry.Port, ProtocolVersion: version, CertificateSHA256: fields["cert"],
 	}
 	var addresses []net.IP
-	if entry.AddrV4 != nil {
-		addresses = append(addresses, entry.AddrV4)
-	}
-	if entry.AddrV6IPAddr != nil && entry.AddrV6IPAddr.IP != nil {
-		addresses = append(addresses, entry.AddrV6IPAddr.IP)
-	} else if entry.AddrV6 != nil {
-		addresses = append(addresses, entry.AddrV6)
-	}
+	addresses = append(addresses, entry.AddrIPv4...)
+	addresses = append(addresses, entry.AddrIPv6...)
 	var result []Offer
 	for _, address := range addresses {
 		offer := base

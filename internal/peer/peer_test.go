@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/hashicorp/mdns"
+	"github.com/grandcat/zeroconf"
 )
 
 func TestInvitationRoundTripAndValidation(t *testing.T) {
@@ -44,9 +44,9 @@ func TestInvitationRoundTripAndValidation(t *testing.T) {
 }
 
 func TestOffersFromEntry(t *testing.T) {
-	entry := &mdns.ServiceEntry{
-		Host: "desktop.local.", AddrV4: net.ParseIP("192.0.2.10"), Port: 44123,
-		InfoFields: []string{
+	entry := &zeroconf.ServiceEntry{
+		HostName: "desktop.local.", AddrIPv4: []net.IP{net.ParseIP("192.0.2.10")}, Port: 44123,
+		Text: []string{
 			"v=1", "fs=" + strings.Repeat("a", 40), "network=" + encodeTXT("Home Files"),
 			"peer=0123456789abcdef", "name=" + encodeTXT("Desktop"), "cert=" + strings.Repeat("b", 64),
 		},
@@ -60,7 +60,7 @@ func TestOffersFromEntry(t *testing.T) {
 		t.Fatalf("offer = %#v", offer)
 	}
 
-	entry.InfoFields = []string{"v=broken"}
+	entry.Text = []string{"v=broken"}
 	if offers := offersFromEntry(entry); len(offers) != 0 {
 		t.Fatalf("invalid entry produced offers: %#v", offers)
 	}
