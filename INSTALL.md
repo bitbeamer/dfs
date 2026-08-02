@@ -15,7 +15,19 @@ make build
 
 The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353 and TCP 7843 from the trusted LAN.
 
-## 2. Create an invitation
+## 2. Create a new filesystem (first peer only)
+
+If no DFS filesystem exists yet, initialize and mount one:
+
+```sh
+./bin/dfs init ~/.local/share/dfs/repository \
+  --name desktop --network-name "Home Files" --cache-limit 100GiB
+./bin/dfs --repo ~/.local/share/dfs/repository mount ~/DFS
+```
+
+Keep the mount running. It now advertises the filesystem to nearby peers. Run the next step in another terminal.
+
+## 3. Create an invitation
 
 On an existing, mounted DFS peer:
 
@@ -25,7 +37,7 @@ dfs --repo ~/.local/share/dfs/repository pair invite
 
 Send the resulting `dfs1_...` invitation to the new peer through a trusted channel. It is a temporary secret.
 
-## 3. Join and mount
+## 4. Join and mount
 
 On the new peer, from the cloned DFS source directory:
 
