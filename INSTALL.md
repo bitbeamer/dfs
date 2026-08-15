@@ -4,7 +4,72 @@ DFS is experimental. Start with test data and keep an independent backup.
 
 ## 1. Install and build
 
-Install Go 1.26+, Git, git-annex, OpenSSH, rsync, and FUSE 3 (Linux) or macFUSE (macOS). Then:
+Each peer needs Go 1.26+, Git, git-annex, OpenSSH, rsync, and a FUSE
+runtime.
+
+### CachyOS/Arch Linux prerequisites
+
+```sh
+sudo pacman -S --needed go git git-annex openssh rsync fuse3
+```
+
+Enable the SSH server on a peer that will receive direct connections from
+other peers:
+
+```sh
+sudo systemctl enable --now sshd
+```
+
+### macOS prerequisites
+
+Install the command-line dependencies with Homebrew. macOS supplies the SSH
+client and server.
+
+```sh
+brew install go git git-annex rsync
+```
+
+Installing `git-annex` may print a suggestion to run
+`brew services start git-annex`. Do not start that optional service for a DFS
+repository: it runs `git-annex assistant`, while DFS already controls annex
+operations and synchronization.
+
+Install the current macFUSE package from the
+[official macFUSE site](https://macfuse.io/) by opening its downloaded installer.
+The macFUSE project recommends its signed installer over third-party package
+managers. Homebrew's cask is an alternative:
+
+```sh
+brew install --cask macfuse
+```
+
+DFS currently uses macFUSE's VFS/kernel backend, not its optional FSKit
+backend. Its go-fuse integration expects the traditional FUSE device transport,
+and FSKit also restricts mountpoints to `/Volumes`, whereas the examples below
+use a mountpoint in the user's home directory. Do not select
+`backend=fskit`. On the first mount, follow macOS's prompt to allow macFUSE under
+**System Settings → Privacy & Security**, then restart when requested. On an
+Apple Silicon Mac whose security policy has never allowed third-party kernel
+extensions, macOS may first direct you to Recovery: choose **Reduced Security**,
+enable **Allow user management of kernel extensions from identified
+developers**, restart, approve macFUSE in Privacy & Security, and restart once
+more. Do not disable Gatekeeper or System Integrity Protection. See macFUSE's
+[current installation instructions](https://github.com/macfuse/macfuse/wiki/Getting-Started)
+for the dialogs used by your macOS version.
+
+Verify that the runtime helper is installed:
+
+```sh
+test -x /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse \
+  && echo "macFUSE is installed"
+```
+
+For direct inbound connections, enable **Remote Login** under **System Settings
+→ General → Sharing** for the DFS account.
+
+### Build DFS
+
+After installing the platform prerequisites:
 
 ```sh
 git clone https://github.com/bitbeamer/dfs.git
