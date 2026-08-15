@@ -118,7 +118,23 @@ func TestServiceAdvertisesWithMDNS(t *testing.T) {
 	if err := repo.SaveConfig(); err != nil {
 		t.Fatal(err)
 	}
-	loopback, err := net.InterfaceByName("lo")
+	testInterface := os.Getenv("DFS_TEST_MDNS_INTERFACE")
+	var loopback *net.Interface
+	if testInterface != "" {
+		loopback, err = net.InterfaceByName(testInterface)
+	} else {
+		interfaces, listErr := net.Interfaces()
+		err = listErr
+		for index := range interfaces {
+			if interfaces[index].Flags&net.FlagLoopback != 0 {
+				loopback = &interfaces[index]
+				break
+			}
+		}
+		if err == nil && loopback == nil {
+			err = errors.New("no loopback interface")
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
