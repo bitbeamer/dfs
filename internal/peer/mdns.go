@@ -73,19 +73,13 @@ func newMDNSConn(interfacePointers []*net.Interface, options ...mdns.ServerOptio
 
 func multicastPacketConns() (*ipv4.PacketConn, *ipv6.PacketConn, error) {
 	var packet4 *ipv4.PacketConn
-	address4, err4 := net.ResolveUDPAddr("udp4", mdns.DefaultAddressIPv4)
-	if err4 == nil {
-		if listener4, listenErr := net.ListenUDP("udp4", address4); listenErr == nil {
-			packet4 = ipv4.NewPacketConn(listener4)
-		}
+	if listener4, err := listenMDNSUDP4(); err == nil {
+		packet4 = ipv4.NewPacketConn(listener4)
 	}
 
 	var packet6 *ipv6.PacketConn
-	address6, err6 := net.ResolveUDPAddr("udp6", mdns.DefaultAddressIPv6)
-	if err6 == nil {
-		if listener6, listenErr := net.ListenUDP("udp6", address6); listenErr == nil {
-			packet6 = ipv6.NewPacketConn(listener6)
-		}
+	if listener6, err := listenMDNSUDP6(); err == nil {
+		packet6 = ipv6.NewPacketConn(listener6)
 	}
 	if packet4 == nil && packet6 == nil {
 		return nil, nil, errors.New("cannot listen for IPv4 or IPv6 multicast DNS")
