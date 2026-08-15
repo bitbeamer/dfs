@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,7 +22,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/grandcat/zeroconf"
+	"github.com/pion/mdns/v2"
 )
 
 func TestInvitationRoundTripAndValidation(t *testing.T) {
@@ -45,26 +46,25 @@ func TestInvitationRoundTripAndValidation(t *testing.T) {
 	}
 }
 
-func TestOffersFromEntry(t *testing.T) {
-	entry := &zeroconf.ServiceEntry{
-		HostName: "desktop.local.", AddrIPv4: []net.IP{net.ParseIP("192.0.2.10")}, Port: 44123,
-		Text: []string{
+func TestOfferFromEvent(t *testing.T) {
+	event := mdns.ServiceEvent{
+		Addr: netip.MustParseAddr("192.0.2.10"),
+		Instance: mdns.ServiceInstance{Host: "desktop.local.", Port: 44123, Text: pionTXTEntries([]string{
 			"v=1", "fs=" + strings.Repeat("a", 40), "network=" + encodeTXT("Home Files"),
 			"peer=0123456789abcdef", "name=" + encodeTXT("Desktop"), "cert=" + strings.Repeat("b", 64),
-		},
+		})},
 	}
-	offers := offersFromEntry(entry)
-	if len(offers) != 1 {
-		t.Fatalf("offers = %#v", offers)
+	offer, found := offerFromEvent(event)
+	if !found {
+		t.Fatal("valid event did not produce an offer")
 	}
-	offer := offers[0]
 	if offer.NetworkName != "Home Files" || offer.PeerName != "Desktop" || offer.Endpoint != "https://192.0.2.10:44123" {
 		t.Fatalf("offer = %#v", offer)
 	}
 
-	entry.Text = []string{"v=broken"}
-	if offers := offersFromEntry(entry); len(offers) != 0 {
-		t.Fatalf("invalid entry produced offers: %#v", offers)
+	event.Instance.Text = pionTXTEntries([]string{"v=broken"})
+	if offer, found := offerFromEvent(event); found {
+		t.Fatalf("invalid event produced offer: %#v", offer)
 	}
 	networks := GroupOffers([]Offer{
 		{FileSystemID: "same", NetworkName: "Home", PeerName: "desktop"},

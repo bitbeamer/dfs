@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/grandcat/zeroconf"
+	"github.com/pion/mdns/v2"
 )
 
 type Offer struct {
@@ -59,42 +59,29 @@ func Discover(ctx context.Context, timeout time.Duration) ([]Offer, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	interfacePointers := interfaceProvider()
-	interfaces := make([]net.Interface, 0, len(interfacePointers))
-	for _, networkInterface := range interfacePointers {
-		if networkInterface != nil {
-			interfaces = append(interfaces, *networkInterface)
-		}
-	}
-	var options []zeroconf.ClientOption
-	if len(interfaces) > 0 {
-		options = append(options, zeroconf.SelectIfaces(interfaces))
-	}
-	resolver, err := zeroconf.NewResolver(options...)
+	conn, err := newMDNSConn(interfaceProvider())
 	if err != nil {
 		return nil, fmt.Errorf("discover DFS networks: %w", err)
 	}
+	defer conn.Close()
 	discoveryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	entries := make(chan *zeroconf.ServiceEntry, 128)
-	if err := resolver.Browse(discoveryCtx, ServiceType, "local.", entries); err != nil {
+	events := make(chan mdns.ServiceEvent, 128)
+	conn.OnServiceDiscovered(func(event mdns.ServiceEvent) {
+		select {
+		case events <- event:
+		case <-discoveryCtx.Done():
+		}
+	})
+	if err := conn.Browse(discoveryCtx, ServiceType); err != nil {
 		return nil, fmt.Errorf("discover DFS networks: %w", err)
 	}
 
 	unique := make(map[string]Offer)
 	for {
 		select {
-		case entry, open := <-entries:
-			if !open {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				return sortedOffers(unique), nil
-			}
-			if entry == nil {
-				continue
-			}
-			for _, offer := range offersFromEntry(entry) {
+		case event := <-events:
+			if offer, found := offerFromEvent(event); found {
 				key := offer.FileSystemID + "\x00" + offer.PeerID + "\x00" + offer.Endpoint
 				unique[key] = offer
 			}
@@ -140,42 +127,34 @@ func multicastInterfaces() []*net.Interface {
 
 var interfaceProvider = multicastInterfaces
 
-func offersFromEntry(entry *zeroconf.ServiceEntry) []Offer {
+func offerFromEvent(event mdns.ServiceEvent) (Offer, bool) {
 	fields := make(map[string]string)
-	for _, field := range entry.Text {
-		key, value, found := strings.Cut(field, "=")
-		if found {
-			fields[key] = value
-		}
+	for _, field := range event.Instance.Text {
+		fields[field.Key] = string(field.Value)
 	}
 	version, err := strconv.Atoi(fields["v"])
 	if err != nil || version <= 0 || fields["fs"] == "" || fields["peer"] == "" {
-		return nil
+		return Offer{}, false
 	}
 	networkName, err := decodeTXT(fields["network"])
 	if err != nil {
-		return nil
+		return Offer{}, false
 	}
 	peerName, err := decodeTXT(fields["name"])
 	if err != nil {
-		return nil
+		return Offer{}, false
 	}
-	base := Offer{
+	offer := Offer{
 		FileSystemID: fields["fs"], NetworkName: networkName,
-		PeerID: fields["peer"], PeerName: peerName, Host: strings.TrimSuffix(entry.HostName, "."),
-		Port: entry.Port, ProtocolVersion: version, CertificateSHA256: fields["cert"],
+		PeerID: fields["peer"], PeerName: peerName, Host: strings.TrimSuffix(event.Instance.Host, "."),
+		Address: event.Addr.String(), Port: int(event.Instance.Port), ProtocolVersion: version,
+		CertificateSHA256: fields["cert"],
 	}
-	var addresses []net.IP
-	addresses = append(addresses, entry.AddrIPv4...)
-	addresses = append(addresses, entry.AddrIPv6...)
-	var result []Offer
-	for _, address := range addresses {
-		offer := base
-		offer.Address = address.String()
-		offer.Endpoint = "https://" + net.JoinHostPort(offer.Address, strconv.Itoa(offer.Port))
-		result = append(result, offer)
+	if !event.Addr.IsValid() {
+		return Offer{}, false
 	}
-	return result
+	offer.Endpoint = "https://" + net.JoinHostPort(offer.Address, strconv.Itoa(offer.Port))
+	return offer, true
 }
 
 func encodeTXT(value string) string {
