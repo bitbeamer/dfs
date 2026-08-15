@@ -76,6 +76,18 @@ func TestOffersFromEntry(t *testing.T) {
 	}
 }
 
+func TestMDNSHostname(t *testing.T) {
+	for input, expected := range map[string]string{
+		"cachyos":     "cachyos.local.",
+		"zeus.local":  "zeus.local.",
+		"ZEUS.LOCAL.": "ZEUS.LOCAL.",
+	} {
+		if actual := mdnsHostname(input); actual != expected {
+			t.Errorf("mdnsHostname(%q) = %q, want %q", input, actual, expected)
+		}
+	}
+}
+
 func TestServiceAdvertisesWithMDNS(t *testing.T) {
 	if os.Getenv("DFS_TEST_MDNS") != "1" {
 		t.Skip("set DFS_TEST_MDNS=1 to exercise multicast discovery")

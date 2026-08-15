@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,7 +22,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/hashicorp/mdns"
+	"github.com/grandcat/zeroconf"
 )
 
 const runtimeStateFile = "network.json"
@@ -45,7 +44,7 @@ type Service struct {
 	identity     transportIdentity
 	listener     net.Listener
 	httpServer   *http.Server
-	mdnsServers  []*mdns.Server
+	mdnsServers  []*zeroconf.Server
 	statePath    string
 	mu           sync.Mutex
 	attempts     map[string]attemptWindow
@@ -124,18 +123,21 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 			return nil, errors.New("advertise DFS network: no multicast-capable interface")
 		}
 		for _, networkInterface := range interfaces {
-			zone, zoneErr := mdns.NewMDNSService(
-				serviceInstance(repo.Config.NetworkName, repo.Config.Name, repo.Config.PeerID), ServiceType, "", "", port,
-				interfaceIPs(networkInterface), []string{
+			if networkInterface == nil {
+				continue
+			}
+			ips := interfaceIPStrings(networkInterface)
+			if len(ips) == 0 {
+				continue
+			}
+			server, serverErr := zeroconf.RegisterProxy(
+				serviceInstance(repo.Config.NetworkName, repo.Config.Name, repo.Config.PeerID), ServiceType, "local", port,
+				localMDNSHostname(), ips, []string{
 					"v=" + strconv.Itoa(ProtocolVersion), "fs=" + filesystemID,
 					"network=" + encodeTXT(repo.Config.NetworkName), "peer=" + repo.Config.PeerID,
 					"name=" + encodeTXT(repo.Config.Name), "cert=" + fingerprint, "pair=invite",
-				},
+				}, []net.Interface{*networkInterface},
 			)
-			if zoneErr != nil {
-				continue
-			}
-			server, serverErr := mdns.NewServer(&mdns.Config{Zone: zone, Iface: networkInterface, Logger: log.New(io.Discard, "", 0)})
 			if serverErr == nil {
 				service.mdnsServers = append(service.mdnsServers, server)
 			}
@@ -151,7 +153,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		CertificateSHA: fingerprint, PID: os.Getpid(), StartedAt: time.Now().UTC(),
 	}); err != nil {
 		for _, server := range service.mdnsServers {
-			_ = server.Shutdown()
+			server.Shutdown()
 		}
 		_ = listener.Close()
 		return nil, err
@@ -170,7 +172,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 
 func (s *Service) Close() error {
 	for _, server := range s.mdnsServers {
-		_ = server.Shutdown()
+		server.Shutdown()
 	}
 	close(s.cleanupStop)
 	<-s.cleanupDone
@@ -411,7 +413,7 @@ func localAddress(request *http.Request) string {
 		}
 	}
 	host, _ := os.Hostname()
-	return host + ".local"
+	return strings.TrimSuffix(mdnsHostname(host), ".")
 }
 
 func remoteAddress(request *http.Request) string {
@@ -470,9 +472,9 @@ func (s *Service) recordPairingFailure(remote string, now time.Time) {
 	s.attempts[remote] = window
 }
 
-func interfaceIPs(networkInterface *net.Interface) []net.IP {
+func interfaceIPStrings(networkInterface *net.Interface) []string {
 	addresses, _ := networkInterface.Addrs()
-	var result []net.IP
+	var result []string
 	for _, address := range addresses {
 		var ip net.IP
 		switch value := address.(type) {
@@ -484,14 +486,26 @@ func interfaceIPs(networkInterface *net.Interface) []net.IP {
 		if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
 			continue
 		}
-		result = append(result, ip)
+		result = append(result, ip.String())
 	}
 	return result
 }
 
-func runtimeEndpoint(port int) string {
+func localMDNSHostname() string {
 	host, _ := os.Hostname()
-	return "https://" + net.JoinHostPort(host+".local", strconv.Itoa(port))
+	return mdnsHostname(host)
+}
+
+func mdnsHostname(host string) string {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if strings.HasSuffix(strings.ToLower(host), ".local") {
+		return host + "."
+	}
+	return host + ".local."
+}
+
+func runtimeEndpoint(port int) string {
+	return "https://" + net.JoinHostPort(strings.TrimSuffix(localMDNSHostname(), "."), strconv.Itoa(port))
 }
 
 func writeRuntimeState(path string, state runtimeState) error {
