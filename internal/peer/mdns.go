@@ -1,11 +1,14 @@
 package peer
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/pion/mdns/v2"
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -98,4 +101,56 @@ func pionTXTEntries(fields []string) []mdns.TXTEntry {
 		}
 	}
 	return entries
+}
+
+// Pion Browse requests unicast replies. Sending a conventional multicast
+// question as well keeps discovery interoperable with Bonjour and networks
+// that filter replies from UDP 5353 to an ephemeral port.
+func sendMulticastBrowseQuestions(ctx context.Context, interfaces []*net.Interface) {
+	name, err := dnsmessage.NewName(ServiceType + ".local.")
+	if err != nil {
+		return
+	}
+	message := dnsmessage.Message{Questions: []dnsmessage.Question{{
+		Name: name, Type: dnsmessage.TypePTR, Class: dnsmessage.ClassINET,
+	}}}
+	packet, err := message.Pack()
+	if err != nil {
+		return
+	}
+	send := func() {
+		for _, networkInterface := range interfaces {
+			if networkInterface != nil {
+				sendMulticastBrowseQuestion(packet, networkInterface)
+			}
+		}
+	}
+	send()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			send()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func sendMulticastBrowseQuestion(packet []byte, networkInterface *net.Interface) {
+	if listener4, err := listenMDNSQueryUDP4(networkInterface); err == nil {
+		connection4 := ipv4.NewPacketConn(listener4)
+		_, _ = connection4.WriteTo(packet, &ipv4.ControlMessage{IfIndex: networkInterface.Index}, &net.UDPAddr{
+			IP: net.IPv4(224, 0, 0, 251), Port: 5353,
+		})
+		_ = connection4.Close()
+	}
+	if listener6, err := listenMDNSQueryUDP6(networkInterface); err == nil {
+		connection6 := ipv6.NewPacketConn(listener6)
+		_, _ = connection6.WriteTo(packet, &ipv6.ControlMessage{IfIndex: networkInterface.Index}, &net.UDPAddr{
+			IP: net.ParseIP("ff02::fb"), Port: 5353, Zone: networkInterface.Name,
+		})
+		_ = connection6.Close()
+	}
 }

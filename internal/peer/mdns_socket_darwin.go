@@ -18,6 +18,14 @@ func listenMDNSUDP6() (*net.UDPConn, error) {
 	return listenReusableMDNS("udp6", "[::]:5353")
 }
 
+func listenMDNSQueryUDP4(_ *net.Interface) (*net.UDPConn, error) {
+	return listenReusableMDNS("udp4", "0.0.0.0:5353")
+}
+
+func listenMDNSQueryUDP6(_ *net.Interface) (*net.UDPConn, error) {
+	return listenReusableMDNS("udp6", "[::]:5353")
+}
+
 func listenReusableMDNS(network, address string) (*net.UDPConn, error) {
 	listenConfig := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
 		var socketErr error

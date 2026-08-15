@@ -59,7 +59,8 @@ func Discover(ctx context.Context, timeout time.Duration) ([]Offer, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	conn, err := newMDNSConn(interfaceProvider())
+	interfaces := interfaceProvider()
+	conn, err := newMDNSConn(interfaces)
 	if err != nil {
 		return nil, fmt.Errorf("discover DFS networks: %w", err)
 	}
@@ -76,6 +77,7 @@ func Discover(ctx context.Context, timeout time.Duration) ([]Offer, error) {
 	if err := conn.Browse(discoveryCtx, ServiceType); err != nil {
 		return nil, fmt.Errorf("discover DFS networks: %w", err)
 	}
+	go sendMulticastBrowseQuestions(discoveryCtx, interfaces)
 
 	unique := make(map[string]Offer)
 	for {

@@ -23,3 +23,13 @@ func listenMDNSUDP6() (*net.UDPConn, error) {
 	}
 	return net.ListenUDP("udp6", address)
 }
+
+func listenMDNSQueryUDP4(networkInterface *net.Interface) (*net.UDPConn, error) {
+	return net.ListenMulticastUDP("udp4", networkInterface, &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353})
+}
+
+func listenMDNSQueryUDP6(networkInterface *net.Interface) (*net.UDPConn, error) {
+	return net.ListenMulticastUDP("udp6", networkInterface, &net.UDPAddr{
+		IP: net.ParseIP("ff02::fb"), Port: 5353, Zone: networkInterface.Name,
+	})
+}
