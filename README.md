@@ -101,7 +101,7 @@ make build
   ~/.local/share/dfs/repository ~/DFS ./bin/dfs
 ```
 
-This installs the binary under `~/Library/Application Support/DFS/bin`, creates `~/Library/LaunchAgents/io.bitbeamer.dfs.mount.plist`, loads it into the current GUI login session, and waits for the mount to report healthy. Inspect or control it with:
+This installs a signed helper at `~/Library/Application Support/DFS/DFS.app`, keeps `~/Library/Application Support/DFS/bin/dfs` as a compatibility link, creates `~/Library/LaunchAgents/io.bitbeamer.dfs.mount.plist`, loads it into the current GUI login session, and waits for the mount to report healthy. Allow **DFS** under **System Settings → Privacy & Security → Local Network** when macOS prompts. Inspect or control it with:
 
 ```sh
 launchctl print gui/$(id -u)/io.bitbeamer.dfs.mount

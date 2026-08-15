@@ -4,7 +4,10 @@ set -euo pipefail
 label="io.bitbeamer.dfs.mount"
 domain="gui/$(id -u)"
 support_dir="$HOME/Library/Application Support/DFS"
-install_path="$support_dir/bin/dfs"
+app_dir="$support_dir/DFS.app"
+install_path="$app_dir/Contents/MacOS/dfs"
+legacy_install_path="$support_dir/bin/dfs"
+info_path="$app_dir/Contents/Info.plist"
 plist_dir="$HOME/Library/LaunchAgents"
 plist_path="$plist_dir/$label.plist"
 log_dir="$HOME/Library/Logs/DFS"
@@ -17,7 +20,7 @@ usage() {
 if [[ "${1:-}" == "--uninstall" ]]; then
   launchctl bootout "$domain/$label" 2>/dev/null || true
   rm -f "$plist_path"
-  printf 'Removed %s (binary retained at %s).\n' "$label" "$install_path"
+  printf 'Removed %s (application retained at %s).\n' "$label" "$app_dir"
   exit 0
 fi
 
@@ -41,10 +44,10 @@ repository=$(absolute_path "$1")
 mountpoint=$2
 source_binary=${3:-./bin/dfs}
 source_binary=$(absolute_path "$source_binary")
-mkdir -p "$mountpoint" "$support_dir/bin" "$plist_dir" "$log_dir"
+mkdir -p "$mountpoint" "$app_dir/Contents/MacOS" "$support_dir/bin" "$plist_dir" "$log_dir"
 mountpoint=$(absolute_path "$mountpoint")
 
-for command in git git-annex launchctl plutil; do
+for command in codesign git git-annex launchctl plutil; do
   command -v "$command" >/dev/null || { printf 'Required command not found: %s\n' "$command" >&2; exit 1; }
 done
 if [[ ! -x "$source_binary" ]]; then
@@ -65,6 +68,45 @@ fi
 if [[ "$source_binary" != "$install_path" ]]; then
   install -m 0755 "$source_binary" "$install_path"
 fi
+
+cat >"$info_path" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>DFS</string>
+  <key>CFBundleExecutable</key>
+  <string>dfs</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.bitbeamer.dfs</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>DFS</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_dfs._tcp</string>
+  </array>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>DFS discovers and connects to peers on your local network.</string>
+</dict>
+</plist>
+EOF
+plutil -lint "$info_path"
+codesign --force --deep --sign - --identifier io.bitbeamer.dfs "$app_dir"
+codesign --verify --deep --strict "$app_dir"
+ln -sfn "../DFS.app/Contents/MacOS/dfs" "$legacy_install_path"
 
 binary_xml=$(xml_escape "$install_path")
 repository_xml=$(xml_escape "$repository")

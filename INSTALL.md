@@ -55,6 +55,11 @@ launchctl print gui/$(id -u)/io.bitbeamer.dfs.mount
   --repo ~/.local/share/dfs/repository health
 ```
 
+The installer puts the daemon in a signed `DFS.app` helper with a stable bundle
+identifier and keeps `~/Library/Application Support/DFS/bin/dfs` as a
+compatibility link. On first install, allow **DFS** under **System Settings →
+Privacy & Security → Local Network** so discovery can use `_dfs._tcp`.
+
 Homebrew is normally added to interactive macOS shells automatically. When
 building through a non-interactive SSH command, make it explicit first:
 
