@@ -99,8 +99,11 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	return report, nil
 }
 
-// CheckMesh asks every discovered peer in this filesystem to run Diagnose and
-// evaluates every directed edge between those peers and the local peer.
+// CheckMesh asks every configured or discovered peer in this filesystem to run
+// Diagnose and evaluates every directed edge between those peers and the local
+// peer. Configured remotes are authoritative mesh members: discovery is only a
+// supplement, so a broken or blocked mDNS advertisement cannot make doctor
+// silently omit a peer.
 func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeout, probeTimeout time.Duration) (MeshReport, error) {
 	if discoveryTimeout <= 0 {
 		discoveryTimeout = 2 * time.Second
@@ -112,25 +115,19 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	if err != nil {
 		return MeshReport{}, err
 	}
-	offers, err := Discover(ctx, discoveryTimeout)
-	if err != nil {
-		return MeshReport{}, err
-	}
 	peers := map[string]MeshPeer{
 		repo.Config.PeerID: {PeerID: repo.Config.PeerID, PeerName: repo.Config.Name},
 	}
-	for _, offer := range offers {
-		if offer.FileSystemID == filesystemID && offer.PeerID != repo.Config.PeerID {
-			peers[offer.PeerID] = MeshPeer{PeerID: offer.PeerID, PeerName: offer.PeerName}
+	if offers, discoverErr := Discover(ctx, discoveryTimeout); discoverErr == nil {
+		for _, offer := range offers {
+			if offer.FileSystemID == filesystemID && offer.PeerID != repo.Config.PeerID {
+				peers[offer.PeerID] = MeshPeer{PeerID: offer.PeerID, PeerName: offer.PeerName}
+			}
 		}
 	}
 	remotes, err := repo.Remotes(ctx)
 	if err != nil {
 		return MeshReport{}, err
-	}
-	remoteByName := make(map[string]repository.Remote, len(remotes))
-	for _, remote := range remotes {
-		remoteByName[remote.Name] = remote
 	}
 
 	reports := make(map[string]DiagnosticReport)
@@ -143,17 +140,15 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 
 	var wait sync.WaitGroup
 	var mu sync.Mutex
-	for peerID := range peers {
-		if peerID == repo.Config.PeerID {
+	for _, remote := range remotes {
+		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
 			continue
 		}
-		peerID := peerID
-		remote, found := remoteByName[pairedRemoteName(peerID)]
-		if !found {
-			mu.Lock()
-			reportErrors[peerID] = "no configured remote from the initiating peer"
-			mu.Unlock()
-			continue
+		remote := remote
+		peerID := meshPeerIDForRemote(peers, remote.Name)
+		if peerID == "" {
+			peerID = strings.TrimPrefix(remote.Name, "dfs-peer-")
+			peers[peerID] = MeshPeer{PeerID: peerID, PeerName: remote.Name}
 		}
 		wait.Add(1)
 		go func() {
@@ -167,15 +162,32 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 				reportErrors[peerID] = conciseError(requestErr)
 				return
 			}
-			if report.FileSystemID != filesystemID || report.PeerID != peerID {
+			if report.FileSystemID != filesystemID || pairedRemoteName(report.PeerID) != remote.Name {
 				reportErrors[peerID] = "remote diagnostic returned a different filesystem or peer identity"
 				return
 			}
+			if report.PeerID != peerID {
+				delete(peers, peerID)
+				delete(reportErrors, peerID)
+				peers[report.PeerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
+			} else {
+				peers[peerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
+			}
 			reports[peerID] = report
+			reports[report.PeerID] = report
 		}()
 	}
 	wait.Wait()
 	return evaluateMesh(peers, reports, reportErrors), nil
+}
+
+func meshPeerIDForRemote(peers map[string]MeshPeer, remoteName string) string {
+	for peerID := range peers {
+		if pairedRemoteName(peerID) == remoteName {
+			return peerID
+		}
+	}
+	return ""
 }
 
 func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport, reportErrors map[string]string) MeshReport {

@@ -423,6 +423,18 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	}
 }
 
+func TestMeshPeerIDForRemoteUsesConfiguredShortID(t *testing.T) {
+	peers := map[string]MeshPeer{
+		"6a728fd84bbb1234567890abcdefabcd": {PeerID: "6a728fd84bbb1234567890abcdefabcd", PeerName: "zeus"},
+	}
+	if got := meshPeerIDForRemote(peers, "dfs-peer-6a728fd84bbb"); got != "6a728fd84bbb1234567890abcdefabcd" {
+		t.Fatalf("peer ID = %q", got)
+	}
+	if got := meshPeerIDForRemote(peers, "dfs-peer-fa0841841386"); got != "" {
+		t.Fatalf("unknown peer ID = %q", got)
+	}
+}
+
 func TestSSHRemoteAcceptsOnlySSHURLs(t *testing.T) {
 	tests := []struct {
 		url, target, port string
