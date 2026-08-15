@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/grandcat/zeroconf"
 )
@@ -267,6 +269,150 @@ func TestServeSSHDelegatesToRepositoryRestrictedAnnexShell(t *testing.T) {
 	}
 	if string(data) != "-c\ngit-upload-pack '/some/repository'\n"+repositoryPath+"\n" {
 		t.Fatalf("git-annex-shell invocation:\n%s", data)
+	}
+}
+
+func TestServeDiagnosticReturnsRepositoryIdentity(t *testing.T) {
+	directory := t.TempDir()
+	gitOutput(t, directory, "init", "-b", "main")
+	gitOutput(t, directory, "config", "user.name", "Diagnostic Test")
+	gitOutput(t, directory, "config", "user.email", "diagnostic@example.invalid")
+	gitOutput(t, directory, "commit", "--allow-empty", "-m", "Initialize")
+	reachable := filepath.Join(t.TempDir(), "reachable.git")
+	if err := os.Mkdir(reachable, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, reachable, "init", "--bare")
+	gitOutput(t, directory, "remote", "add", "dfs-peer-bbbbbbbbbbbb", reachable)
+	gitOutput(t, directory, "remote", "add", "dfs-peer-cccccccccccc", filepath.Join(t.TempDir(), "missing.git"))
+	cfg := config.Default("desktop", directory)
+	cfg.PeerID = "aaaaaaaaaaaaaaaa"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := serveDiagnostic(directory, &output); err != nil {
+		t.Fatal(err)
+	}
+	var report DiagnosticReport
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Version != 1 || report.PeerID != cfg.PeerID || report.PeerName != cfg.Name || report.FileSystemID == "" {
+		t.Fatalf("diagnostic report = %#v", report)
+	}
+	if len(report.Remotes) != 2 || !report.Remotes[0].Reachable || report.Remotes[1].Reachable || report.Remotes[1].Error == "" {
+		t.Fatalf("remote diagnostics = %#v", report.Remotes)
+	}
+}
+
+func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
+	peers := map[string]MeshPeer{
+		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop"},
+		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop"},
+		"cccccccccccccccc": {PeerID: "cccccccccccccccc", PeerName: "server"},
+	}
+	reports := map[string]DiagnosticReport{
+		"aaaaaaaaaaaaaaaa": {
+			PeerID: "aaaaaaaaaaaaaaaa", Remotes: []RemoteDiagnostic{
+				{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true},
+				{Name: "dfs-peer-cccccccccccc", Reachable: false, Error: "connection refused"},
+			},
+		},
+		"bbbbbbbbbbbbbbbb": {
+			PeerID: "bbbbbbbbbbbbbbbb", Remotes: []RemoteDiagnostic{
+				{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true},
+			},
+		},
+	}
+	report := evaluateMesh(peers, reports, map[string]string{"cccccccccccccccc": "diagnostic unavailable"})
+	if report.Complete || len(report.Connections) != 6 {
+		t.Fatalf("mesh report = %#v", report)
+	}
+	want := map[string]string{
+		"desktop>laptop": "OK", "desktop>server": "FAILED",
+		"laptop>desktop": "OK", "laptop>server": "NOT_CONFIGURED",
+		"server>desktop": "UNREPORTED", "server>laptop": "UNREPORTED",
+	}
+	for _, connection := range report.Connections {
+		from, to := "", ""
+		for _, participant := range report.Peers {
+			if participant.PeerID == connection.FromPeerID {
+				from = participant.PeerName
+			}
+			if participant.PeerID == connection.ToPeerID {
+				to = participant.PeerName
+			}
+		}
+		key := from + ">" + to
+		if connection.Status != want[key] {
+			t.Errorf("%s status = %q, want %q", key, connection.Status, want[key])
+		}
+	}
+}
+
+func TestSSHRemoteAcceptsOnlySSHURLs(t *testing.T) {
+	tests := []struct {
+		url, target, port string
+		wantErr           bool
+	}{
+		{"ssh://alice@example.test:2222/repository", "alice@example.test", "2222", false},
+		{"ssh://alice@[2001:db8::1]/repository", "alice@[2001:db8::1]", "", false},
+		{"alice@example.test:repository", "", "", true},
+		{"https://example.test/repository", "", "", true},
+	}
+	for _, test := range tests {
+		target, port, err := sshRemote(test.url)
+		if (err != nil) != test.wantErr || target != test.target || port != test.port {
+			t.Errorf("sshRemote(%q) = %q, %q, %v", test.url, target, port, err)
+		}
+	}
+}
+
+func TestRequestDiagnosticUsesPinnedRestrictedSSH(t *testing.T) {
+	directory := t.TempDir()
+	stateDirectory := filepath.Join(directory, filepath.FromSlash(config.Directory))
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{transportKeyFile, "known_hosts"} {
+		if err := os.WriteFile(filepath.Join(stateDirectory, name), []byte("test\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bin := filepath.Join(directory, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	capture := filepath.Join(directory, "arguments")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\nprintf '%s\\n' \"$DIAGNOSTIC_REPORT\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CAPTURE_PATH", capture)
+	t.Setenv("DIAGNOSTIC_REPORT", `{"version":1,"filesystem_id":"filesystem","peer_id":"bbbbbbbbbbbbbbbb","peer_name":"laptop","remotes":[]}`)
+	repo := &repository.Repository{Config: config.Config{Repository: directory}}
+	report, err := requestDiagnostic(context.Background(), repo, repository.Remote{
+		Name: "dfs-peer-bbbbbbbbbbbb", URL: "ssh://alice@example.test:2222/repository",
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.PeerID != "bbbbbbbbbbbbbbbb" {
+		t.Fatalf("diagnostic response = %#v", report)
+	}
+	arguments, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"IdentitiesOnly=yes\n", "BatchMode=yes\n", "StrictHostKeyChecking=yes\n",
+		"--\nalice@example.test\n" + diagnosticCommand + "\n",
+	} {
+		if !strings.Contains(string(arguments), expected) {
+			t.Fatalf("SSH arguments do not contain %q:\n%s", expected, arguments)
+		}
 	}
 }
 

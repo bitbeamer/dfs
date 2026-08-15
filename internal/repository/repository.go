@@ -510,6 +510,17 @@ func (r *Repository) Remotes(ctx context.Context) ([]Remote, error) {
 	return r.remotesLocked(ctx)
 }
 
+// ProbeRemote verifies that a configured Git remote can serve repository
+// metadata. It is deliberately read-only and does not fetch or update refs.
+func (r *Repository) ProbeRemote(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("remote name is required")
+	}
+	_, err := r.runner.Run(ctx, "git", "ls-remote", "--heads", name)
+	return err
+}
+
 func (r *Repository) remotesLocked(ctx context.Context) ([]Remote, error) {
 	out, err := r.runner.Run(ctx, "git", "remote", "-v")
 	if err != nil {

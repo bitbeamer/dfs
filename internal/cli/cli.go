@@ -811,7 +811,9 @@ func (a *App) conflictsCommand() *cobra.Command {
 }
 
 func (a *App) doctorCommand() *cobra.Command {
-	return &cobra.Command{
+	var mesh bool
+	var discoveryTimeout, peerTimeout time.Duration
+	cmd := &cobra.Command{
 		Use: "doctor", Args: cobra.NoArgs, Short: "Check build and runtime dependencies",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			commands := []string{"git", "git-annex", "git-annex-shell", "ssh", "ssh-keygen", "rsync"}
@@ -858,7 +860,55 @@ func (a *App) doctorCommand() *cobra.Command {
 			if failed {
 				return fmt.Errorf("one or more required commands are missing")
 			}
+			if mesh {
+				repo, err := a.open()
+				if err != nil {
+					return err
+				}
+				defer repo.Close()
+				ctx, cancel := commandContext(cmd)
+				defer cancel()
+				report, err := peer.CheckMesh(ctx, repo, discoveryTimeout, peerTimeout)
+				if err != nil {
+					return fmt.Errorf("check peer mesh: %w", err)
+				}
+				printMeshReport(a.Out, report)
+				if !report.Complete {
+					return fmt.Errorf("peer mesh is incomplete or unreachable")
+				}
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&mesh, "mesh", false, "check every directed connection between currently discovered peers")
+	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the mesh check")
+	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 5*time.Second, "maximum time for each peer connection probe")
+	return cmd
+}
+
+func printMeshReport(output io.Writer, report peer.MeshReport) {
+	if len(report.Peers) == 1 {
+		fmt.Fprintf(output, "MESH\tONLY_LOCAL_PEER\t%s\n", meshPeerLabel(report.Peers[0]))
+		return
+	}
+	names := make(map[string]string, len(report.Peers))
+	for _, participant := range report.Peers {
+		names[participant.PeerID] = meshPeerLabel(participant)
+	}
+	fmt.Fprintln(output, "FROM\tTO\tSTATUS\tDETAIL")
+	for _, connection := range report.Connections {
+		fmt.Fprintf(output, "%s\t%s\t%s\t%s\n",
+			names[connection.FromPeerID], names[connection.ToPeerID], connection.Status, connection.Error)
+	}
+}
+
+func meshPeerLabel(participant peer.MeshPeer) string {
+	id := participant.PeerID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	if participant.PeerName == "" || participant.PeerName == participant.PeerID {
+		return id
+	}
+	return participant.PeerName + " (" + id + ")"
 }

@@ -303,6 +303,9 @@ func ServeSSH(repositoryPath string) error {
 	if original == "" {
 		return errors.New("DFS peer transport can only be invoked by SSH")
 	}
+	if original == diagnosticCommand {
+		return serveDiagnostic(repositoryPath, os.Stdout)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
 	command := exec.CommandContext(ctx, "git-annex-shell", "-c", original)

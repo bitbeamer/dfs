@@ -315,9 +315,19 @@ dfs --repo ~/.local/share/dfs/repository history Documents/report.pdf
 dfs --repo ~/.local/share/dfs/repository restore <commit> Documents/report.pdf
 dfs --repo ~/.local/share/dfs/repository conflicts
 dfs --repo ~/.local/share/dfs/repository doctor
+dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
 
 Restore creates a new commit and does not rewrite shared history.
+
+`doctor --mesh` discovers mounted peers in the same DFS filesystem and asks
+each paired peer to verify every configured peer transport in both directions.
+It reports `NOT_CONFIGURED`, `FAILED`, or `UNREPORTED` for an incomplete mesh
+and exits unsuccessfully if any directed connection is not healthy. Peers that
+are offline, outside the local multicast domain, or running with discovery
+disabled are not part of the discovered mesh.
+All discovered peers must run a DFS version that supports the diagnostic SSH
+command; older peers are reported as `UNREPORTED` until they are upgraded.
 
 ## Architecture
 
