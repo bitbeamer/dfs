@@ -308,12 +308,31 @@ func ServeSSH(repositoryPath string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
-	command := exec.CommandContext(ctx, "git-annex-shell", "-c", original)
+	annexShell, err := executablePath("git-annex-shell", "/opt/homebrew/bin", "/usr/local/bin")
+	if err != nil {
+		return fmt.Errorf("locate git-annex-shell: %w", err)
+	}
+	command := exec.CommandContext(ctx, annexShell, "-c", original)
 	command.Env = append(os.Environ(), "GIT_ANNEX_SHELL_DIRECTORY="+repositoryPath)
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	return command.Run()
+}
+
+func executablePath(name string, fallbackDirectories ...string) (string, error) {
+	path, err := exec.LookPath(name)
+	if err == nil {
+		return path, nil
+	}
+	for _, directory := range fallbackDirectories {
+		candidate := filepath.Join(directory, name)
+		info, statErr := os.Stat(candidate)
+		if statErr == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", err
 }
 
 func shellQuote(value string) string {

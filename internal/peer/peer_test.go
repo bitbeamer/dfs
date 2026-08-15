@@ -300,6 +300,22 @@ func TestServeSSHDelegatesToRepositoryRestrictedAnnexShell(t *testing.T) {
 	}
 }
 
+func TestExecutablePathUsesFallbackDirectory(t *testing.T) {
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "test-command")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "")
+	path, err := executablePath("test-command", directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != executable {
+		t.Fatalf("executable path = %q, want %q", path, executable)
+	}
+}
+
 func TestServeDiagnosticReturnsRepositoryIdentity(t *testing.T) {
 	directory := t.TempDir()
 	gitOutput(t, directory, "init", "-b", "main")
