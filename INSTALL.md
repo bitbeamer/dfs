@@ -13,6 +13,55 @@ make build
 ./bin/dfs doctor
 ```
 
+## Updating a managed installation from source
+
+Build the new binary in the DFS source checkout before replacing the running
+version:
+
+```sh
+cd ~/dfs
+git pull --ff-only
+make build
+./bin/dfs --version
+./bin/dfs doctor
+```
+
+Do not copy `bin/dfs` over the installed binary while the daemon is running.
+Rerun the installer for the current platform. The installer stops the managed
+mount, installs the newly built binary, reloads the service definition, starts
+the mount, and waits for DFS to report healthy. Let the command finish; if it is
+interrupted after stopping the old daemon, rerun the same installer command.
+
+On CachyOS/systemd:
+
+```sh
+cd ~/dfs
+./scripts/install-cachyos.sh \
+  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+
+systemctl --user --no-pager --full status dfs-mount
+~/.local/bin/dfs --repo ~/.local/share/dfs/repository health
+```
+
+On macOS/launchd:
+
+```sh
+cd ~/dfs
+./scripts/install-macos.sh \
+  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+
+launchctl print gui/$(id -u)/io.bitbeamer.dfs.mount
+"$HOME/Library/Application Support/DFS/bin/dfs" \
+  --repo ~/.local/share/dfs/repository health
+```
+
+Homebrew is normally added to interactive macOS shells automatically. When
+building through a non-interactive SSH command, make it explicit first:
+
+```sh
+export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+```
+
 The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353, TCP 7843, and the SSH server port (normally TCP 22) from the trusted LAN.
 
 ## 2. Create a new filesystem (first peer only)
