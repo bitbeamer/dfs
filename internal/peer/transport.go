@@ -31,7 +31,13 @@ func ensureRepositoryTransport(ctx context.Context, repo *repository.Repository)
 	if err != nil {
 		return transportIdentity{}, err
 	}
-	sshCommand := transportSSHCommand(identity.PrivateKey, "")
+	knownHosts := filepath.Join(directory, "known_hosts")
+	if _, err := os.Stat(knownHosts); errors.Is(err, os.ErrNotExist) {
+		knownHosts = ""
+	} else if err != nil {
+		return transportIdentity{}, fmt.Errorf("inspect pinned SSH host keys: %w", err)
+	}
+	sshCommand := transportSSHCommand(identity.PrivateKey, knownHosts)
 	if err := repo.ConfigureSSHCommand(ctx, sshCommand); err != nil {
 		return transportIdentity{}, fmt.Errorf("configure DFS transport key: %w", err)
 	}

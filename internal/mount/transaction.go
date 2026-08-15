@@ -23,7 +23,9 @@ type writeTransaction struct {
 	stagingPath        string
 	recordPath         string
 	refs               int
+	pendingRefs        int
 	dirty              bool
+	checkpointed       bool
 	created            bool
 	unlinked           bool
 	destinationExisted bool
@@ -41,6 +43,8 @@ type stagedFile struct {
 	filesystem  *FileSystem
 	transaction *writeTransaction
 	path        string
+	stateMu     sync.Mutex
+	pending     bool
 	finishOnce  sync.Once
 	finishCode  fuse.Status
 }
@@ -98,6 +102,7 @@ func (f *FileSystem) openStaged(name string, flags uint32, mode os.FileMode, cre
 		return nil, err
 	}
 	transaction.refs++
+	transaction.pendingRefs++
 	if f.notifier != nil {
 		f.notifier.BeginWrite()
 	}
@@ -106,6 +111,7 @@ func (f *FileSystem) openStaged(name string, flags uint32, mode os.FileMode, cre
 	return &stagedFile{
 		File: nodefs.NewLoopbackFile(handle), filesystem: f,
 		transaction: transaction, path: path, finishCode: fuse.OK,
+		pending: true,
 	}, nil
 }
 
@@ -242,10 +248,11 @@ func (f *FileSystem) openStagedRead(path string) (nodefs.File, bool, error) {
 func (f *FileSystem) markDirty(transaction *writeTransaction) {
 	f.writesMu.Lock()
 	transaction.dirty = true
+	transaction.checkpointed = false
 	f.writesMu.Unlock()
 }
 
-func (f *FileSystem) finishWrite(transaction *writeTransaction, path string) fuse.Status {
+func (f *FileSystem) finishWrite(transaction *writeTransaction, path string, endWrite bool) fuse.Status {
 	f.writesMu.Lock()
 	transaction.refs--
 	final := transaction.refs == 0
@@ -256,7 +263,7 @@ func (f *FileSystem) finishWrite(transaction *writeTransaction, path string) fus
 		}
 		if transaction.failure != fuse.OK {
 			err = fmt.Errorf("write transaction failed before publication: %s", transaction.failure)
-		} else if transaction.unlinked || !transaction.dirty {
+		} else if transaction.unlinked || !transaction.dirty || transaction.checkpointed {
 			err = errors.Join(os.Remove(transaction.stagingPath), os.Remove(transaction.recordPath))
 		} else {
 			err = f.publishTransaction(transaction)
@@ -264,7 +271,7 @@ func (f *FileSystem) finishWrite(transaction *writeTransaction, path string) fus
 	}
 	f.writesMu.Unlock()
 
-	if f.notifier != nil {
+	if endWrite && f.notifier != nil {
 		f.notifier.EndWrite()
 	}
 	if err != nil {
@@ -327,12 +334,37 @@ func (f *FileSystem) publishTransaction(transaction *writeTransaction) error {
 
 func (s *stagedFile) finish() fuse.Status {
 	s.finishOnce.Do(func() {
-		s.finishCode = s.filesystem.finishWrite(s.transaction, s.path)
+		s.stateMu.Lock()
+		endWrite := s.pending
+		if s.pending {
+			s.filesystem.writesMu.Lock()
+			s.transaction.pendingRefs--
+			s.filesystem.writesMu.Unlock()
+		}
+		s.pending = false
+		s.stateMu.Unlock()
+		s.finishCode = s.filesystem.finishWrite(s.transaction, s.path, endWrite)
 	})
 	return s.finishCode
 }
 
+func (s *stagedFile) beginMutation() {
+	if !s.pending {
+		s.pending = true
+		s.filesystem.writesMu.Lock()
+		s.transaction.pendingRefs++
+		s.transaction.checkpointed = false
+		s.filesystem.writesMu.Unlock()
+		if s.filesystem.notifier != nil {
+			s.filesystem.notifier.BeginWrite()
+		}
+	}
+}
+
 func (s *stagedFile) Write(data []byte, off int64) (uint32, fuse.Status) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.beginMutation()
 	written, code := s.File.Write(data, off)
 	if code == fuse.OK && written > 0 {
 		s.filesystem.markDirty(s.transaction)
@@ -341,6 +373,9 @@ func (s *stagedFile) Write(data []byte, off int64) (uint32, fuse.Status) {
 }
 
 func (s *stagedFile) Truncate(size uint64) fuse.Status {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.beginMutation()
 	code := s.File.Truncate(size)
 	if code == fuse.OK {
 		s.filesystem.markDirty(s.transaction)
@@ -349,6 +384,9 @@ func (s *stagedFile) Truncate(size uint64) fuse.Status {
 }
 
 func (s *stagedFile) Chmod(mode uint32) fuse.Status {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.beginMutation()
 	code := s.File.Chmod(mode)
 	if code == fuse.OK {
 		s.filesystem.markDirty(s.transaction)
@@ -357,6 +395,9 @@ func (s *stagedFile) Chmod(mode uint32) fuse.Status {
 }
 
 func (s *stagedFile) Chown(uid, gid uint32) fuse.Status {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.beginMutation()
 	code := s.File.Chown(uid, gid)
 	if code == fuse.OK {
 		s.filesystem.markDirty(s.transaction)
@@ -365,6 +406,9 @@ func (s *stagedFile) Chown(uid, gid uint32) fuse.Status {
 }
 
 func (s *stagedFile) Utimens(atime, mtime *time.Time) fuse.Status {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.beginMutation()
 	code := s.File.Utimens(atime, mtime)
 	if code == fuse.OK {
 		s.filesystem.markDirty(s.transaction)
@@ -373,6 +417,9 @@ func (s *stagedFile) Utimens(atime, mtime *time.Time) fuse.Status {
 }
 
 func (s *stagedFile) Allocate(off, size uint64, mode uint32) fuse.Status {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.beginMutation()
 	code := s.File.Allocate(off, size, mode)
 	if code == fuse.OK {
 		s.filesystem.markDirty(s.transaction)
@@ -389,11 +436,37 @@ func (s *stagedFile) GetAttr(out *fuse.Attr) fuse.Status {
 }
 
 func (s *stagedFile) Flush() fuse.Status {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	code := s.File.Flush()
 	if code != fuse.OK {
 		s.filesystem.markFailure(s.transaction, code)
+		return code
 	}
-	return code
+	if !s.pending {
+		return fuse.OK
+	}
+	s.filesystem.writesMu.Lock()
+	s.transaction.pendingRefs--
+	lastPending := s.transaction.pendingRefs == 0
+	var err error
+	if lastPending {
+		err = s.filesystem.checkpointTransactionLocked(s.transaction)
+	}
+	if err != nil {
+		s.transaction.pendingRefs++
+	}
+	s.filesystem.writesMu.Unlock()
+	if err != nil {
+		code = status(err)
+		s.filesystem.markFailure(s.transaction, code)
+		return code
+	}
+	s.pending = false
+	if s.filesystem.notifier != nil {
+		s.filesystem.notifier.EndWrite()
+	}
+	return fuse.OK
 }
 
 func (s *stagedFile) Release() {
@@ -425,6 +498,10 @@ func (f *FileSystem) markFailure(transaction *writeTransaction, code fuse.Status
 func (f *FileSystem) checkpointTransaction(transaction *writeTransaction) error {
 	f.writesMu.Lock()
 	defer f.writesMu.Unlock()
+	return f.checkpointTransactionLocked(transaction)
+}
+
+func (f *FileSystem) checkpointTransactionLocked(transaction *writeTransaction) error {
 	if !transaction.dirty || transaction.unlinked {
 		return nil
 	}
@@ -494,6 +571,7 @@ func (f *FileSystem) checkpointTransaction(transaction *writeTransaction) error 
 		return fmt.Errorf("record fsync checkpoint: %w", err)
 	}
 	transaction.recordPath = recordPath
+	transaction.checkpointed = true
 	return nil
 }
 

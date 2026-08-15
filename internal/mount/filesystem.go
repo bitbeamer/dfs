@@ -76,8 +76,12 @@ func clean(name string) string {
 
 func hidden(name string) bool {
 	name = clean(name)
-	first := strings.Split(name, "/")[0]
-	return first == ".git"
+	for _, component := range strings.Split(name, "/") {
+		if component == ".git" {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *FileSystem) full(name string) string {

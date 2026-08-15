@@ -276,6 +276,34 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 }
 
+func TestEnsureRepositoryTransportPreservesPinnedHostKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Transport Test\nemail = transport@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	repo, err := repository.Init(ctx, filepath.Join(home, "repository"), "desktop", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	stateDirectory := filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory))
+	knownHosts := filepath.Join(stateDirectory, "known_hosts")
+	if err := os.WriteFile(knownHosts, []byte("peer.local ssh-ed25519 test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureRepositoryTransport(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	command := gitOutput(t, repo.Config.Repository, "config", "--get", "core.sshCommand")
+	for _, expected := range []string{knownHosts, "StrictHostKeyChecking=yes", transportKeyFile} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("SSH command %q does not contain %q", command, expected)
+		}
+	}
+}
+
 func TestServeSSHDelegatesToRepositoryRestrictedAnnexShell(t *testing.T) {
 	directory := t.TempDir()
 	capture := filepath.Join(directory, "capture")

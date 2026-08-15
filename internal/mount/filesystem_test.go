@@ -51,11 +51,20 @@ func testFileSystem(t *testing.T, root string) *FileSystem {
 }
 
 func TestOnlyGitMetadataIsHidden(t *testing.T) {
-	if !hidden(".git/dfs/state.db") {
-		t.Fatal("Git metadata is visible")
+	tests := []struct {
+		path   string
+		hidden bool
+	}{
+		{".git/dfs/state.db", true},
+		{"project/.git/config", true},
+		{"project/.git/hooks/pre-commit", true},
+		{"project/.gitignore", false},
+		{".dfs/user-data", false},
 	}
-	if hidden(".dfs/user-data") {
-		t.Fatal("user-owned .dfs path is hidden")
+	for _, test := range tests {
+		if got := hidden(test.path); got != test.hidden {
+			t.Errorf("hidden(%q) = %v, want %v", test.path, got, test.hidden)
+		}
 	}
 }
 
