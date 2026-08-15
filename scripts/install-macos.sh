@@ -160,7 +160,18 @@ EOF
 
 plutil -lint "$plist_path"
 launchctl bootout "$domain/$label" 2>/dev/null || true
-launchctl bootstrap "$domain" "$plist_path"
+bootstrapped=false
+for _ in $(seq 1 30); do
+  if launchctl bootstrap "$domain" "$plist_path"; then
+    bootstrapped=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$bootstrapped" != true ]]; then
+  printf 'Could not bootstrap %s after waiting for launchd teardown.\n' "$label" >&2
+  exit 1
+fi
 launchctl kickstart "$domain/$label"
 
 for _ in $(seq 1 120); do
