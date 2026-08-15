@@ -22,7 +22,6 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/grandcat/zeroconf"
 )
 
 const runtimeStateFile = "network.json"
@@ -44,7 +43,7 @@ type Service struct {
 	identity     transportIdentity
 	listener     net.Listener
 	httpServer   *http.Server
-	mdnsServers  []*zeroconf.Server
+	mdnsServers  []mdnsAdvertiser
 	statePath    string
 	mu           sync.Mutex
 	attempts     map[string]attemptWindow
@@ -122,29 +121,17 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 			_ = listener.Close()
 			return nil, errors.New("advertise DFS network: no multicast-capable interface")
 		}
-		for _, networkInterface := range interfaces {
-			if networkInterface == nil {
-				continue
-			}
-			ips := interfaceIPStrings(networkInterface)
-			if len(ips) == 0 {
-				continue
-			}
-			server, serverErr := zeroconf.RegisterProxy(
-				serviceInstance(repo.Config.NetworkName, repo.Config.Name, repo.Config.PeerID), ServiceType, "local", port,
-				localMDNSHostname(), ips, []string{
-					"v=" + strconv.Itoa(ProtocolVersion), "fs=" + filesystemID,
-					"network=" + encodeTXT(repo.Config.NetworkName), "peer=" + repo.Config.PeerID,
-					"name=" + encodeTXT(repo.Config.Name), "cert=" + fingerprint, "pair=invite",
-				}, []net.Interface{*networkInterface},
-			)
-			if serverErr == nil {
-				service.mdnsServers = append(service.mdnsServers, server)
-			}
+		txt := []string{
+			"v=" + strconv.Itoa(ProtocolVersion), "fs=" + filesystemID,
+			"network=" + encodeTXT(repo.Config.NetworkName), "peer=" + repo.Config.PeerID,
+			"name=" + encodeTXT(repo.Config.Name), "cert=" + fingerprint, "pair=invite",
 		}
-		if len(service.mdnsServers) == 0 {
+		service.mdnsServers, err = startMDNSAdvertisers(
+			serviceInstance(repo.Config.NetworkName, repo.Config.Name, repo.Config.PeerID), port, txt, interfaces,
+		)
+		if err != nil {
 			_ = listener.Close()
-			return nil, errors.New("advertise DFS network: no multicast listener could be started")
+			return nil, fmt.Errorf("advertise DFS network: %w", err)
 		}
 	}
 	endpoint := runtimeEndpoint(port)
