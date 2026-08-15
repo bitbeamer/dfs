@@ -13,7 +13,7 @@ make build
 ./bin/dfs doctor
 ```
 
-The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353 and TCP 7843 from the trusted LAN.
+The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353, TCP 7843, and the SSH server port (normally TCP 22) from the trusted LAN.
 
 ## 2. Create a new filesystem (first peer only)
 
@@ -64,6 +64,11 @@ Verify the peer:
 ```sh
 dfs --repo ~/.local/share/dfs/repository health
 dfs --repo ~/.local/share/dfs/repository peer list
+dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
+
+Run the mesh check while all peers you expect to validate are mounted and
+advertising. It exits unsuccessfully if any discovered peer lacks a direct
+remote or any directed Git/SSH connection fails.
 
 See [README.md](README.md) for platform-specific dependencies, manual mounting, troubleshooting, and advanced configuration.

@@ -12,6 +12,7 @@ Every peer sees the complete file and directory tree. File content is downloaded
 - A complete Git-backed namespace on every peer.
 - Direct Git/git-annex peers over SSH or a local path.
 - Local-network discovery with authenticated, one-use peer pairing.
+- Authenticated full-mesh configuration and connectivity diagnostics.
 - Optional bare Git metadata relay.
 - On-demand hydration when an annexed file is opened.
 - Writes committed only after all writable mount handles have closed.
@@ -143,7 +144,7 @@ dfs network join 'dfs1_...' \
 dfs --repo ~/.local/share/dfs/repository mount ~/DFS
 ```
 
-The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; the forced command delegates to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository, so it does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
+The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; the forced command delegates Git and git-annex operations to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository. It also accepts one fixed, read-only DFS diagnostic command used by the mesh check. It does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
 
 Useful invitation and naming commands are:
 
@@ -162,7 +163,7 @@ Pairing records the completion token privately after the clone. If the final rec
 
 mDNS normally stays within one LAN and may be blocked by guest Wi-Fi isolation or VLAN boundaries. A currently mounted inviter embeds its `.local` pairing endpoint in the invitation as a fallback. `pair invite --clone-url <url>` can override the authenticated clone URL for routed or advanced setups; the manual join flow remains available.
 
-A default-drop host firewall must allow UDP 5353 for mDNS and TCP 7843 for the pairing endpoint from the trusted LAN on both devices. The pairing port can be changed with `dfs mount --pair-port <port>`; managed-service definitions must use the same fixed port allowed by the firewall. DFS logs a warning and continues mounting when discovery or the pairing listener cannot start.
+A default-drop host firewall must allow UDP 5353 for mDNS, TCP 7843 for the pairing endpoint, and the SSH server port (normally TCP 22) from the trusted LAN on every device that receives direct peer connections. The pairing port can be changed with `dfs mount --pair-port <port>`; managed-service definitions must use the same fixed port allowed by the firewall. DFS logs a warning and continues mounting when discovery or the pairing listener cannot start.
 
 Use `dfs mount --discovery=false` when a peer must not advertise the filesystem or run a pairing endpoint. Manual configured remotes continue to work.
 
@@ -320,12 +321,41 @@ dfs --repo ~/.local/share/dfs/repository doctor --mesh
 
 Restore creates a new commit and does not rewrite shared history.
 
+Plain `doctor` checks the required Git, git-annex, SSH, rsync, and platform
+FUSE commands or devices. `doctor --mesh` runs those local checks first, then
+adds the repository-aware mesh validation below.
+
 `doctor --mesh` discovers mounted peers in the same DFS filesystem and asks
 each paired peer to verify every configured peer transport in both directions.
-It reports `NOT_CONFIGURED`, `FAILED`, or `UNREPORTED` for an incomplete mesh
-and exits unsuccessfully if any directed connection is not healthy. Peers that
-are offline, outside the local multicast domain, or running with discovery
-disabled are not part of the discovered mesh.
+It evaluates the complete directed graph among peers discovered by the
+initiating peer: `desktop → laptop` and `laptop → desktop` are separate checks.
+Each probe is read-only and validates the configured Git/SSH transport without
+fetching or changing repository refs.
+
+```text
+FROM                    TO                      STATUS          DETAIL
+desktop (a1b2c3d4e5f6)  laptop (112233445566)   OK
+laptop (112233445566)   desktop (a1b2c3d4e5f6)  NOT_CONFIGURED  paired remote is missing
+```
+
+`OK` means the directed transport works. `NOT_CONFIGURED` means the source
+peer has no direct remote for the discovered destination. `FAILED` means that
+remote exists but its Git/SSH probe failed. `UNREPORTED` means the initiating
+peer could not obtain a diagnostic report, for example because SSH failed or
+the remote DFS version is too old. `ONLY_LOCAL_PEER` means no other peer was
+discovered, so there were no directed edges to test.
+
+The command exits unsuccessfully if any edge in the discovered mesh is not
+`OK`. Peers that are offline, outside the initiating peer's multicast domain,
+or running with discovery disabled are not included, so success is not a claim
+about peers that were absent from discovery. Adjust the bounded discovery and
+connection probes when necessary:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository doctor --mesh \
+  --discovery-timeout 5s --peer-timeout 10s
+```
+
 All discovered peers must run a DFS version that supports the diagnostic SSH
 command; older peers are reported as `UNREPORTED` until they are upgraded.
 
@@ -346,7 +376,7 @@ DFS transaction and quota scheduler
         ├── git-annex: hashes, locations, safe copies
         ├── SQLite: pins and last-access times
         ├── mDNS + pinned TLS: discovery and pairing
-        ├── restricted SSH/rsync: direct peer content
+        ├── restricted SSH: Git metadata, git-annex content, mesh diagnostics
         └── S3: optional durable content
 ```
 
