@@ -214,7 +214,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			report.Remotes = append(report.Remotes, check)
 			if !check.Reachable {
 				report.Issues = append(report.Issues, HealthIssue{Code: "PEER_UNREACHABLE", Severity: "warning",
-					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs doctor --cluster"})
+					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs health --cluster"})
 			} else if check.Transport == "ssh-fallback" {
 				report.Issues = append(report.Issues, HealthIssue{Code: "SSH_FALLBACK", Severity: "warning",
 					Detail: check.Name + " is reachable only through SSH fallback", Action: "check UDP reachability for the peer's managed DFS port"})

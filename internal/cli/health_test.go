@@ -79,3 +79,35 @@ func TestClusterFlagReplacesMeshFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestHealthIncludesMissingDependencyDiagnostics(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	report, err := checkEnvironment("plan9")
+	if err == nil || report.Healthy {
+		t.Fatalf("checkEnvironment() = %+v, %v; want degraded error", report, err)
+	}
+	if len(report.Checks) != 6 {
+		t.Fatalf("dependency checks = %d, want 6", len(report.Checks))
+	}
+	var output bytes.Buffer
+	printEnvironmentHealth(&output, report)
+	if !strings.Contains(output.String(), "Environment: DEGRADED") || !strings.Contains(output.String(), "git") || !strings.Contains(output.String(), "MISSING") {
+		t.Fatalf("environment health output:\n%s", output.String())
+	}
+}
+
+func TestDoctorIsDeprecatedHealthAlias(t *testing.T) {
+	root := New()
+	doctor, _, err := root.Find([]string{"doctor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doctor.Deprecated == "" {
+		t.Fatal("doctor command is not marked deprecated")
+	}
+	for _, flag := range []string{"json", "cluster", "discovery-timeout", "peer-timeout"} {
+		if doctor.Flags().Lookup(flag) == nil {
+			t.Errorf("deprecated doctor alias has no --%s flag", flag)
+		}
+	}
+}

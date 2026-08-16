@@ -46,8 +46,8 @@ content to be present locally.
   authorizations automatically, including after an offline peer returns.
 - Transfer Git metadata, git-annex content, membership, and diagnostics over
   mutually authenticated QUIC, with repository-restricted SSH as a fallback.
-- Diagnose every directed peer-to-peer path, including ordinary passwordless
-  SSH, with `doctor --cluster`.
+- Diagnose dependencies and every directed peer-to-peer path, including ordinary
+  passwordless SSH, with `health` and `health --cluster`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
   membership, and peer health with `dfs health`; add `--cluster` for an active
   whole-cluster check and namespace-convergence comparison. Health output lists
@@ -97,7 +97,7 @@ Build and check the local dependencies:
 
 ```sh
 make build
-./bin/dfs doctor
+./bin/dfs health
 ```
 
 The binary uses the native Go FUSE protocol implementation and does not link
@@ -285,19 +285,18 @@ records namespace versions, but does not by itself retain old annex objects.
 Copy versions to durable storage before allowing their final content copy to be
 dropped.
 
-## Check health and mesh connectivity
+## Check health and cluster connectivity
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository health
 dfs --repo ~/.local/share/dfs/repository health --json
 dfs --repo ~/.local/share/dfs/repository health --cluster
 dfs --repo ~/.local/share/dfs/repository health --cluster --json
-dfs --repo ~/.local/share/dfs/repository doctor
-dfs --repo ~/.local/share/dfs/repository doctor --cluster
 ```
 
-`health` validates the private `.git/dfs/health.json` heartbeat, owner process,
-and mountpoint, then displays the daemon's timestamped operational observation.
+`health` checks all required commands and the platform FUSE dependency, validates
+the private `.git/dfs/health.json` heartbeat, owner process, and mountpoint, then
+displays the daemon's timestamped operational observation.
 That observation includes network identity and role, instance port, logical file
 count and size, repository/metadata/private-state sizes, cache and disk use,
 local content holdings, pins, reconciliation state, outgoing reachability, and
@@ -306,11 +305,11 @@ hydrating missing content. `health --cluster` actively queries every configured 
 discovered member in parallel, reports the same metrics for each responding
 peer, checks every directed connection, and compares online namespace tree IDs.
 The human-readable view is a compact peer and connection summary with shortened,
-deduplicated errors; `--json` retains complete diagnostic details. The command
-exits unsuccessfully when the cluster is incomplete or inconsistent.
+deduplicated errors; `--json` retains environment, service, and optional cluster
+objects with complete diagnostic details. The command exits unsuccessfully when
+dependencies are missing or the cluster is incomplete or inconsistent.
 
-`doctor` remains the dependency and low-level transport diagnostic.
-`doctor --cluster` asks every known mounted peer to test every configured peer in both directions:
+`health --cluster` asks every known mounted peer to test every configured peer in both directions:
 `desktop -> laptop` and `laptop -> desktop` are separate rows. Each read-only
 probe tests mutually authenticated QUIC, the repository-restricted SSH
 fallback, and ordinary passwordless non-interactive SSH.
@@ -333,9 +332,12 @@ command fail. `SSH_FALLBACK` is a healthy but degraded result. Adjust bounded
 probes when needed:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository doctor --cluster \
+dfs --repo ~/.local/share/dfs/repository health --cluster \
   --discovery-timeout 5s --peer-timeout 10s
 ```
+
+`dfs doctor` is retained temporarily as a deprecated compatibility alias for
+`dfs health` and accepts the same flags.
 
 ## Services, logs, and recovery
 

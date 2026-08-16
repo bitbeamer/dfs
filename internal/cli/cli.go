@@ -636,55 +636,73 @@ func (a *App) unmountCommand() *cobra.Command {
 }
 
 func (a *App) healthCommand() *cobra.Command {
+	return a.newHealthCommand("health", false)
+}
+
+type dependencyCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Path   string `json:"path,omitempty"`
+}
+
+type environmentHealth struct {
+	Healthy bool              `json:"healthy"`
+	Checks  []dependencyCheck `json:"checks"`
+}
+
+func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 	var asJSON, cluster bool
 	var discoveryTimeout, peerTimeout time.Duration
 	cmd := &cobra.Command{
-		Use: "health", Args: cobra.NoArgs, Short: "Report filesystem, storage, and peer health",
+		Use: name, Args: cobra.NoArgs, Short: "Report environment, filesystem, storage, and peer health",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			environment, environmentErr := checkEnvironment(runtime.GOOS)
 			repositoryPath, err := config.ResolveRepository(a.repo)
 			if err != nil {
-				return err
+				return errors.Join(environmentErr, err)
 			}
 			report, healthErr := dfsmount.CheckHealth(repositoryPath)
+			var clusterReport *peer.MeshReport
+			var clusterErr error
 			if cluster && healthErr == nil {
 				repo, openErr := a.open()
 				if openErr != nil {
-					return openErr
-				}
-				defer repo.Close()
-				meshReport, meshErr := peer.CheckMesh(cmd.Context(), repo, discoveryTimeout, peerTimeout)
-				if asJSON {
-					encoder := json.NewEncoder(a.Out)
-					encoder.SetIndent("", "  ")
-					if err := encoder.Encode(struct {
-						Service dfsmount.HealthReport `json:"service"`
-						Cluster peer.MeshReport       `json:"cluster"`
-					}{Service: report, Cluster: meshReport}); err != nil {
-						return err
-					}
+					clusterErr = openErr
 				} else {
-					printServiceSummary(a.Out, report)
-					printMeshHealth(a.Out, meshReport)
+					defer repo.Close()
+					meshReport, meshErr := peer.CheckMesh(cmd.Context(), repo, discoveryTimeout, peerTimeout)
+					clusterReport = &meshReport
+					clusterErr = meshErr
+					if meshErr == nil && !meshReport.Complete {
+						clusterErr = errors.New("DFS cluster health is degraded")
+					}
 				}
-				if meshErr != nil {
-					return meshErr
-				}
-				if !meshReport.Complete {
-					return errors.New("DFS cluster health is degraded")
-				}
-				return nil
 			}
 			if asJSON {
 				encoder := json.NewEncoder(a.Out)
 				encoder.SetIndent("", "  ")
-				if err := encoder.Encode(report); err != nil {
+				if err := encoder.Encode(struct {
+					Environment environmentHealth     `json:"environment"`
+					Service     dfsmount.HealthReport `json:"service"`
+					Cluster     *peer.MeshReport      `json:"cluster,omitempty"`
+				}{Environment: environment, Service: report, Cluster: clusterReport}); err != nil {
 					return err
 				}
-			} else if report.Version != 0 {
-				printServiceHealth(a.Out, report)
+			} else {
+				fmt.Fprintln(a.Out, "DFS HEALTH")
+				printEnvironmentHealth(a.Out, environment)
+				if report.Version != 0 {
+					printServiceDetails(a.Out, report)
+				}
+				if clusterReport != nil {
+					printMeshHealth(a.Out, *clusterReport)
+				}
 			}
-			return healthErr
+			return errors.Join(environmentErr, healthErr, clusterErr)
 		},
+	}
+	if deprecated {
+		cmd.Deprecated = "use dfs health instead"
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the complete health report as JSON")
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "actively check the entire cluster and every directed peer connection")
@@ -695,6 +713,10 @@ func (a *App) healthCommand() *cobra.Command {
 
 func printServiceHealth(output io.Writer, report dfsmount.HealthReport) {
 	fmt.Fprintln(output, "DFS HEALTH")
+	printServiceDetails(output, report)
+}
+
+func printServiceDetails(output io.Writer, report dfsmount.HealthReport) {
 	printServiceSummary(output, report)
 	if report.Operational != nil {
 		printNodeHealth(output, *report.Operational)
@@ -703,6 +725,20 @@ func printServiceHealth(output io.Writer, report dfsmount.HealthReport) {
 	} else {
 		fmt.Fprintln(output, "Operational check: PENDING (periodic observation has not completed)")
 	}
+}
+
+func printEnvironmentHealth(output io.Writer, report environmentHealth) {
+	status := "HEALTHY"
+	if !report.Healthy {
+		status = "DEGRADED"
+	}
+	fmt.Fprintf(output, "Environment: %s\n", status)
+	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "DEPENDENCY\tSTATUS\tPATH")
+	for _, check := range report.Checks {
+		fmt.Fprintf(table, "%s\t%s\t%s\n", check.Name, check.Status, check.Path)
+	}
+	_ = table.Flush()
 }
 
 func printServiceSummary(output io.Writer, report dfsmount.HealthReport) {
@@ -1199,82 +1235,57 @@ func (a *App) conflictsCommand() *cobra.Command {
 }
 
 func (a *App) doctorCommand() *cobra.Command {
-	var cluster bool
-	var discoveryTimeout, peerTimeout time.Duration
-	cmd := &cobra.Command{
-		Use: "doctor", Args: cobra.NoArgs, Short: "Check build and runtime dependencies",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := prepareDoctorPath(runtime.GOOS); err != nil {
-				return fmt.Errorf("prepare dependency search path: %w", err)
-			}
-			commands := []string{"git", "git-annex", "git-annex-shell", "ssh", "ssh-keygen", "rsync"}
-			if runtime.GOOS == "linux" {
-				commands = append(commands, "fusermount3")
-			}
-			failed := false
-			for _, name := range commands {
-				path, err := exec.LookPath(name)
-				if err != nil {
-					failed = true
-					fmt.Fprintf(a.Out, "MISSING\t%s\n", name)
-				} else {
-					fmt.Fprintf(a.Out, "OK\t%s\t%s\n", name, path)
-				}
-			}
-			if runtime.GOOS == "linux" {
-				if _, err := os.Stat("/dev/fuse"); err != nil {
-					failed = true
-					fmt.Fprintln(a.Out, "MISSING\t/dev/fuse")
-				} else {
-					fmt.Fprintln(a.Out, "OK\t/dev/fuse")
-				}
-			}
-			if runtime.GOOS == "darwin" {
-				paths := []string{
-					"/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
-					"/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
-				}
-				found := ""
-				for _, path := range paths {
-					if _, err := os.Stat(path); err == nil {
-						found = path
-						break
-					}
-				}
-				if found == "" {
-					failed = true
-					fmt.Fprintln(a.Out, "MISSING\tmacFUSE")
-				} else {
-					fmt.Fprintf(a.Out, "OK\tmacFUSE\t%s\n", found)
-				}
-			}
-			if failed {
-				return fmt.Errorf("one or more required commands are missing")
-			}
-			if cluster {
-				repo, err := a.open()
-				if err != nil {
-					return err
-				}
-				defer repo.Close()
-				ctx, cancel := commandContext(cmd)
-				defer cancel()
-				report, err := peer.CheckMesh(ctx, repo, discoveryTimeout, peerTimeout)
-				if err != nil {
-					return fmt.Errorf("check peer cluster: %w", err)
-				}
-				printMeshReport(a.Out, report)
-				if !report.Complete {
-					return fmt.Errorf("peer cluster is incomplete or unreachable")
-				}
-			}
-			return nil
-		},
+	return a.newHealthCommand("doctor", true)
+}
+
+func checkEnvironment(goos string) (environmentHealth, error) {
+	report := environmentHealth{Healthy: true}
+	if err := prepareDoctorPath(goos); err != nil {
+		return report, fmt.Errorf("prepare dependency search path: %w", err)
 	}
-	cmd.Flags().BoolVar(&cluster, "cluster", false, "check every directed connection between configured cluster peers")
-	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the cluster check")
-	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer connection probe")
-	return cmd
+	commands := []string{"git", "git-annex", "git-annex-shell", "ssh", "ssh-keygen", "rsync"}
+	if goos == "linux" {
+		commands = append(commands, "fusermount3")
+	}
+	for _, name := range commands {
+		path, err := exec.LookPath(name)
+		check := dependencyCheck{Name: name, Status: "OK", Path: path}
+		if err != nil {
+			report.Healthy = false
+			check.Status = "MISSING"
+		}
+		report.Checks = append(report.Checks, check)
+	}
+	if goos == "linux" {
+		check := dependencyCheck{Name: "/dev/fuse", Status: "OK", Path: "/dev/fuse"}
+		if _, err := os.Stat("/dev/fuse"); err != nil {
+			report.Healthy = false
+			check.Status = "MISSING"
+			check.Path = ""
+		}
+		report.Checks = append(report.Checks, check)
+	}
+	if goos == "darwin" {
+		check := dependencyCheck{Name: "macFUSE", Status: "MISSING"}
+		for _, path := range []string{
+			"/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
+			"/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
+		} {
+			if _, err := os.Stat(path); err == nil {
+				check.Status = "OK"
+				check.Path = path
+				break
+			}
+		}
+		if check.Status != "OK" {
+			report.Healthy = false
+		}
+		report.Checks = append(report.Checks, check)
+	}
+	if !report.Healthy {
+		return report, errors.New("one or more required dependencies are missing")
+	}
+	return report, nil
 }
 
 func prepareDoctorPath(goos string) error {
