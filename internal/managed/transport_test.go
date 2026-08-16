@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,7 +128,12 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	originalPath := os.Getenv("PATH")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+originalPath)
 	offlineRecord := serverRecord
-	offlineRecord.Payload.QUICEndpoint = "quic://127.0.0.1:1"
+	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blackhole.Close()
+	offlineRecord.Payload.QUICEndpoint = "quic://" + blackhole.LocalAddr().String()
 	offlineRecord.Payload.Generation++
 	offlineRecord.Payload.UpdatedAt = time.Now().UTC()
 	offlineRecord, err = membership.Sign(offlineRecord.Payload, serverKey)

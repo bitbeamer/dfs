@@ -333,7 +333,9 @@ func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*qui
 		}
 		return nil
 	}
-	connection, err := quic.DialAddr(ctx, endpoint.Host, tlsConfig, &quic.Config{MaxIdleTimeout: 2 * time.Minute, KeepAlivePeriod: 20 * time.Second})
+	connection, err := quic.DialAddr(ctx, endpoint.Host, tlsConfig, &quic.Config{
+		HandshakeIdleTimeout: 3 * time.Second, MaxIdleTimeout: 2 * time.Minute, KeepAlivePeriod: 20 * time.Second,
+	})
 	return connection, target, err
 }
 
