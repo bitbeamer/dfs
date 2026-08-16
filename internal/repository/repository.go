@@ -366,6 +366,25 @@ func (r *Repository) TreeID(ctx context.Context) (string, error) {
 	return strings.TrimSpace(value), nil
 }
 
+// ChangedPaths returns every path whose directory entry differs between two
+// trees. Rename detection is disabled so both the removed and added names are
+// invalidated in FUSE clients.
+func (r *Repository) ChangedPaths(ctx context.Context, before, after string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, err := r.runner.Run(ctx, "git", "diff", "--name-only", "--no-renames", "-z", before, after)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, path := range strings.Split(value, "\x00") {
+		if path != "" {
+			paths = append(paths, filepath.ToSlash(path))
+		}
+	}
+	return paths, nil
+}
+
 func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -53,6 +54,14 @@ func (i nodeContentInvalidator) InvalidateContent(path string) {
 	// offset. Tail receives a content event without a replacement event.
 	time.AfterFunc(10*time.Millisecond, func() {
 		i.paths.FileNotify(path, 0, 0)
+	})
+}
+
+func (i nodeContentInvalidator) InvalidateEntry(path string) {
+	directory, name := filepath.Split(filepath.ToSlash(path))
+	directory = strings.TrimSuffix(directory, "/")
+	time.AfterFunc(10*time.Millisecond, func() {
+		i.paths.EntryNotify(directory, name)
 	})
 }
 
@@ -112,15 +121,15 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Info("stale mountpoint detached", "mountpoint", mountpoint)
 	}
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
-	scheduler.Start()
-	defer scheduler.Stop()
 
 	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))
 	// The annex working tree may replace a regular file with a symlink after a
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
-	filesystem.cacheInvalidator = nodeContentInvalidator{paths: pathNodes}
+	invalidator := nodeContentInvalidator{paths: pathNodes}
+	filesystem.cacheInvalidator = invalidator
+	scheduler.SetEntryInvalidator(invalidator)
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,
@@ -137,6 +146,8 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
 	}
+	scheduler.Start()
+	defer scheduler.Stop()
 	if !options.DisablePeerDiscovery {
 		peerService, peerErr := peer.Start(repo, logger, options.PairingPort)
 		if peerErr != nil {

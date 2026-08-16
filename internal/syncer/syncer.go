@@ -20,6 +20,11 @@ type Scheduler struct {
 	done     chan struct{}
 	once     sync.Once
 	writers  atomic.Int64
+	entries  EntryInvalidator
+}
+
+type EntryInvalidator interface {
+	InvalidateEntry(path string)
 }
 
 func New(repo *repository.Repository, interval time.Duration, logger *slog.Logger) *Scheduler {
@@ -40,6 +45,10 @@ func (s *Scheduler) Start() {
 	s.logger.Info("sync scheduler started", "interval", s.interval)
 	go s.loop()
 	s.Notify("startup")
+}
+
+func (s *Scheduler) SetEntryInvalidator(invalidator EntryInvalidator) {
+	s.entries = invalidator
 }
 
 func (s *Scheduler) Stop() {
@@ -116,9 +125,14 @@ func (s *Scheduler) sync(reason string) {
 	s.logger.Info("automatic sync started", "reason", reason)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	passes, err := syncUntilConverged(ctx, 4, 2, s.repo.TreeID, func(ctx context.Context) error {
+	passes, changedPaths, err := syncUntilConverged(ctx, 4, 2, s.repo.TreeID, s.repo.ChangedPaths, func(ctx context.Context) error {
 		return s.repo.Sync(ctx, true)
 	})
+	if s.entries != nil {
+		for _, path := range changedPaths {
+			s.entries.InvalidateEntry(path)
+		}
+	}
 	if err != nil {
 		s.logger.Error("automatic sync failed", "reason", reason, "duration", time.Since(started), "error", err)
 		return
@@ -153,37 +167,50 @@ func syncUntilConverged(
 	ctx context.Context,
 	maxPasses, stablePasses int,
 	treeID func(context.Context) (string, error),
+	changedPaths func(context.Context, string, string) ([]string, error),
 	syncPass func(context.Context) error,
-) (int, error) {
+) (int, []string, error) {
 	if maxPasses < 1 || stablePasses < 1 {
-		return 0, fmt.Errorf("invalid convergence limits: max=%d stable=%d", maxPasses, stablePasses)
+		return 0, nil, fmt.Errorf("invalid convergence limits: max=%d stable=%d", maxPasses, stablePasses)
 	}
 	previous, err := treeID(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("read tree before synchronization: %w", err)
+		return 0, nil, fmt.Errorf("read tree before synchronization: %w", err)
 	}
+	changedSet := make(map[string]bool)
+	var changedList []string
 	changed := false
 	stable := 0
 	for pass := 1; pass <= maxPasses; pass++ {
 		if err := syncPass(ctx); err != nil {
-			return pass, err
+			return pass, changedList, err
 		}
 		current, err := treeID(ctx)
 		if err != nil {
-			return pass, fmt.Errorf("read tree after synchronization: %w", err)
+			return pass, changedList, fmt.Errorf("read tree after synchronization: %w", err)
 		}
 		if current == previous {
 			stable++
 			// Do not make every unchanged periodic sync run twice. Once a pass
 			// has changed the tree, require two confirming stable passes.
 			if !changed || stable >= stablePasses {
-				return pass, nil
+				return pass, changedList, nil
 			}
 		} else {
+			paths, err := changedPaths(ctx, previous, current)
+			if err != nil {
+				return pass, changedList, fmt.Errorf("list synchronized paths: %w", err)
+			}
+			for _, path := range paths {
+				if !changedSet[path] {
+					changedSet[path] = true
+					changedList = append(changedList, path)
+				}
+			}
 			changed = true
 			stable = 0
 		}
 		previous = current
 	}
-	return maxPasses, fmt.Errorf("filesystem tree did not converge after %d synchronization passes", maxPasses)
+	return maxPasses, changedList, fmt.Errorf("filesystem tree did not converge after %d synchronization passes", maxPasses)
 }
