@@ -137,6 +137,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Info("stale mountpoint detached", "mountpoint", mountpoint)
 	}
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
+	scheduler.SetReconciler(func(ctx context.Context) error { return peer.ReconcileMembership(ctx, repo) })
 
 	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))
 	// The annex working tree may replace a regular file with a symlink after a

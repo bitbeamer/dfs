@@ -167,7 +167,7 @@ On an existing, mounted DFS peer:
 dfs --repo ~/.local/share/dfs/repository pair invite
 ```
 
-Send the resulting `dfs1_...` invitation to the new peer through a trusted channel. It is a temporary secret.
+Send the resulting `dfs2_...` invitation to the new peer through a trusted channel. It is a temporary secret.
 
 ## 4. Join and mount
 

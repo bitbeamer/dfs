@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
@@ -109,6 +110,11 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		request.ReverseUser = account.Username
 		request.ReversePath = destination
 	}
+	_, membershipDraft, err := newMembershipDraft(temporary, destination, invitation.FileSystemID, peerID, name, identity.PublicKey, request.SSHHostKeys)
+	if err != nil {
+		return nil, fmt.Errorf("create signed DFS membership: %w", err)
+	}
+	request.Membership = membershipDraft
 
 	endpoints := []string{}
 	discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout+time.Second)
@@ -159,6 +165,15 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if !start.ExpiresAt.After(time.Now()) {
 		return nil, errors.New("pairing session expired before repository initialization")
 	}
+	if start.Approver.Payload.PeerID != start.PeerID || start.Membership.Payload.PeerID != peerID {
+		return nil, errors.New("pairing peer returned mismatched membership identities")
+	}
+	if err := membership.VerifyApproval(start.Approver, start.Approver); err != nil {
+		return nil, fmt.Errorf("verify approving DFS membership: %w", err)
+	}
+	if err := membership.VerifyApproval(start.Membership, start.Approver); err != nil {
+		return nil, fmt.Errorf("verify approved DFS membership: %w", err)
+	}
 	knownHosts := filepath.Join(temporary, "known_hosts")
 	if err := installKnownHosts(knownHosts, start.CloneURL, start.SSHHostKeys); err != nil {
 		return nil, fmt.Errorf("configure paired SSH host verification: %w", err)
@@ -208,6 +223,9 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := os.Rename(identity.PrivateKey+".pub", installedPublic); err != nil {
 		return nil, fmt.Errorf("install paired SSH public key: %w", err)
 	}
+	if err := os.Rename(membership.KeyPath(temporary), membership.KeyPath(repo.Config.Repository)); err != nil {
+		return nil, fmt.Errorf("install DFS membership private key: %w", err)
+	}
 	installedKnownHosts := ""
 	if knownHosts != "" {
 		installedKnownHosts = filepath.Join(stateDirectory, "known_hosts")
@@ -220,6 +238,32 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	}
 	if _, err := repo.AdoptClonedPeer(ctx, start.PeerID); err != nil {
 		return nil, fmt.Errorf("name paired source remote: %w", err)
+	}
+	if err := membership.Save(repo.Config.Repository, start.Approver); err != nil {
+		return nil, fmt.Errorf("save approving DFS membership: %w", err)
+	}
+	if err := membership.Save(repo.Config.Repository, start.Membership); err != nil {
+		return nil, fmt.Errorf("save local DFS membership: %w", err)
+	}
+	if err := membership.Trust(repo.Config.Repository, start.PeerID, start.Approver.Payload.SigningPublicKey); err != nil {
+		return nil, fmt.Errorf("trust approving DFS member: %w", err)
+	}
+	if err := membership.Trust(repo.Config.Repository, peerID, start.Membership.Payload.SigningPublicKey); err != nil {
+		return nil, fmt.Errorf("trust local DFS membership: %w", err)
+	}
+	for _, endorsement := range start.Endorsements {
+		if err := membership.VerifyEndorsement(endorsement, start.Approver); err != nil {
+			return nil, fmt.Errorf("verify DFS membership endorsement: %w", err)
+		}
+		if err := membership.Trust(repo.Config.Repository, endorsement.PeerID, endorsement.SigningPublicKey); err != nil {
+			return nil, fmt.Errorf("trust endorsed DFS member: %w", err)
+		}
+	}
+	memberPaths := []string{".gitattributes",
+		filepath.ToSlash(filepath.Join(".dfs", "members", start.PeerID+".json")),
+		filepath.ToSlash(filepath.Join(".dfs", "members", peerID+".json"))}
+	if _, err := repo.CommitControlFiles(ctx, "Join DFS membership", memberPaths...); err != nil {
+		return nil, fmt.Errorf("commit DFS membership: %w", err)
 	}
 	resume := pairingResume{
 		Version: ProtocolVersion, Endpoint: endpoint, CertificateSHA256: invitation.CertificateSHA256,
@@ -237,6 +281,9 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	}
 	if err := removePairingResume(repo.Config.Repository); err != nil {
 		return nil, err
+	}
+	if err := ReconcileMembership(ctx, repo); err != nil {
+		return nil, fmt.Errorf("reconcile DFS membership: %w", err)
 	}
 	keepOpen = true
 	return &JoinResult{

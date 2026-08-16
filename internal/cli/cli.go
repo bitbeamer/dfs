@@ -414,6 +414,11 @@ func (a *App) peerCommand() *cobra.Command {
 				defer repo.Close()
 				ctx, cancel := commandContext(cmd)
 				defer cancel()
+				if strings.HasPrefix(args[0], "dfs-peer-") {
+					if err := peer.RevokeMembership(ctx, repo, args[0]); err != nil {
+						return err
+					}
+				}
 				if err := repo.RemovePeer(ctx, args[0]); err != nil {
 					return err
 				}

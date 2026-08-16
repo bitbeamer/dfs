@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
@@ -33,14 +34,15 @@ type invitationRecord struct {
 }
 
 type pendingPair struct {
-	SessionID        string    `json:"session_id"`
-	CompletionHash   string    `json:"completion_hash"`
-	PeerID           string    `json:"peer_id"`
-	PeerName         string    `json:"peer_name"`
-	ReverseURL       string    `json:"reverse_url,omitempty"`
-	CloneURL         string    `json:"clone_url"`
-	AuthorizedMarker string    `json:"authorized_marker,omitempty"`
-	ExpiresAt        time.Time `json:"expires_at"`
+	SessionID        string            `json:"session_id"`
+	CompletionHash   string            `json:"completion_hash"`
+	PeerID           string            `json:"peer_id"`
+	PeerName         string            `json:"peer_name"`
+	ReverseURL       string            `json:"reverse_url,omitempty"`
+	CloneURL         string            `json:"clone_url"`
+	AuthorizedMarker string            `json:"authorized_marker,omitempty"`
+	ExpiresAt        time.Time         `json:"expires_at"`
+	Membership       membership.Record `json:"membership"`
 }
 
 type InvitationInfo struct {

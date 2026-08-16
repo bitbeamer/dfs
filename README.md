@@ -135,7 +135,7 @@ In another terminal on that peer, create a one-use invitation. It expires after 
 dfs --repo ~/.local/share/dfs/repository pair invite
 ```
 
-The command prints an invitation beginning with `dfs1_`. Send it to the user of
+The command prints an invitation beginning with `dfs2_`. Send it to the user of
 the new device through a trusted channel. On the new device, use the recommended
 transactional setup:
 
@@ -154,6 +154,16 @@ invitation from the prompt keeps its bearer secret out of shell history.
 lower-level diagnostic and manual controls.
 
 The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; the forced command delegates Git and git-annex operations to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository. It also accepts one fixed, read-only DFS diagnostic command used by the mesh check. It does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
+
+Each admitted device also publishes a signed record under `.dfs/members` with
+its stable ID, hostname, role, generation, signing key, and transport endpoint.
+The approving member signs the admission and endorses its current roster, so a
+single approval establishes the new device's full mesh. Periodic sync verifies
+the signature chain and automatically reconciles missing remotes, pinned host
+keys, and repository-restricted authorizations on online peers; offline peers
+do the same after their next sync. `peer remove` publishes an administrator-
+signed revocation, and accepted revocations remain sticky in private local
+state even if a later Git change removes the shared revocation file.
 
 Useful invitation and naming commands are:
 

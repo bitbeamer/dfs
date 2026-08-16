@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/pion/mdns/v2"
 )
@@ -266,6 +267,32 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 		if err != nil || info.Mode().Perm() != 0o600 {
 			t.Fatalf("transport key mode = %v, %v", info, err)
 		}
+		records, err := membership.LoadAll(repo.Config.Repository)
+		if err != nil || len(records) != 2 {
+			t.Fatalf("paired membership records = %#v, %v", records, err)
+		}
+	}
+	secondInvitation, err := CreateInvitation(existing, 5*time.Minute, existing.Config.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInvitation.Endpoint = "https://" + listener.Addr().String()
+	secondEncoded, err := secondInvitation.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdDestination := filepath.Join(home, "tablet")
+	third, err := PairAndJoin(ctx, secondEncoded, thirdDestination, "tablet", 5<<20, 20*time.Millisecond, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Repository.Close()
+	thirdRemotes, err := third.Repository.Remotes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(thirdRemotes) != 2 {
+		t.Fatalf("third peer did not reconcile the existing mesh: %#v", thirdRemotes)
 	}
 	active, err := ListInvitations(existing.Config.Repository, time.Now())
 	if err != nil {

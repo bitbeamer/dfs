@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
@@ -36,20 +38,23 @@ type runtimeState struct {
 }
 
 type Service struct {
-	repo         *repository.Repository
-	logger       *slog.Logger
-	filesystemID string
-	fingerprint  string
-	identity     transportIdentity
-	listener     net.Listener
-	httpServer   *http.Server
-	mdnsServers  []mdnsAdvertiser
-	statePath    string
-	mu           sync.Mutex
-	attempts     map[string]attemptWindow
-	done         chan struct{}
-	cleanupStop  chan struct{}
-	cleanupDone  chan struct{}
+	repo             *repository.Repository
+	logger           *slog.Logger
+	filesystemID     string
+	fingerprint      string
+	identity         transportIdentity
+	membershipKey    ed25519.PrivateKey
+	membershipRecord membership.Record
+	endorsements     []membership.Endorsement
+	listener         net.Listener
+	httpServer       *http.Server
+	mdnsServers      []mdnsAdvertiser
+	statePath        string
+	mu               sync.Mutex
+	attempts         map[string]attemptWindow
+	done             chan struct{}
+	cleanupStop      chan struct{}
+	cleanupDone      chan struct{}
 }
 
 type attemptWindow struct {
@@ -92,6 +97,22 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	if err != nil {
 		return nil, err
 	}
+	membershipKey, membershipRecord, err := ensureLocalMembership(ctx, repo, filesystemID, identity)
+	if err != nil {
+		return nil, fmt.Errorf("prepare DFS membership: %w", err)
+	}
+	accepted, err := acceptedMembership(ctx, repo, filesystemID)
+	if err != nil {
+		return nil, fmt.Errorf("load accepted DFS membership: %w", err)
+	}
+	var endorsements []membership.Endorsement
+	for _, record := range accepted {
+		endorsement, endorseErr := membership.Endorse(record, repo.Config.PeerID, membershipKey)
+		if endorseErr != nil {
+			return nil, fmt.Errorf("endorse DFS membership: %w", endorseErr)
+		}
+		endorsements = append(endorsements, endorsement)
+	}
 	if listener == nil {
 		listener, err = net.Listen("tcp", ":0")
 		if err != nil {
@@ -100,7 +121,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	}
 	service := &Service{
 		repo: repo, logger: logger.With("component", "peer-network"), filesystemID: filesystemID,
-		fingerprint: fingerprint, identity: identity, listener: tls.NewListener(listener, &tls.Config{
+		fingerprint: fingerprint, identity: identity, membershipKey: membershipKey, membershipRecord: membershipRecord, endorsements: endorsements, listener: tls.NewListener(listener, &tls.Config{
 			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
 		}),
 		statePath: filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), runtimeStateFile),
@@ -193,6 +214,10 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		writeProtocolError(response, http.StatusBadRequest, "valid peer SSH public key is required")
 		return
 	}
+	if err := validatePairingMembership(input.Membership, s.filesystemID, input.PeerID, input.PeerName, input.SSHPublicKey, input.ReversePath); err != nil {
+		writeProtocolError(response, http.StatusBadRequest, "valid signed peer membership is required")
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	remote := remoteAddress(request)
@@ -209,6 +234,10 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		return
 	}
 	delete(s.attempts, remote)
+	if err := s.refreshEndorsements(request.Context()); err != nil {
+		writeProtocolError(response, http.StatusInternalServerError, "cannot load approved membership")
+		return
+	}
 	if record.Pending != nil && !record.Pending.ExpiresAt.After(time.Now()) {
 		if err := removeAuthorizedMarker(record.Pending.AuthorizedMarker); err != nil {
 			writeProtocolError(response, http.StatusInternalServerError, "cannot release expired pairing session")
@@ -253,6 +282,11 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		writeProtocolError(response, http.StatusInternalServerError, "cannot create pairing session")
 		return
 	}
+	approvedMembership, err := membership.Approve(input.Membership, s.repo.Config.PeerID, s.membershipKey)
+	if err != nil {
+		writeProtocolError(response, http.StatusInternalServerError, "cannot approve peer membership")
+		return
+	}
 	sessionID, err := randomString(12)
 	if err != nil {
 		writeProtocolError(response, http.StatusInternalServerError, "cannot create pairing session")
@@ -285,6 +319,7 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		PeerName: strings.TrimSpace(input.PeerName), ReverseURL: reverseURL, CloneURL: cloneURL,
 		AuthorizedMarker: authorizedMarker,
 		ExpiresAt:        minTime(record.ExpiresAt, time.Now().UTC().Add(pairingLease)),
+		Membership:       approvedMembership,
 	}
 	if err := saveInvitation(s.repo.Config.Repository, record); err != nil {
 		_ = removeAuthorizedMarker(authorizedMarker)
@@ -300,7 +335,25 @@ func (s *Service) startResponse(pending *pendingPair, completionSecret string) P
 		PeerName: s.repo.Config.Name, PeerID: s.repo.Config.PeerID, CloneURL: pending.CloneURL,
 		SSHPublicKey: s.identity.PublicKey, SSHHostKeys: localSSHHostKeys(), SessionID: pending.SessionID,
 		CompletionSecret: completionSecret, ExpiresAt: pending.ExpiresAt,
+		Membership: pending.Membership, Approver: s.membershipRecord, Endorsements: s.endorsements,
 	}
+}
+
+func (s *Service) refreshEndorsements(ctx context.Context) error {
+	accepted, err := acceptedMembership(ctx, s.repo, s.filesystemID)
+	if err != nil {
+		return err
+	}
+	endorsements := make([]membership.Endorsement, 0, len(accepted))
+	for _, record := range accepted {
+		endorsement, err := membership.Endorse(record, s.repo.Config.PeerID, s.membershipKey)
+		if err != nil {
+			return err
+		}
+		endorsements = append(endorsements, endorsement)
+	}
+	s.endorsements = endorsements
+	return nil
 }
 
 func (s *Service) handlePairComplete(response http.ResponseWriter, request *http.Request) {
@@ -329,6 +382,23 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 			break
 		}
 		remoteName := ""
+		if err := membership.VerifyApproval(pending.Membership, s.membershipRecord); err != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "approved membership is invalid")
+			return
+		}
+		if err := membership.Save(s.repo.Config.Repository, pending.Membership); err != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "cannot publish peer membership")
+			return
+		}
+		memberPath := filepath.ToSlash(filepath.Join(".dfs", "members", pending.PeerID+".json"))
+		if _, err := s.repo.CommitControlFiles(request.Context(), "Approve DFS peer membership", ".gitattributes", memberPath); err != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "cannot commit peer membership")
+			return
+		}
+		if err := membership.Trust(s.repo.Config.Repository, pending.Membership.Payload.PeerID, pending.Membership.Payload.SigningPublicKey); err != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "cannot trust approved peer membership")
+			return
+		}
 		if pending.ReverseURL != "" {
 			ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
 			remoteName, err = s.repo.AddPairedRemote(ctx, pending.PeerID, pending.ReverseURL)

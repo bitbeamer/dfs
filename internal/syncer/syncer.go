@@ -13,15 +13,16 @@ import (
 )
 
 type Scheduler struct {
-	repo     *repository.Repository
-	interval time.Duration
-	logger   *slog.Logger
-	events   chan string
-	stop     chan struct{}
-	done     chan struct{}
-	once     sync.Once
-	writers  atomic.Int64
-	entries  EntryInvalidator
+	repo      *repository.Repository
+	interval  time.Duration
+	logger    *slog.Logger
+	events    chan string
+	stop      chan struct{}
+	done      chan struct{}
+	once      sync.Once
+	writers   atomic.Int64
+	entries   EntryInvalidator
+	reconcile func(context.Context) error
 }
 
 type EntryInvalidator interface {
@@ -50,6 +51,10 @@ func (s *Scheduler) Start() {
 
 func (s *Scheduler) SetEntryInvalidator(invalidator EntryInvalidator) {
 	s.entries = invalidator
+}
+
+func (s *Scheduler) SetReconciler(reconcile func(context.Context) error) {
+	s.reconcile = reconcile
 }
 
 func (s *Scheduler) Stop() {
@@ -137,6 +142,12 @@ func (s *Scheduler) sync(reason string) {
 	if err != nil {
 		s.logger.Error("automatic sync failed", "reason", reason, "duration", time.Since(started), "error", err)
 		return
+	}
+	if s.reconcile != nil {
+		if err := s.reconcile(ctx); err != nil {
+			s.logger.Error("membership reconciliation failed", "error", err)
+			return
+		}
 	}
 	pins, err := s.repo.Store.Pins()
 	if err != nil {
