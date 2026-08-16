@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -15,6 +16,23 @@ func TestSyncUntilConvergedStopsImmediatelyWhenUnchanged(t *testing.T) {
 	)
 	if err != nil || got != 1 || passes != 1 || len(paths) != 0 {
 		t.Fatalf("syncUntilConverged = passes %d/%d, error %v", got, passes, err)
+	}
+}
+
+func TestSyncUntilConvergedReportsPathsChangedByFailedPass(t *testing.T) {
+	tree := "before"
+	_, paths, err := syncUntilConverged(context.Background(), 4, 2,
+		func(context.Context) (string, error) { return tree, nil },
+		func(_ context.Context, before, after string) ([]string, error) {
+			return []string{"old.txt", "new.txt"}, nil
+		},
+		func(context.Context) error {
+			tree = "after"
+			return errors.New("push rejected")
+		},
+	)
+	if err == nil || len(paths) != 2 || paths[0] != "old.txt" || paths[1] != "new.txt" {
+		t.Fatalf("failed synchronization returned paths %q, error %v", paths, err)
 	}
 }
 

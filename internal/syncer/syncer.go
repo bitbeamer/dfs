@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -182,12 +183,31 @@ func syncUntilConverged(
 	changed := false
 	stable := 0
 	for pass := 1; pass <= maxPasses; pass++ {
-		if err := syncPass(ctx); err != nil {
-			return pass, changedList, err
-		}
+		syncErr := syncPass(ctx)
 		current, err := treeID(ctx)
 		if err != nil {
+			if syncErr != nil {
+				return pass, changedList, errors.Join(syncErr, fmt.Errorf("read tree after failed synchronization: %w", err))
+			}
 			return pass, changedList, fmt.Errorf("read tree after synchronization: %w", err)
+		}
+		if current != previous {
+			paths, err := changedPaths(ctx, previous, current)
+			if err != nil {
+				if syncErr != nil {
+					return pass, changedList, errors.Join(syncErr, fmt.Errorf("list partially synchronized paths: %w", err))
+				}
+				return pass, changedList, fmt.Errorf("list synchronized paths: %w", err)
+			}
+			for _, path := range paths {
+				if !changedSet[path] {
+					changedSet[path] = true
+					changedList = append(changedList, path)
+				}
+			}
+		}
+		if syncErr != nil {
+			return pass, changedList, syncErr
 		}
 		if current == previous {
 			stable++
@@ -197,16 +217,6 @@ func syncUntilConverged(
 				return pass, changedList, nil
 			}
 		} else {
-			paths, err := changedPaths(ctx, previous, current)
-			if err != nil {
-				return pass, changedList, fmt.Errorf("list synchronized paths: %w", err)
-			}
-			for _, path := range paths {
-				if !changedSet[path] {
-					changedSet[path] = true
-					changedList = append(changedList, path)
-				}
-			}
 			changed = true
 			stable = 0
 		}
