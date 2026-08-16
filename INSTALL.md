@@ -252,20 +252,20 @@ Verify the peer:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository health
-dfs --repo ~/.local/share/dfs/repository health --mesh
+dfs --repo ~/.local/share/dfs/repository health --cluster
 dfs --repo ~/.local/share/dfs/repository peer list
-dfs --repo ~/.local/share/dfs/repository doctor --mesh
+dfs --repo ~/.local/share/dfs/repository doctor --cluster
 ```
 
 `health` reports the managed mount plus filesystem identity, logical size and
 file count, instance port, role, repository and metadata size, cache and disk
 use, content holdings, pins, reconciliation, and timestamped peer observations.
-`health --mesh` actively collects those details from all responding members,
+`health --cluster` actively collects those details from all responding members,
 compares namespace convergence, and verifies every directed peer edge. Use
 `--json` with either form for complete machine-readable diagnostics; the normal
 terminal view shortens transport errors and avoids repeating them per peer.
 
-`doctor --mesh` verifies managed QUIC, the repository-restricted SSH fallback,
+`doctor --cluster` verifies managed QUIC, the repository-restricted SSH fallback,
 and ordinary passwordless, non-interactive SSH for every directed peer pair. A
 working fallback with unavailable QUIC is shown as `SSH_FALLBACK`; a missing
 account key or `known_hosts` entry is reported on the exact `FROM` → `TO` row as
@@ -286,7 +286,7 @@ transfers the old identity to the renamed machine. Re-add it as a new peer:
 3. Move the renamed machine's old repository aside as a backup, create a new
    invitation on an existing member, and run `network join` into the original
    repository path. The join generates a new peer ID.
-4. Reinstall the managed mount and verify it with `doctor --mesh` and the
+4. Reinstall the managed mount and verify it with `doctor --cluster` and the
    mounted-volume acceptance test.
 
 The `.local` DNS suffix and hostname letter case are normalized, so `zeus`,

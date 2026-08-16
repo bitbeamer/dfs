@@ -636,7 +636,7 @@ func (a *App) unmountCommand() *cobra.Command {
 }
 
 func (a *App) healthCommand() *cobra.Command {
-	var asJSON, mesh bool
+	var asJSON, cluster bool
 	var discoveryTimeout, peerTimeout time.Duration
 	cmd := &cobra.Command{
 		Use: "health", Args: cobra.NoArgs, Short: "Report filesystem, storage, and peer health",
@@ -646,7 +646,7 @@ func (a *App) healthCommand() *cobra.Command {
 				return err
 			}
 			report, healthErr := dfsmount.CheckHealth(repositoryPath)
-			if mesh && healthErr == nil {
+			if cluster && healthErr == nil {
 				repo, openErr := a.open()
 				if openErr != nil {
 					return openErr
@@ -658,8 +658,8 @@ func (a *App) healthCommand() *cobra.Command {
 					encoder.SetIndent("", "  ")
 					if err := encoder.Encode(struct {
 						Service dfsmount.HealthReport `json:"service"`
-						Mesh    peer.MeshReport       `json:"mesh"`
-					}{Service: report, Mesh: meshReport}); err != nil {
+						Cluster peer.MeshReport       `json:"cluster"`
+					}{Service: report, Cluster: meshReport}); err != nil {
 						return err
 					}
 				} else {
@@ -670,7 +670,7 @@ func (a *App) healthCommand() *cobra.Command {
 					return meshErr
 				}
 				if !meshReport.Complete {
-					return errors.New("DFS mesh health is degraded")
+					return errors.New("DFS cluster health is degraded")
 				}
 				return nil
 			}
@@ -687,8 +687,8 @@ func (a *App) healthCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the complete health report as JSON")
-	cmd.Flags().BoolVar(&mesh, "mesh", false, "actively check the entire cluster and every directed peer connection")
-	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the mesh check")
+	cmd.Flags().BoolVar(&cluster, "cluster", false, "actively check the entire cluster and every directed peer connection")
+	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the cluster check")
 	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer health probe")
 	return cmd
 }
@@ -758,7 +758,7 @@ func printMeshHealth(output io.Writer, report peer.MeshReport) {
 	if !report.Complete {
 		clusterStatus = "DEGRADED"
 	}
-	fmt.Fprintln(output, "\nDFS MESH HEALTH")
+	fmt.Fprintln(output, "\nDFS CLUSTER HEALTH")
 	fmt.Fprintf(output, "Status: %s  Namespace: %s  Responding: %d/%d  Observed: %s\n",
 		clusterStatus, strings.ToUpper(report.NamespaceStatus), len(report.Reports), len(report.Peers), formatHealthTime(report.ObservedAt))
 
@@ -1199,7 +1199,7 @@ func (a *App) conflictsCommand() *cobra.Command {
 }
 
 func (a *App) doctorCommand() *cobra.Command {
-	var mesh bool
+	var cluster bool
 	var discoveryTimeout, peerTimeout time.Duration
 	cmd := &cobra.Command{
 		Use: "doctor", Args: cobra.NoArgs, Short: "Check build and runtime dependencies",
@@ -1251,7 +1251,7 @@ func (a *App) doctorCommand() *cobra.Command {
 			if failed {
 				return fmt.Errorf("one or more required commands are missing")
 			}
-			if mesh {
+			if cluster {
 				repo, err := a.open()
 				if err != nil {
 					return err
@@ -1261,18 +1261,18 @@ func (a *App) doctorCommand() *cobra.Command {
 				defer cancel()
 				report, err := peer.CheckMesh(ctx, repo, discoveryTimeout, peerTimeout)
 				if err != nil {
-					return fmt.Errorf("check peer mesh: %w", err)
+					return fmt.Errorf("check peer cluster: %w", err)
 				}
 				printMeshReport(a.Out, report)
 				if !report.Complete {
-					return fmt.Errorf("peer mesh is incomplete or unreachable")
+					return fmt.Errorf("peer cluster is incomplete or unreachable")
 				}
 			}
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&mesh, "mesh", false, "check every directed connection between configured mesh peers")
-	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the mesh check")
+	cmd.Flags().BoolVar(&cluster, "cluster", false, "check every directed connection between configured cluster peers")
+	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the cluster check")
 	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer connection probe")
 	return cmd
 }
@@ -1299,7 +1299,7 @@ func prepareDoctorPath(goos string) error {
 
 func printMeshReport(output io.Writer, report peer.MeshReport) {
 	if len(report.Peers) == 1 {
-		fmt.Fprintf(output, "\nConnections\n%s is the only mesh peer.\n", meshPeerLabel(report.Peers[0]))
+		fmt.Fprintf(output, "\nConnections\n%s is the only cluster peer.\n", meshPeerLabel(report.Peers[0]))
 		return
 	}
 	names := make(map[string]string, len(report.Peers))

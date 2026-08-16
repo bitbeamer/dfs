@@ -134,7 +134,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			report.ReconciliationStatus = "pending"
 			report.Issues = append(report.Issues, HealthIssue{Code: "RECONCILIATION_PENDING", Severity: "warning",
 				Detail: fmt.Sprintf("%d accepted member(s) are not configured as local peers", expected-len(remotes)),
-				Action: "keep peers online and run dfs sync; use dfs health --mesh to identify incomplete edges"})
+				Action: "keep peers online and run dfs sync; use dfs health --cluster to identify incomplete edges"})
 		}
 	}
 	if report.Role == "" {
@@ -214,7 +214,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			report.Remotes = append(report.Remotes, check)
 			if !check.Reachable {
 				report.Issues = append(report.Issues, HealthIssue{Code: "PEER_UNREACHABLE", Severity: "warning",
-					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs doctor --mesh"})
+					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs doctor --cluster"})
 			} else if check.Transport == "ssh-fallback" {
 				report.Issues = append(report.Issues, HealthIssue{Code: "SSH_FALLBACK", Severity: "warning",
 					Detail: check.Name + " is reachable only through SSH fallback", Action: "check UDP reachability for the peer's managed DFS port"})
@@ -393,7 +393,7 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 		result.NamespaceStatus = "inconsistent"
 		result.Complete = false
 		result.Issues = append(result.Issues, HealthIssue{Code: "NAMESPACE_DIVERGED", Severity: "error",
-			Detail: "online peers report different logical namespace trees", Action: "run dfs sync on the affected peers and repeat dfs health --mesh"})
+			Detail: "online peers report different logical namespace trees", Action: "run dfs sync on the affected peers and repeat dfs health --cluster"})
 	} else if len(result.Reports) < len(result.Peers) || missingTree {
 		result.NamespaceStatus = "unknown"
 		result.Complete = false

@@ -47,9 +47,9 @@ content to be present locally.
 - Transfer Git metadata, git-annex content, membership, and diagnostics over
   mutually authenticated QUIC, with repository-restricted SSH as a fallback.
 - Diagnose every directed peer-to-peer path, including ordinary passwordless
-  SSH, with `doctor --mesh`.
+  SSH, with `doctor --cluster`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
-  membership, and peer health with `dfs health`; add `--mesh` for an active
+  membership, and peer health with `dfs health`; add `--cluster` for an active
   whole-cluster check and namespace-convergence comparison. Health output lists
   every pinned file or directory with its logical size and missing-file count.
 - Run more than one active DFS filesystem on the same host. Each repository has
@@ -290,10 +290,10 @@ dropped.
 ```sh
 dfs --repo ~/.local/share/dfs/repository health
 dfs --repo ~/.local/share/dfs/repository health --json
-dfs --repo ~/.local/share/dfs/repository health --mesh
-dfs --repo ~/.local/share/dfs/repository health --mesh --json
+dfs --repo ~/.local/share/dfs/repository health --cluster
+dfs --repo ~/.local/share/dfs/repository health --cluster --json
 dfs --repo ~/.local/share/dfs/repository doctor
-dfs --repo ~/.local/share/dfs/repository doctor --mesh
+dfs --repo ~/.local/share/dfs/repository doctor --cluster
 ```
 
 `health` validates the private `.git/dfs/health.json` heartbeat, owner process,
@@ -302,7 +302,7 @@ That observation includes network identity and role, instance port, logical file
 count and size, repository/metadata/private-state sizes, cache and disk use,
 local content holdings, pins, reconciliation state, outgoing reachability, and
 actionable degraded-state guidance. The daemon refreshes it periodically without
-hydrating missing content. `health --mesh` actively queries every configured or
+hydrating missing content. `health --cluster` actively queries every configured or
 discovered member in parallel, reports the same metrics for each responding
 peer, checks every directed connection, and compares online namespace tree IDs.
 The human-readable view is a compact peer and connection summary with shortened,
@@ -310,7 +310,7 @@ deduplicated errors; `--json` retains complete diagnostic details. The command
 exits unsuccessfully when the cluster is incomplete or inconsistent.
 
 `doctor` remains the dependency and low-level transport diagnostic.
-`doctor --mesh` asks every known mounted peer to test every configured peer in both directions:
+`doctor --cluster` asks every known mounted peer to test every configured peer in both directions:
 `desktop -> laptop` and `laptop -> desktop` are separate rows. Each read-only
 probe tests mutually authenticated QUIC, the repository-restricted SSH
 fallback, and ordinary passwordless non-interactive SSH.
@@ -333,7 +333,7 @@ command fail. `SSH_FALLBACK` is a healthy but degraded result. Adjust bounded
 probes when needed:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository doctor --mesh \
+dfs --repo ~/.local/share/dfs/repository doctor --cluster \
   --discovery-timeout 5s --peer-timeout 10s
 ```
 

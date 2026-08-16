@@ -38,7 +38,7 @@ func TestPrintNodeHealthMarksLegacyObservationUnknown(t *testing.T) {
 	}
 }
 
-func TestPrintMeshHealthIsCompactAndUsesPeerNames(t *testing.T) {
+func TestPrintClusterHealthIsCompactAndUsesPeerNames(t *testing.T) {
 	observed := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 	report := peer.MeshReport{
 		ObservedAt: observed, NamespaceStatus: "unknown", Complete: false,
@@ -54,12 +54,28 @@ func TestPrintMeshHealthIsCompactAndUsesPeerNames(t *testing.T) {
 	var output bytes.Buffer
 	printMeshHealth(&output, report)
 	text := output.String()
-	for _, wanted := range []string{"Status: DEGRADED", "Responding: 1/2", "cachyos", "iris", "UNREPORTED", "Pinned content", "Archive/file", "4.0 KiB", "connection timed out"} {
+	for _, wanted := range []string{"DFS CLUSTER HEALTH", "Status: DEGRADED", "Responding: 1/2", "cachyos", "iris", "UNREPORTED", "Pinned content", "Archive/file", "4.0 KiB", "connection timed out"} {
 		if !strings.Contains(text, wanted) {
-			t.Fatalf("mesh health output does not contain %q:\n%s", wanted, text)
+			t.Fatalf("cluster health output does not contain %q:\n%s", wanted, text)
 		}
 	}
 	if strings.Contains(text, "dfs-peer-") || strings.Contains(text, "git ls-remote") {
-		t.Fatalf("mesh health exposes internal diagnostic details:\n%s", text)
+		t.Fatalf("cluster health exposes internal diagnostic details:\n%s", text)
+	}
+}
+
+func TestClusterFlagReplacesMeshFlag(t *testing.T) {
+	root := New()
+	for _, name := range []string{"health", "doctor"} {
+		command, _, err := root.Find([]string{name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if command.Flags().Lookup("cluster") == nil {
+			t.Errorf("%s command has no --cluster flag", name)
+		}
+		if command.Flags().Lookup("mesh") != nil {
+			t.Errorf("%s command still exposes --mesh", name)
+		}
 	}
 }

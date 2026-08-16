@@ -9,7 +9,7 @@ import (
 	"github.com/bitbeamer/dfs/internal/peer"
 )
 
-func TestPrintMeshReport(t *testing.T) {
+func TestPrintClusterConnectionReport(t *testing.T) {
 	report := peer.MeshReport{
 		Peers: []peer.MeshPeer{
 			{PeerID: "a", PeerName: "desktop"},
@@ -28,7 +28,7 @@ func TestPrintMeshReport(t *testing.T) {
 		"laptop   desktop  FAILED  connection refused",
 	} {
 		if !strings.Contains(output.String(), expected) {
-			t.Fatalf("mesh output does not contain %q:\n%s", expected, output.String())
+			t.Fatalf("cluster output does not contain %q:\n%s", expected, output.String())
 		}
 	}
 }
