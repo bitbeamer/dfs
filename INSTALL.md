@@ -265,6 +265,14 @@ compares namespace convergence, and verifies every directed peer edge. Use
 `--json` with either form for complete machine-readable diagnostics; the normal
 terminal view shortens transport errors and avoids repeating them per peer.
 
+Pinning needs no manual file access. `dfs pin <path>` saves a peer-local policy;
+`dfs pin --cluster <path>` saves a signed replicated policy for all current and
+future peers. A running daemon hydrates the selected content automatically in
+the background. Offline peers apply cluster pins after reconnecting, and
+`health --cluster` reports each peer's pin scope and hydration, missing-content,
+or capacity-constrained state. Use the corresponding `unpin` command with or
+without `--cluster`; the two scopes are independent.
+
 `health --cluster` verifies managed QUIC, the repository-restricted SSH fallback,
 and ordinary passwordless, non-interactive SSH for every directed peer pair. A
 working fallback with unavailable QUIC is shown as `SSH_FALLBACK`; a missing

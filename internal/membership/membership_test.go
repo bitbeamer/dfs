@@ -185,6 +185,98 @@ func TestMembershipRefSynchronizesWithoutWorktreeFiles(t *testing.T) {
 	}
 }
 
+func TestSignedClusterPinPolicyReplicatesAndUnpins(t *testing.T) {
+	first := gitMembershipRepository(t)
+	second := filepath.Join(t.TempDir(), "second")
+	if output, err := exec.Command("git", "clone", first, second).CombinedOutput(); err != nil {
+		t.Fatalf("clone second repository: %v\n%s", err, output)
+	}
+	gitMembershipRun(t, second, "config", "user.name", "Membership Test")
+	gitMembershipRun(t, second, "config", "user.email", "membership@example.invalid")
+	gitMembershipRun(t, first, "remote", "add", "second", second)
+	gitMembershipRun(t, second, "remote", "add", "first", first)
+	filesystemID := strings.Repeat("f", 40)
+	firstKey, firstPublic, err := EnsureKey(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondKey, secondPublic, err := EnsureKey(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRecord := signedTestRecord(t, filesystemID, "first-peer", "admin", firstPublic, firstKey)
+	firstRecord, err = Approve(firstRecord, "first-peer", firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRecord := signedTestRecord(t, filesystemID, "second-peer", "member", secondPublic, secondKey)
+	secondRecord, err = Approve(secondRecord, "first-peer", firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repositoryPath := range []string{first, second} {
+		for _, record := range []Record{firstRecord, secondRecord} {
+			if err := Save(repositoryPath, record); err != nil {
+				t.Fatal(err)
+			}
+			if err := Trust(repositoryPath, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := SetPinPolicy(first, filesystemID, "first-peer", "Media/Films", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := Sync(context.Background(), first, []string{"second"}); err != nil {
+		t.Fatal(err)
+	}
+	if paths, err := ActivePinPaths(second, filesystemID); err != nil || len(paths) != 1 || paths[0] != "Media/Films" {
+		t.Fatalf("replicated active pins = %v, %v", paths, err)
+	}
+	policy, err := SetPinPolicy(second, filesystemID, "second-peer", "Media/Films", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Generation != 2 {
+		t.Fatalf("unpin generation = %d, want 2", policy.Generation)
+	}
+	if err := Sync(context.Background(), second, []string{"first"}); err != nil {
+		t.Fatal(err)
+	}
+	if paths, err := ActivePinPaths(first, filesystemID); err != nil || len(paths) != 0 {
+		t.Fatalf("active pins after replicated unpin = %v, %v", paths, err)
+	}
+	for _, repositoryPath := range []string{first, second} {
+		if output := gitMembershipRunOutput(t, repositoryPath, "ls-tree", "-r", "--name-only", "HEAD"); strings.Contains(output, "pins/") {
+			t.Fatalf("cluster pin leaked into worktree history in %s: %s", repositoryPath, output)
+		}
+		if output := gitMembershipRunOutput(t, repositoryPath, "ls-tree", "-r", "--name-only", PinRef); !strings.Contains(output, "pins/") {
+			t.Fatalf("cluster pin missing from dedicated metadata ref in %s: %s", repositoryPath, output)
+		}
+	}
+	files, err := loadSharedPrefix(first, PinRef, pinsPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range files {
+		var tampered PinPolicy
+		if err := json.Unmarshal(data, &tampered); err != nil {
+			t.Fatal(err)
+		}
+		tampered.Pinned = true
+		changed, err := json.Marshal(tampered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writePinPolicyFile(first, path, changed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if paths, err := ActivePinPaths(first, filesystemID); err != nil || len(paths) != 0 {
+		t.Fatalf("tampered cluster pin policy was accepted: %v, %v", paths, err)
+	}
+}
+
 func TestMembershipRejectsTamperingAndKeyReplacement(t *testing.T) {
 	repositoryPath := t.TempDir()
 	key, public, err := EnsureKey(t.TempDir())
@@ -263,4 +355,14 @@ func gitMembershipRun(t *testing.T, repositoryPath string, arguments ...string) 
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(arguments, " "), err, output)
 	}
+}
+
+func gitMembershipRunOutput(t *testing.T, repositoryPath string, arguments ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repositoryPath}, arguments...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(arguments, " "), err, output)
+	}
+	return string(output)
 }

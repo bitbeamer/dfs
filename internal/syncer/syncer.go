@@ -176,7 +176,7 @@ func (s *Scheduler) sync(reason string) {
 	}()
 	degradedRemotes := make(map[string]error)
 	maxPasses, stablePasses := 1, 0
-	maintenance := reason == "startup" || reason == "periodic" || reason == "shutdown"
+	maintenance := isMaintenanceReason(reason)
 	if maintenance {
 		maxPasses, stablePasses = 4, 1
 	}
@@ -265,6 +265,15 @@ func (s *Scheduler) sync(reason string) {
 			"pins_refreshed", refreshed,
 			"files_evicted", len(dropped),
 		)
+	}
+}
+
+func isMaintenanceReason(reason string) bool {
+	switch reason {
+	case "startup", "periodic", "shutdown", "pin policy changed":
+		return true
+	default:
+		return false
 	}
 }
 

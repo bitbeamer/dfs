@@ -180,7 +180,17 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 	} else if err != nil {
 		return err
 	}
-	return repo.ConfigureSSHCommand(ctx, transportSSHCommand(filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), transportKeyFile), configuredKnownHosts))
+	if err := repo.ConfigureSSHCommand(ctx, transportSSHCommand(filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), transportKeyFile), configuredKnownHosts)); err != nil {
+		return err
+	}
+	clusterPins, err := membership.ActivePinPaths(repo.Config.Repository, filesystemID)
+	if err != nil {
+		return fmt.Errorf("load cluster pin policy: %w", err)
+	}
+	if err := repo.Store.ReplaceClusterPins(clusterPins); err != nil {
+		return fmt.Errorf("apply cluster pin policy: %w", err)
+	}
+	return nil
 }
 
 func RevokeMembership(ctx context.Context, repo *repository.Repository, remote string) error {

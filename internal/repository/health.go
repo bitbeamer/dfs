@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/bitbeamer/dfs/internal/store"
 )
 
 type HealthStats struct {
@@ -32,10 +34,13 @@ type HealthStats struct {
 
 type PinnedPathHealth struct {
 	Path         string `json:"path"`
+	Scope        string `json:"scope"`
 	Kind         string `json:"kind"`
+	Status       string `json:"status"`
 	LogicalFiles int64  `json:"logical_files"`
 	LogicalBytes int64  `json:"logical_bytes"`
 	MissingFiles int64  `json:"missing_files"`
+	MissingBytes int64  `json:"missing_bytes"`
 }
 
 type annexHealthFile struct {
@@ -46,6 +51,10 @@ type annexHealthFile struct {
 // HealthStats reports namespace and disk use without hydrating annex content.
 func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 	pins, err := r.Store.Pins()
+	if err != nil {
+		return HealthStats{}, err
+	}
+	pinRecords, err := r.Store.PinRecords()
 	if err != nil {
 		return HealthStats{}, err
 	}
@@ -64,7 +73,7 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 	if err != nil {
 		return HealthStats{}, err
 	}
-	stats := HealthStats{PinnedPaths: int64(len(pins)), CacheLimitBytes: r.Config.CacheLimit}
+	stats := HealthStats{PinnedPaths: int64(len(pinRecords)), CacheLimitBytes: r.Config.CacheLimit}
 	annexed := make(map[string]annexHealthFile, len(all))
 	fileSizes := make(map[string]int64, len(all))
 	for _, file := range all {
@@ -99,7 +108,7 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 			fileSizes[path] = size
 		}
 	}
-	stats.Pinned = pinnedPathHealth(pins, fileSizes, local, annexed)
+	stats.Pinned = pinnedPathHealth(pinRecords, fileSizes, local, annexed)
 	stats.CacheBytes, err = directorySize(filepath.Join(r.Config.Repository, ".git", "annex", "objects"), nil)
 	if err != nil {
 		return HealthStats{}, err
@@ -127,14 +136,29 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 		stats.DiskTotalBytes = int64(filesystem.Blocks) * int64(filesystem.Bsize)
 		stats.DiskAvailableBytes = int64(filesystem.Bavail) * int64(filesystem.Bsize)
 	}
+	updatePinStatuses(stats.Pinned, stats.DiskAvailableBytes)
 	return stats, nil
 }
 
-func pinnedPathHealth(pins []string, fileSizes map[string]int64, local map[string]annexHealthFile, annexed map[string]annexHealthFile) []PinnedPathHealth {
+func updatePinStatuses(pins []PinnedPathHealth, diskAvailableBytes int64) {
+	for index := range pins {
+		pin := &pins[index]
+		switch {
+		case pin.MissingFiles == 0 && pin.Kind != "missing":
+			pin.Status = "ready"
+		case pin.MissingBytes > 0 && diskAvailableBytes > 0 && pin.MissingBytes > diskAvailableBytes:
+			pin.Status = "capacity-constrained"
+		default:
+			pin.Status = "hydrating"
+		}
+	}
+}
+
+func pinnedPathHealth(pins []store.Pin, fileSizes map[string]int64, local map[string]annexHealthFile, annexed map[string]annexHealthFile) []PinnedPathHealth {
 	result := make([]PinnedPathHealth, 0, len(pins))
 	for _, original := range pins {
-		pin := strings.Trim(filepath.ToSlash(original), "/")
-		entry := PinnedPathHealth{Path: pin, Kind: "directory"}
+		pin := strings.Trim(filepath.ToSlash(original.Path), "/")
+		entry := PinnedPathHealth{Path: pin, Scope: original.Scope, Kind: "directory"}
 		if _, found := fileSizes[pin]; found {
 			entry.Kind = "file"
 		}
@@ -147,6 +171,7 @@ func pinnedPathHealth(pins []string, fileSizes map[string]int64, local map[strin
 			if _, isAnnexed := annexed[path]; isAnnexed {
 				if _, isLocal := local[path]; !isLocal {
 					entry.MissingFiles++
+					entry.MissingBytes += size
 				}
 			}
 		}

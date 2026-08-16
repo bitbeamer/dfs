@@ -155,6 +155,7 @@ func TestHealthStatsReportNamespaceAndStorageWithoutHydration(t *testing.T) {
 		t.Fatalf("content policy stats = %+v", stats)
 	}
 	if len(stats.Pinned) != 1 || stats.Pinned[0].Path != "item.txt" || stats.Pinned[0].Kind != "file" ||
+		stats.Pinned[0].Scope != "local" || stats.Pinned[0].Status != "ready" ||
 		stats.Pinned[0].LogicalFiles != 1 || stats.Pinned[0].LogicalBytes != int64(len("health content\n")) {
 		t.Fatalf("pinned path stats = %+v", stats.Pinned)
 	}
@@ -170,6 +171,9 @@ func TestHealthStatsReportNamespaceAndStorageWithoutHydration(t *testing.T) {
 	}
 	if withoutContent.LogicalFiles != stats.LogicalFiles || withoutContent.LogicalBytes != stats.LogicalBytes || withoutContent.ContentFiles != 0 {
 		t.Fatalf("logical stats changed when content was evicted: before=%+v after=%+v", stats, withoutContent)
+	}
+	if len(withoutContent.Pinned) != 1 || withoutContent.Pinned[0].Status != "hydrating" || withoutContent.Pinned[0].MissingFiles != 1 {
+		t.Fatalf("missing pin hydration status = %+v", withoutContent.Pinned)
 	}
 }
 

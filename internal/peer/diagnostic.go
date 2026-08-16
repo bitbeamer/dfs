@@ -145,6 +145,13 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			Detail: fmt.Sprintf("%d pinned file(s) are not held locally", stats.MissingPinnedFiles),
 			Action: "run dfs sync and verify that another peer or durable remote still holds the content"})
 	}
+	for _, pin := range stats.Pinned {
+		if pin.Status == "capacity-constrained" {
+			report.Issues = append(report.Issues, HealthIssue{Code: "PIN_CAPACITY_CONSTRAINED", Severity: "error",
+				Detail: fmt.Sprintf("%s pin %q needs %d additional byte(s), exceeding available disk space", pin.Scope, pin.Path, pin.MissingBytes),
+				Action: "free disk space on this peer; cluster pin hydration will retry automatically"})
+		}
+	}
 	if stats.CacheLimitBytes > 0 && stats.CacheBytes > stats.CacheLimitBytes {
 		report.Issues = append(report.Issues, HealthIssue{Code: "CACHE_OVER_LIMIT", Severity: "warning",
 			Detail: "local annex object storage exceeds the configured cache limit", Action: "run dfs cache prune"})
@@ -376,6 +383,7 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 	}
 	seenReports := make(map[string]bool)
 	trees := make(map[string]bool)
+	clusterPinPolicies := make(map[string]bool)
 	missingTree := false
 	for _, participant := range result.Peers {
 		if report, found := reports[participant.PeerID]; found && !seenReports[report.PeerID] {
@@ -386,6 +394,19 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 			} else {
 				missingTree = true
 			}
+			for _, issue := range report.Issues {
+				if issue.Severity == "error" {
+					result.Complete = false
+				}
+			}
+			var clusterPins []string
+			for _, pin := range report.Stats.Pinned {
+				if pin.Scope == "cluster" {
+					clusterPins = append(clusterPins, pin.Path)
+				}
+			}
+			sort.Strings(clusterPins)
+			clusterPinPolicies[strings.Join(clusterPins, "\x00")] = true
 		}
 	}
 	sort.Slice(result.Reports, func(i, j int) bool { return result.Reports[i].PeerName < result.Reports[j].PeerName })
@@ -397,6 +418,11 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 	} else if len(result.Reports) < len(result.Peers) || missingTree {
 		result.NamespaceStatus = "unknown"
 		result.Complete = false
+	}
+	if len(clusterPinPolicies) > 1 {
+		result.Complete = false
+		result.Issues = append(result.Issues, HealthIssue{Code: "CLUSTER_PIN_POLICY_DIVERGED", Severity: "error",
+			Detail: "online peers report different replicated cluster pin policies", Action: "keep peers online until reconciliation completes, then repeat dfs health --cluster"})
 	}
 	return result
 }

@@ -32,8 +32,9 @@ content to be present locally.
 ### Control which content occupies each device
 
 - Set an independent cache limit on every peer.
-- Fetch content temporarily, pin content against automatic eviction, or safely
-  evict local copies while retaining their namespace entries.
+- Fetch content temporarily, pin it on one peer or across the cluster against
+  automatic eviction, or safely evict local copies while retaining namespace
+  entries. Pinning schedules hydration automatically on every targeted peer.
 - Let LRU pruning enforce the configured target without dropping open or pinned
   files or violating git-annex copy-safety rules.
 
@@ -51,7 +52,8 @@ content to be present locally.
 - Inspect service, namespace, repository, cache, disk, content-policy,
   membership, and peer health with `dfs health`; add `--cluster` for an active
   whole-cluster check and namespace-convergence comparison. Health output lists
-  every pinned file or directory with its logical size and missing-file count.
+  every pinned file or directory with its scope, hydration status, logical size,
+  and missing-file count.
 - Run more than one active DFS filesystem on the same host. Each repository has
   independent state, mountpoint, service, logs, and TCP/UDP transport port.
 
@@ -254,21 +256,30 @@ mv ~/dfs_storage/Documents/report.pdf ~/dfs_storage/Archive/
 rm ~/dfs_storage/Archive/old.pdf
 ```
 
-Control local content placement explicitly:
+Control local or cluster-wide content placement explicitly:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository fetch Documents/report.pdf
 dfs --repo ~/.local/share/dfs/repository pin Photos/Vacation
+dfs --repo ~/.local/share/dfs/repository pin --cluster Shared/Reference
 dfs --repo ~/.local/share/dfs/repository unpin Photos/Vacation
+dfs --repo ~/.local/share/dfs/repository unpin --cluster Shared/Reference
 dfs --repo ~/.local/share/dfs/repository evict Movies/large.mkv
 dfs --repo ~/.local/share/dfs/repository cache status
 dfs --repo ~/.local/share/dfs/repository cache set-limit 75GiB
 dfs --repo ~/.local/share/dfs/repository cache prune
 ```
 
-`fetch` caches content; `pin` also protects it from automatic eviction.
-`evict` delegates safety checks to git-annex and refuses to remove pinned
-content. Open or pinned files and copy-safety rules can temporarily keep usage
+`fetch` caches content temporarily. `pin` creates a peer-local policy;
+`pin --cluster` writes a signed policy to DFS's replicated Git metadata ref.
+Both forms notify the daemon and hydrate matching files automatically in the
+background—opening or copying them manually is unnecessary. An offline peer
+applies a cluster pin when it reconnects. `health` shows each pin as `LOCAL` or
+`CLUSTER` and as `READY`, `HYDRATING`, or `CAPACITY-CONSTRAINED`; `health
+--cluster` also exposes offline and incomplete peers. Local and cluster scopes
+are independent, so removing one does not remove the other. `evict` delegates
+safety checks to git-annex and refuses to remove content protected by either
+scope. Open or pinned files and copy-safety rules can temporarily keep usage
 above the configured limit.
 
 ## Inspect history and recover a path
@@ -467,9 +478,9 @@ Go FUSE mounted logical namespace
         |
         v
 DFS transactions, synchronization, and quota scheduler
-        |-- Git: namespace, history, membership metadata refs
+        |-- Git: namespace, history, signed membership and cluster-pin metadata refs
         |-- git-annex: content hashes, locations, safe copies
-        |-- SQLite: peer-local pins, access, and filesystem metadata
+        |-- SQLite: peer-local pins, applied cluster pins, access, and filesystem metadata
         |-- mDNS + pinned TLS: discovery and pairing
         |-- mutually authenticated QUIC: primary peer transport
         |-- restricted SSH: compatibility fallback

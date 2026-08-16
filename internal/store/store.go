@@ -20,6 +20,11 @@ type Access struct {
 	LastAccess time.Time
 }
 
+type Pin struct {
+	Path  string
+	Scope string
+}
+
 type FileMetadata struct {
 	Mode      uint32
 	UID       uint32
@@ -46,6 +51,7 @@ func Open(path string) (*Store, error) {
 		`PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS access (path TEXT PRIMARY KEY, last_access INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS pins (path TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS cluster_pins (path TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS file_metadata (
 			path TEXT PRIMARY KEY, mode INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL,
 			atime_ns INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL,
@@ -91,8 +97,35 @@ func (s *Store) Unpin(path string) error {
 	return err
 }
 
+func (s *Store) SetClusterPinned(path string, pinned bool) error {
+	path = normalize(path)
+	if !pinned {
+		_, err := s.db.Exec(`DELETE FROM cluster_pins WHERE path=?`, path)
+		return err
+	}
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO cluster_pins(path,created_at) VALUES(?,?)`, path, time.Now().UnixNano())
+	return err
+}
+
+func (s *Store) ReplaceClusterPins(paths []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM cluster_pins`); err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO cluster_pins(path,created_at) VALUES(?,?)`, normalize(path), time.Now().UnixNano()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Pins() ([]string, error) {
-	rows, err := s.db.Query(`SELECT path FROM pins ORDER BY path`)
+	rows, err := s.db.Query(`SELECT path FROM pins UNION SELECT path FROM cluster_pins ORDER BY path`)
 	if err != nil {
 		return nil, err
 	}
@@ -108,9 +141,26 @@ func (s *Store) Pins() ([]string, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) PinRecords() ([]Pin, error) {
+	rows, err := s.db.Query(`SELECT path, 'local' FROM pins UNION ALL SELECT path, 'cluster' FROM cluster_pins ORDER BY path, 2`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Pin
+	for rows.Next() {
+		var pin Pin
+		if err := rows.Scan(&pin.Path, &pin.Scope); err != nil {
+			return nil, err
+		}
+		result = append(result, pin)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) IsPinned(path string) (bool, error) {
 	path = normalize(path)
-	rows, err := s.db.Query(`SELECT path FROM pins`)
+	rows, err := s.db.Query(`SELECT path FROM pins UNION SELECT path FROM cluster_pins`)
 	if err != nil {
 		return false, err
 	}

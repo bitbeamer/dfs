@@ -530,6 +530,24 @@ func TestEvaluateMeshDetectsNamespaceDivergence(t *testing.T) {
 	}
 }
 
+func TestEvaluateMeshDetectsClusterPinPolicyDivergence(t *testing.T) {
+	peers := map[string]MeshPeer{
+		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop"},
+		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop"},
+	}
+	reports := map[string]DiagnosticReport{
+		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop", TreeID: "same-tree",
+			Stats:   repository.HealthStats{Pinned: []repository.PinnedPathHealth{{Path: "Media", Scope: "cluster", Status: "ready"}}},
+			Remotes: []RemoteDiagnostic{{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop", TreeID: "same-tree",
+			Remotes: []RemoteDiagnostic{{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+	}
+	report := evaluateMesh(peers, reports, nil)
+	if report.Complete || len(report.Issues) != 1 || report.Issues[0].Code != "CLUSTER_PIN_POLICY_DIVERGED" {
+		t.Fatalf("cluster pin health report = %+v", report)
+	}
+}
+
 func TestProbePasswordlessSSHUsesOrdinaryNonInteractiveSSH(t *testing.T) {
 	directory := t.TempDir()
 	capture := filepath.Join(directory, "arguments")

@@ -35,6 +35,39 @@ func TestPinsApplyToDescendants(t *testing.T) {
 	}
 }
 
+func TestLocalAndClusterPinScopesAreIndependent(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if err := state.Pin("shared"); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetClusterPinned("shared", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Unpin("shared"); err != nil {
+		t.Fatal(err)
+	}
+	if pinned, err := state.IsPinned("shared/file"); err != nil || !pinned {
+		t.Fatalf("cluster pin lost after local unpin: pinned=%v err=%v", pinned, err)
+	}
+	records, err := state.PinRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(records, []Pin{{Path: "shared", Scope: "cluster"}}) {
+		t.Fatalf("pin records = %+v", records)
+	}
+	if err := state.ReplaceClusterPins([]string{"other"}); err != nil {
+		t.Fatal(err)
+	}
+	if pins, err := state.Pins(); err != nil || !reflect.DeepEqual(pins, []string{"other"}) {
+		t.Fatalf("pins after replacement = %v, %v", pins, err)
+	}
+}
+
 func TestFileMetadataAndXAttrsFollowNamespaceChanges(t *testing.T) {
 	state, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

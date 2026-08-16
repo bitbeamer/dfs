@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/wakeup"
 )
@@ -325,6 +326,10 @@ func ServeSSH(repositoryPath string) error {
 		if err != nil {
 			return fmt.Errorf("locate %s: %w", service, err)
 		}
+		pinRefBefore := ""
+		if service == "git-receive-pack" {
+			pinRefBefore = transportRefValue(ctx, repositoryPath, membership.PinRef)
+		}
 		command := exec.CommandContext(ctx, gitService, repositoryPath)
 		command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := command.Run(); err != nil {
@@ -334,7 +339,11 @@ func ServeSSH(repositoryPath string) error {
 			// QUIC receives run in the mount process and can wake its scheduler
 			// directly. SSH fallback receives run in this restricted child, so
 			// notify the mount through its repository-specific runtime socket.
-			_ = wakeup.Notify(repositoryPath, "managed Git receive")
+			reason := "managed Git receive"
+			if transportRefValue(ctx, repositoryPath, membership.PinRef) != pinRefBefore {
+				reason = "pin policy changed"
+			}
+			_ = wakeup.Notify(repositoryPath, reason)
 		}
 		return nil
 	}
@@ -348,6 +357,14 @@ func ServeSSH(repositoryPath string) error {
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	return command.Run()
+}
+
+func transportRefValue(ctx context.Context, repositoryPath, ref string) string {
+	output, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "rev-parse", "--verify", ref).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func restrictedGitService(original, repositoryPath string) (string, bool, error) {

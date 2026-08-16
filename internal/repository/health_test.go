@@ -3,6 +3,8 @@ package repository
 import (
 	"reflect"
 	"testing"
+
+	"github.com/bitbeamer/dfs/internal/store"
 )
 
 func TestParseAnnexHealthFiles(t *testing.T) {
@@ -36,13 +38,27 @@ func TestPinnedPathHealthReportsFilesAndDirectoryTotals(t *testing.T) {
 		"albums/two.jpg": {Path: "albums/two.jpg", Size: 30},
 	}
 	local := map[string]annexHealthFile{"photo.jpg": annexed["photo.jpg"], "albums/one.jpg": annexed["albums/one.jpg"]}
-	got := pinnedPathHealth([]string{"albums", "missing", "photo.jpg"}, files, local, annexed)
+	got := pinnedPathHealth([]store.Pin{{Path: "albums", Scope: "cluster"}, {Path: "missing", Scope: "local"}, {Path: "photo.jpg", Scope: "local"}}, files, local, annexed)
 	want := []PinnedPathHealth{
-		{Path: "albums", Kind: "directory", LogicalFiles: 2, LogicalBytes: 50, MissingFiles: 1},
-		{Path: "missing", Kind: "missing"},
-		{Path: "photo.jpg", Kind: "file", LogicalFiles: 1, LogicalBytes: 12},
+		{Path: "albums", Scope: "cluster", Kind: "directory", LogicalFiles: 2, LogicalBytes: 50, MissingFiles: 1, MissingBytes: 30},
+		{Path: "missing", Scope: "local", Kind: "missing"},
+		{Path: "photo.jpg", Scope: "local", Kind: "file", LogicalFiles: 1, LogicalBytes: 12},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pinned path health = %#v, want %#v", got, want)
+	}
+}
+
+func TestPinHealthDistinguishesReadyHydratingAndCapacity(t *testing.T) {
+	pins := []PinnedPathHealth{
+		{Kind: "file"},
+		{Kind: "file", MissingFiles: 1, MissingBytes: 10},
+		{Kind: "file", MissingFiles: 1, MissingBytes: 200},
+	}
+	updatePinStatuses(pins, 100)
+	got := []string{pins[0].Status, pins[1].Status, pins[2].Status}
+	want := []string{"ready", "hydrating", "capacity-constrained"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pin statuses = %v, want %v", got, want)
 	}
 }

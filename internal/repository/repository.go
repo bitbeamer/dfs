@@ -17,6 +17,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/command"
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/store"
 )
 
@@ -703,13 +704,30 @@ func (r *Repository) Evict(ctx context.Context, path string) error {
 }
 
 func (r *Repository) Pin(ctx context.Context, path string) error {
-	if err := r.Fetch(ctx, path, ""); err != nil {
+	if err := r.Store.Pin(path); err != nil {
 		return err
 	}
-	return r.Store.Pin(path)
+	if err := r.Fetch(ctx, path, ""); err != nil {
+		return fmt.Errorf("pin saved; initial hydration failed: %w", err)
+	}
+	return nil
 }
 
 func (r *Repository) Unpin(path string) error { return r.Store.Unpin(path) }
+
+func (r *Repository) SetLocalPin(path string) error { return r.Store.Pin(path) }
+
+func (r *Repository) SetClusterPin(ctx context.Context, path string, pinned bool) error {
+	filesystemID, err := r.FileSystemID(ctx)
+	if err != nil {
+		return err
+	}
+	policy, err := membership.SetPinPolicy(r.Config.Repository, filesystemID, r.Config.PeerID, path, pinned)
+	if err != nil {
+		return err
+	}
+	return r.Store.SetClusterPinned(policy.Path, pinned)
+}
 
 func (r *Repository) AddRemote(ctx context.Context, name, url string) error {
 	r.mu.Lock()

@@ -254,8 +254,10 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		return
 	}
 	var treeBefore string
+	var pinRefBefore string
 	if service == "git-receive-pack" {
 		treeBefore = worktreeTree(stream.Context(), s.repo.Config.Repository)
+		pinRefBefore = gitRefValue(stream.Context(), s.repo.Config.Repository, membership.PinRef)
 	}
 	command := exec.CommandContext(stream.Context(), service, s.repo.Config.Repository)
 	command.Stdin, command.Stdout, command.Stderr = input, stream, io.Discard
@@ -270,8 +272,20 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 	}
 	if err := command.Wait(); err == nil && service == "git-receive-pack" && s.changed != nil {
 		treeAfter := worktreeTree(stream.Context(), s.repo.Config.Repository)
-		s.changed("managed Git receive", changedPaths(stream.Context(), s.repo.Config.Repository, treeBefore, treeAfter))
+		reason := "managed Git receive"
+		if gitRefValue(stream.Context(), s.repo.Config.Repository, membership.PinRef) != pinRefBefore {
+			reason = "pin policy changed"
+		}
+		s.changed(reason, changedPaths(stream.Context(), s.repo.Config.Repository, treeBefore, treeAfter))
 	}
+}
+
+func gitRefValue(ctx context.Context, repositoryPath, ref string) string {
+	output, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "rev-parse", "--verify", ref).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func worktreeTree(ctx context.Context, repositoryPath string) string {
@@ -309,7 +323,8 @@ func userVisibleRefs(ctx context.Context, repositoryPath string) []byte {
 	for _, line := range bytes.Split(output, []byte{'\n'}) {
 		if bytes.HasSuffix(line, []byte(" refs/heads/git-annex")) ||
 			bytes.HasSuffix(line, []byte(" refs/heads/synced/git-annex")) ||
-			bytes.HasSuffix(line, []byte(" refs/heads/dfs-membership")) {
+			bytes.HasSuffix(line, []byte(" refs/heads/dfs-membership")) ||
+			bytes.HasSuffix(line, []byte(" refs/heads/dfs-pins")) {
 			continue
 		}
 		visible = append(visible, line...)

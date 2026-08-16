@@ -43,6 +43,19 @@ func TestBeginWriteDoesNotPreemptReceivedMerge(t *testing.T) {
 	}
 }
 
+func TestPinAndReceiveEventsRunMaintenance(t *testing.T) {
+	for _, reason := range []string{"pin policy changed"} {
+		if !isMaintenanceReason(reason) {
+			t.Errorf("%q does not run reconciliation and pin hydration", reason)
+		}
+	}
+	for _, reason := range []string{"filesystem change", "managed Git receive"} {
+		if isMaintenanceReason(reason) {
+			t.Fatalf("%q unexpectedly runs maintenance", reason)
+		}
+	}
+}
+
 func TestSyncUntilConvergedStopsImmediatelyWhenUnchanged(t *testing.T) {
 	passes := 0
 	tree := "initial"

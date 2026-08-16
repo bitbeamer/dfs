@@ -25,11 +25,13 @@ import (
 const (
 	Version            = 1
 	SharedRef          = "refs/heads/dfs-membership"
+	PinRef             = "refs/heads/dfs-pins"
 	privateKeyFile     = "membership-key.pem"
 	trustedMembersFile = "trusted-members.json"
 	revokedMembersFile = "revoked-members.json"
 	membersPrefix      = "members/"
 	revocationsPrefix  = "revocations/"
+	pinsPrefix         = "pins/"
 )
 
 func KeyPath(repositoryPath string) string {
@@ -79,6 +81,99 @@ type Revocation struct {
 	Generation   uint64    `json:"generation"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Signature    string    `json:"signature"`
+}
+
+type PinPolicy struct {
+	Version      int       `json:"version"`
+	FileSystemID string    `json:"filesystem_id"`
+	Path         string    `json:"path"`
+	Pinned       bool      `json:"pinned"`
+	Generation   uint64    `json:"generation"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	IssuedBy     string    `json:"issued_by"`
+	Signature    string    `json:"signature"`
+}
+
+func SetPinPolicy(repositoryPath, filesystemID, peerID, path string, pinned bool) (PinPolicy, error) {
+	path, err := normalizePinPath(path)
+	if err != nil {
+		return PinPolicy{}, err
+	}
+	private, public, err := EnsureKey(repositoryPath)
+	if err != nil {
+		return PinPolicy{}, err
+	}
+	trusted, err := LoadTrusted(repositoryPath)
+	if err != nil {
+		return PinPolicy{}, err
+	}
+	if trusted[peerID] != public {
+		return PinPolicy{}, errors.New("local pin signing key does not match trusted membership")
+	}
+	policies, err := LoadPinPolicies(repositoryPath, filesystemID)
+	if err != nil {
+		return PinPolicy{}, err
+	}
+	generation := uint64(1)
+	for _, policy := range policies {
+		if policy.Path == path && policy.Generation >= generation {
+			generation = policy.Generation + 1
+		}
+	}
+	policy := PinPolicy{Version: Version, FileSystemID: filesystemID, Path: path, Pinned: pinned,
+		Generation: generation, UpdatedAt: time.Now().UTC(), IssuedBy: peerID}
+	policy.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, pinPolicyBytes(policy)))
+	if err := verifyPinPolicy(policy, public); err != nil {
+		return PinPolicy{}, err
+	}
+	data, err := json.MarshalIndent(policy, "", "  ")
+	if err != nil {
+		return PinPolicy{}, err
+	}
+	data = append(data, '\n')
+	if err := writePinPolicyFile(repositoryPath, pinPolicyPath(path), data); err != nil {
+		return PinPolicy{}, err
+	}
+	return policy, nil
+}
+
+func LoadPinPolicies(repositoryPath, filesystemID string) ([]PinPolicy, error) {
+	trusted, err := LoadTrusted(repositoryPath)
+	if err != nil {
+		return nil, err
+	}
+	files, err := loadSharedPrefix(repositoryPath, PinRef, pinsPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var policies []PinPolicy
+	for path, data := range files {
+		var policy PinPolicy
+		if json.Unmarshal(data, &policy) != nil || policy.FileSystemID != filesystemID || path != pinPolicyPath(policy.Path) {
+			continue
+		}
+		public := trusted[policy.IssuedBy]
+		if public == "" || verifyPinPolicy(policy, public) != nil {
+			continue
+		}
+		policies = append(policies, policy)
+	}
+	sort.Slice(policies, func(i, j int) bool { return policies[i].Path < policies[j].Path })
+	return policies, nil
+}
+
+func ActivePinPaths(repositoryPath, filesystemID string) ([]string, error) {
+	policies, err := LoadPinPolicies(repositoryPath, filesystemID)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, policy := range policies {
+		if policy.Pinned {
+			paths = append(paths, policy.Path)
+		}
+	}
+	return paths, nil
 }
 
 func Revoke(filesystemID, peerID, revokedBy string, generation uint64, private ed25519.PrivateKey) (Revocation, error) {
@@ -498,6 +593,49 @@ func revocationBytes(revocation Revocation) []byte {
 	return data
 }
 
+func pinPolicyBytes(policy PinPolicy) []byte {
+	copy := policy
+	copy.Signature = ""
+	data, _ := json.Marshal(copy)
+	return data
+}
+
+func verifyPinPolicy(policy PinPolicy, encodedPublic string) error {
+	if policy.Version != Version || len(policy.FileSystemID) < 16 || !validPeerID(policy.IssuedBy) || policy.Generation == 0 || policy.UpdatedAt.IsZero() {
+		return errors.New("incomplete cluster pin policy")
+	}
+	normalized, err := normalizePinPath(policy.Path)
+	if err != nil || normalized != policy.Path {
+		return errors.New("invalid cluster pin path")
+	}
+	public, err := decodePublicKey(encodedPublic)
+	if err != nil {
+		return err
+	}
+	signature, err := base64.RawStdEncoding.DecodeString(policy.Signature)
+	if err != nil || len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, pinPolicyBytes(policy), signature) {
+		return errors.New("invalid cluster pin policy signature")
+	}
+	return nil
+}
+
+func normalizePinPath(path string) (string, error) {
+	path = filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+	path = strings.TrimPrefix(path, "./")
+	if path == "." {
+		path = ""
+	}
+	if filepath.IsAbs(path) || path == ".." || strings.HasPrefix(path, "../") {
+		return "", errors.New("pin path must be relative to the DFS root")
+	}
+	return strings.TrimPrefix(path, "/"), nil
+}
+
+func pinPolicyPath(path string) string {
+	digest := sha256.Sum256([]byte(path))
+	return fmt.Sprintf("%s%x.json", pinsPrefix, digest[:])
+}
+
 func validateRevocation(revocation Revocation) error {
 	if revocation.Version != Version || len(revocation.FileSystemID) < 16 || !validPeerID(revocation.PeerID) ||
 		!validPeerID(revocation.RevokedBy) || revocation.Generation == 0 || revocation.UpdatedAt.IsZero() {
@@ -762,6 +900,58 @@ func Sync(ctx context.Context, repositoryPath string, remotes []string) error {
 	for _, item := range fetched {
 		_, _ = runGit(ctx, repositoryPath, nil, "push", item.remote, SharedRef+":"+SharedRef)
 	}
+	return syncPinPolicies(ctx, repositoryPath, remotes, trusted)
+}
+
+func syncPinPolicies(ctx context.Context, repositoryPath string, remotes []string, trusted map[string]string) error {
+	refs := []string{PinRef}
+	var fetched []struct{ remote, ref string }
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		if remote == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(remote))
+		tracking := fmt.Sprintf("refs/dfs/pin-remotes/%x", digest[:8])
+		if _, err := runGit(ctx, repositoryPath, nil, "fetch", "--no-tags", remote, "+"+PinRef+":"+tracking); err != nil {
+			continue
+		}
+		refs = append(refs, tracking)
+		fetched = append(fetched, struct{ remote, ref string }{remote: remote, ref: tracking})
+	}
+	merged := make(map[string][]byte)
+	for _, ref := range refs {
+		files, err := loadSharedPrefix(repositoryPath, ref, pinsPrefix)
+		if err != nil {
+			return err
+		}
+		for path, data := range files {
+			if !validPinDocument(path, data, trusted) {
+				continue
+			}
+			if current, exists := merged[path]; !exists || newerSharedDocument(path, data, current) {
+				merged[path] = data
+			}
+		}
+	}
+	for path, data := range merged {
+		if err := writePinPolicyFile(repositoryPath, path, data); err != nil {
+			return err
+		}
+	}
+	remoteRefs := make([]string, 0, len(fetched))
+	for _, item := range fetched {
+		remoteRefs = append(remoteRefs, item.ref)
+	}
+	if err := joinRefHistories(ctx, repositoryPath, PinRef, remoteRefs, "cluster pin"); err != nil {
+		return err
+	}
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		if remote != "" {
+			_, _ = runGit(ctx, repositoryPath, nil, "push", remote, PinRef+":"+PinRef)
+		}
+	}
 	return nil
 }
 
@@ -769,12 +959,23 @@ func writeSharedFile(repositoryPath, path string, data []byte) error {
 	if !strings.HasPrefix(path, membersPrefix) && !strings.HasPrefix(path, revocationsPrefix) {
 		return errors.New("invalid DFS membership metadata path")
 	}
+	return writeMetadataFile(repositoryPath, SharedRef, path, data, "membership")
+}
+
+func writePinPolicyFile(repositoryPath, path string, data []byte) error {
+	if !strings.HasPrefix(path, pinsPrefix) {
+		return errors.New("invalid DFS cluster pin metadata path")
+	}
+	return writeMetadataFile(repositoryPath, PinRef, path, data, "cluster pin")
+}
+
+func writeMetadataFile(repositoryPath, ref, path string, data []byte, kind string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for attempt := 0; attempt < 5; attempt++ {
-		old, _ := resolveRef(ctx, repositoryPath, SharedRef)
+		old, _ := resolveRef(ctx, repositoryPath, ref)
 		if old != "" {
-			if existing, err := runGit(ctx, repositoryPath, nil, "show", SharedRef+":"+path); err == nil && bytes.Equal(existing, data) {
+			if existing, err := runGit(ctx, repositoryPath, nil, "show", ref+":"+path); err == nil && bytes.Equal(existing, data) {
 				return nil
 			}
 		}
@@ -789,7 +990,7 @@ func writeSharedFile(repositoryPath, path string, data []byte) error {
 		if err := os.MkdirAll(filepath.Join(gitPath, "dfs"), 0o700); err != nil {
 			return err
 		}
-		index, err := os.CreateTemp(filepath.Join(gitPath, "dfs"), "membership-index-*")
+		index, err := os.CreateTemp(filepath.Join(gitPath, "dfs"), "metadata-index-*")
 		if err != nil {
 			return err
 		}
@@ -817,7 +1018,7 @@ func writeSharedFile(repositoryPath, path string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		arguments := []string{"commit-tree", strings.TrimSpace(string(tree)), "-m", "Update DFS membership metadata"}
+		arguments := []string{"commit-tree", strings.TrimSpace(string(tree)), "-m", "Update DFS " + kind + " metadata"}
 		if old != "" {
 			arguments = append(arguments, "-p", old)
 		}
@@ -825,11 +1026,11 @@ func writeSharedFile(repositoryPath, path string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		if _, err := runGit(ctx, repositoryPath, nil, "update-ref", SharedRef, strings.TrimSpace(string(commit)), old); err == nil {
+		if _, err := runGit(ctx, repositoryPath, nil, "update-ref", ref, strings.TrimSpace(string(commit)), old); err == nil {
 			return nil
 		}
 	}
-	return errors.New("membership metadata changed concurrently too many times")
+	return fmt.Errorf("%s metadata changed concurrently too many times", kind)
 }
 
 func removeSharedFile(repositoryPath, path string) error {
@@ -917,6 +1118,14 @@ func validSharedDocument(path string, data []byte, trusted map[string]string) bo
 	return false
 }
 
+func validPinDocument(path string, data []byte, trusted map[string]string) bool {
+	var policy PinPolicy
+	if json.Unmarshal(data, &policy) != nil || path != pinPolicyPath(policy.Path) || trusted[policy.IssuedBy] == "" {
+		return false
+	}
+	return verifyPinPolicy(policy, trusted[policy.IssuedBy]) == nil
+}
+
 func newerSharedDocument(path string, candidate, current []byte) bool {
 	var candidateGeneration, currentGeneration uint64
 	var candidateTime, currentTime time.Time
@@ -926,8 +1135,14 @@ func newerSharedDocument(path string, candidate, current []byte) bool {
 			candidateGeneration, currentGeneration = left.Payload.Generation, right.Payload.Generation
 			candidateTime, currentTime = left.Payload.UpdatedAt, right.Payload.UpdatedAt
 		}
-	} else {
+	} else if strings.HasPrefix(path, revocationsPrefix) {
 		var left, right Revocation
+		if json.Unmarshal(candidate, &left) == nil && json.Unmarshal(current, &right) == nil {
+			candidateGeneration, currentGeneration = left.Generation, right.Generation
+			candidateTime, currentTime = left.UpdatedAt, right.UpdatedAt
+		}
+	} else if strings.HasPrefix(path, pinsPrefix) {
+		var left, right PinPolicy
 		if json.Unmarshal(candidate, &left) == nil && json.Unmarshal(current, &right) == nil {
 			candidateGeneration, currentGeneration = left.Generation, right.Generation
 			candidateTime, currentTime = left.UpdatedAt, right.UpdatedAt
@@ -943,7 +1158,11 @@ func newerSharedDocument(path string, candidate, current []byte) bool {
 }
 
 func joinSharedHistories(ctx context.Context, repositoryPath string, refs []string) error {
-	current, err := resolveRef(ctx, repositoryPath, SharedRef)
+	return joinRefHistories(ctx, repositoryPath, SharedRef, refs, "membership")
+}
+
+func joinRefHistories(ctx context.Context, repositoryPath, targetRef string, refs []string, kind string) error {
+	current, err := resolveRef(ctx, repositoryPath, targetRef)
 	if err != nil || current == "" {
 		return err
 	}
@@ -968,12 +1187,12 @@ func joinSharedHistories(ctx context.Context, repositoryPath string, refs []stri
 	for _, parent := range parents {
 		arguments = append(arguments, "-p", parent)
 	}
-	arguments = append(arguments, "-m", "Merge DFS membership metadata")
+	arguments = append(arguments, "-m", "Merge DFS "+kind+" metadata")
 	commit, err := runGit(ctx, repositoryPath, nil, arguments...)
 	if err != nil {
 		return err
 	}
-	_, err = runGit(ctx, repositoryPath, nil, "update-ref", SharedRef, strings.TrimSpace(string(commit)), current)
+	_, err = runGit(ctx, repositoryPath, nil, "update-ref", targetRef, strings.TrimSpace(string(commit)), current)
 	return err
 }
 

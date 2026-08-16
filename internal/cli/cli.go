@@ -23,6 +23,7 @@ import (
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 	dfssetup "github.com/bitbeamer/dfs/internal/setup"
+	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/spf13/cobra"
 )
 
@@ -825,15 +826,15 @@ func printMeshHealth(output io.Writer, report peer.MeshReport) {
 	if pinnedRows > 0 {
 		fmt.Fprintln(output, "\nPinned content")
 		pins := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(pins, "PEER\tPATH\tTYPE\tFILES\tLOGICAL\tMISSING")
+		fmt.Fprintln(pins, "PEER\tPATH\tSCOPE\tSTATUS\tTYPE\tFILES\tLOGICAL\tMISSING")
 		for _, participant := range report.Peers {
 			node, found := reports[participant.PeerID]
 			if !found {
 				continue
 			}
 			for _, pin := range node.Stats.Pinned {
-				fmt.Fprintf(pins, "%s\t%s\t%s\t%d\t%s\t%d\n", meshPeerLabel(participant), displayPinnedPath(pin.Path),
-					strings.ToUpper(pin.Kind), pin.LogicalFiles, config.FormatSize(pin.LogicalBytes), pin.MissingFiles)
+				fmt.Fprintf(pins, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\n", meshPeerLabel(participant), displayPinnedPath(pin.Path),
+					strings.ToUpper(pin.Scope), strings.ToUpper(pin.Status), strings.ToUpper(pin.Kind), pin.LogicalFiles, config.FormatSize(pin.LogicalBytes), pin.MissingFiles)
 			}
 		}
 		_ = pins.Flush()
@@ -860,16 +861,16 @@ func printPinnedHealth(output io.Writer, peerName string, pinned []repository.Pi
 	fmt.Fprintln(output, "\nPinned content")
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
 	if peerName == "" {
-		fmt.Fprintln(table, "PATH\tTYPE\tFILES\tLOGICAL\tMISSING")
+		fmt.Fprintln(table, "PATH\tSCOPE\tSTATUS\tTYPE\tFILES\tLOGICAL\tMISSING")
 	} else {
-		fmt.Fprintln(table, "PEER\tPATH\tTYPE\tFILES\tLOGICAL\tMISSING")
+		fmt.Fprintln(table, "PEER\tPATH\tSCOPE\tSTATUS\tTYPE\tFILES\tLOGICAL\tMISSING")
 	}
 	for _, pin := range pinned {
 		if peerName != "" {
 			fmt.Fprintf(table, "%s\t", peerName)
 		}
-		fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%d\n", displayPinnedPath(pin.Path), strings.ToUpper(pin.Kind),
-			pin.LogicalFiles, config.FormatSize(pin.LogicalBytes), pin.MissingFiles)
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\t%s\t%d\n", displayPinnedPath(pin.Path), strings.ToUpper(pin.Scope),
+			strings.ToUpper(pin.Status), strings.ToUpper(pin.Kind), pin.LogicalFiles, config.FormatSize(pin.LogicalBytes), pin.MissingFiles)
 	}
 	_ = table.Flush()
 }
@@ -1040,8 +1041,9 @@ func (a *App) fetchCommand() *cobra.Command {
 }
 
 func (a *App) pinCommand() *cobra.Command {
-	return &cobra.Command{
-		Use: "pin <path>...", Args: cobra.MinimumNArgs(1), Short: "Download content and protect it from eviction",
+	var cluster bool
+	cmd := &cobra.Command{
+		Use: "pin <path>...", Args: cobra.MinimumNArgs(1), Short: "Hydrate content automatically and protect it from eviction",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, err := a.open()
 			if err != nil {
@@ -1051,17 +1053,41 @@ func (a *App) pinCommand() *cobra.Command {
 			ctx, cancel := commandContext(cmd)
 			defer cancel()
 			for _, path := range args {
-				if err := repo.Pin(ctx, path); err != nil {
+				var err error
+				if cluster {
+					err = repo.SetClusterPin(ctx, path, true)
+				} else {
+					err = repo.SetLocalPin(path)
+				}
+				if err != nil {
 					return err
 				}
 			}
+			if err := wakeup.Notify(repo.Config.Repository, "pin policy changed"); err == nil {
+				fmt.Fprintf(a.Out, "Pin policy saved; background hydration scheduled for %d path(s)\n", len(args))
+				return nil
+			}
+			if cluster {
+				if err := peer.ReconcileMembership(ctx, repo); err != nil {
+					return err
+				}
+			}
+			for _, path := range args {
+				if err := repo.Fetch(ctx, path, ""); err != nil {
+					return fmt.Errorf("pin policy saved; hydration failed: %w", err)
+				}
+			}
+			fmt.Fprintf(a.Out, "Pinned and hydrated %d path(s)\n", len(args))
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&cluster, "cluster", false, "pin on every current and future cluster peer")
+	return cmd
 }
 
 func (a *App) unpinCommand() *cobra.Command {
-	return &cobra.Command{
+	var cluster bool
+	cmd := &cobra.Command{
 		Use: "unpin <path>...", Args: cobra.MinimumNArgs(1), Short: "Allow content to be evicted",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, err := a.open()
@@ -1069,14 +1095,29 @@ func (a *App) unpinCommand() *cobra.Command {
 				return err
 			}
 			defer repo.Close()
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
 			for _, path := range args {
-				if err := repo.Unpin(path); err != nil {
+				var err error
+				if cluster {
+					err = repo.SetClusterPin(ctx, path, false)
+				} else {
+					err = repo.Unpin(path)
+				}
+				if err != nil {
+					return err
+				}
+			}
+			if err := wakeup.Notify(repo.Config.Repository, "pin policy changed"); err != nil && cluster {
+				if err := peer.ReconcileMembership(ctx, repo); err != nil {
 					return err
 				}
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&cluster, "cluster", false, "remove the replicated cluster-wide pin policy")
+	return cmd
 }
 
 func (a *App) evictCommand() *cobra.Command {
@@ -1115,13 +1156,13 @@ func (a *App) cacheCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				pins, err := repo.Store.Pins()
+				pins, err := repo.Store.PinRecords()
 				if err != nil {
 					return err
 				}
 				fmt.Fprintf(a.Out, "%s / %s used\n", config.FormatSize(usage), config.FormatSize(repo.Config.CacheLimit))
-				for _, path := range pins {
-					fmt.Fprintf(a.Out, "pinned\t%s\n", path)
+				for _, pin := range pins {
+					fmt.Fprintf(a.Out, "pinned\t%s\t%s\n", pin.Scope, displayPinnedPath(pin.Path))
 				}
 				return nil
 			},
