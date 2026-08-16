@@ -171,25 +171,37 @@ Send the resulting `dfs1_...` invitation to the new peer through a trusted chann
 
 ## 4. Join and mount
 
-On the new peer, from the cloned DFS source directory:
+On the new peer, from the cloned DFS source directory, run the transactional
+setup command:
 
 ```sh
-./bin/dfs network discover
-./bin/dfs network join 'dfs1_...' \
-  ~/.local/share/dfs/repository --name laptop --cache-limit 50GiB
+./bin/dfs setup --name laptop --cache-limit 50GiB
 ```
 
-Install the managed mount service:
+Paste the invitation when prompted and approve the displayed filesystem once.
+DFS then prepares the repository, reconciles the reciprocal peer, installs the
+platform service, mounts `~/dfs_storage`, and verifies health. The invitation
+is read from standard input instead of appearing in shell history.
+
+Every completed step is recorded privately and atomically. If setup is
+interrupted or a dependency is temporarily unavailable, retry it without a new
+invitation:
 
 ```sh
-# Linux with systemd
-./scripts/install-cachyos.sh \
-  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
-
-# macOS with launchd
-./scripts/install-macos.sh \
-  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+./bin/dfs setup --resume
 ```
+
+To deliberately undo an incomplete setup, including the repository that this
+transaction created, run:
+
+```sh
+./bin/dfs setup --abort
+```
+
+Use `--repository` and `--mountpoint` on the initial command to override their
+defaults. Resume and abort use the paths saved by the active transaction. The
+lower-level `network join` and installer scripts remain available for debugging
+and manual deployments.
 
 Verify the peer:
 

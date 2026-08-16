@@ -28,6 +28,14 @@ type JoinResult struct {
 	ReverseRemoteName string
 }
 
+// PairOptions supplies durable client identity for a resumable pairing. When
+// StateDirectory is empty PairAndJoin retains its historical, ephemeral
+// behavior.
+type PairOptions struct {
+	PeerID         string
+	StateDirectory string
+}
+
 const pairingResumeFile = "pairing-resume.json"
 
 type pairingResume struct {
@@ -39,6 +47,10 @@ type pairingResume struct {
 }
 
 func PairAndJoin(ctx context.Context, encodedInvitation, destination, name string, cacheLimit int64, discoveryTimeout time.Duration, configureReverse bool) (*JoinResult, error) {
+	return PairAndJoinWithOptions(ctx, encodedInvitation, destination, name, cacheLimit, discoveryTimeout, configureReverse, PairOptions{})
+}
+
+func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination, name string, cacheLimit int64, discoveryTimeout time.Duration, configureReverse bool, options PairOptions) (*JoinResult, error) {
 	invitation, err := DecodeInvitation(encodedInvitation)
 	if err != nil {
 		return nil, err
@@ -50,9 +62,14 @@ func PairAndJoin(ctx context.Context, encodedInvitation, destination, name strin
 	if err != nil {
 		return nil, err
 	}
-	peerID, err := newPeerID()
-	if err != nil {
-		return nil, err
+	peerID := strings.TrimSpace(options.PeerID)
+	if peerID == "" {
+		peerID, err = newPeerID()
+		if err != nil {
+			return nil, err
+		}
+	} else if !validPeerID(peerID) {
+		return nil, errors.New("invalid persisted pairing peer ID")
 	}
 	request := PairStartRequest{
 		InvitationID: invitation.InvitationID, Secret: invitation.Secret,
@@ -62,11 +79,22 @@ func PairAndJoin(ctx context.Context, encodedInvitation, destination, name strin
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return nil, fmt.Errorf("create paired repository parent: %w", err)
 	}
-	temporary, err := os.MkdirTemp(parent, ".dfs-pair-")
-	if err != nil {
-		return nil, fmt.Errorf("create temporary pairing state: %w", err)
+	temporary := strings.TrimSpace(options.StateDirectory)
+	removeTemporary := temporary == ""
+	if removeTemporary {
+		temporary, err = os.MkdirTemp(parent, ".dfs-pair-")
+	} else {
+		temporary, err = filepath.Abs(temporary)
+		if err == nil {
+			err = os.MkdirAll(temporary, 0o700)
+		}
 	}
-	defer os.RemoveAll(temporary)
+	if err != nil {
+		return nil, fmt.Errorf("create pairing state: %w", err)
+	}
+	if removeTemporary {
+		defer os.RemoveAll(temporary)
+	}
 	identity, err := ensureTransportIdentity(ctx, temporary, peerID)
 	if err != nil {
 		return nil, err
@@ -349,6 +377,10 @@ func newPeerID() (string, error) {
 	digest := sha256.Sum256([]byte(secret))
 	return hex.EncodeToString(digest[:16]), nil
 }
+
+// NewPeerID creates a stable identity suitable for persisting before a
+// transactional pairing begins.
+func NewPeerID() (string, error) { return newPeerID() }
 
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]bool)

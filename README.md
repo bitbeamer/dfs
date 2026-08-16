@@ -135,14 +135,23 @@ In another terminal on that peer, create a one-use invitation. It expires after 
 dfs --repo ~/.local/share/dfs/repository pair invite
 ```
 
-The command prints an invitation beginning with `dfs1_`. Send it to the user of the new device through a trusted channel. On the new device, inspect nearby networks and join:
+The command prints an invitation beginning with `dfs1_`. Send it to the user of
+the new device through a trusted channel. On the new device, use the recommended
+transactional setup:
 
 ```sh
-dfs network discover
-dfs network join 'dfs1_...' \
-  ~/.local/share/dfs/repository --name laptop --cache-limit 50GiB
-dfs --repo ~/.local/share/dfs/repository mount ~/DFS
+dfs setup --name laptop --cache-limit 50GiB
 ```
+
+Paste the invitation at the prompt and approve the filesystem once. The command
+joins the network, installs the platform user service, mounts the default
+`~/dfs_storage` volume, and verifies it. It records progress privately, so an
+interrupted attempt continues with `dfs setup --resume`; `dfs setup --abort`
+removes an incomplete transaction and the repository it created. Reading the
+invitation from the prompt keeps its bearer secret out of shell history.
+
+`dfs network discover`, `dfs network join`, and the installer scripts remain as
+lower-level diagnostic and manual controls.
 
 The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; the forced command delegates Git and git-annex operations to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository. It also accepts one fixed, read-only DFS diagnostic command used by the mesh check. It does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
 

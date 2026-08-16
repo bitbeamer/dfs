@@ -660,6 +660,45 @@ func TestRevokeInvitationRemovesPendingSSHAuthorization(t *testing.T) {
 	}
 }
 
+func TestListInvitationsReleasesExpiredPairingLease(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sshDirectory := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := "dfs-peer-expired"
+	authorizedPath := filepath.Join(sshDirectory, "authorized_keys")
+	if err := os.WriteFile(authorizedPath, []byte("ssh-ed25519 pending "+marker+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(home, "repository")
+	record := invitationRecord{Version: ProtocolVersion, ID: "leased", SecretHash: secretHash("secret"),
+		FileSystemID: strings.Repeat("a", 40), ExpiresAt: time.Now().Add(time.Hour),
+		Pending: &pendingPair{AuthorizedMarker: marker, ExpiresAt: time.Now().Add(-time.Second)}}
+	if err := saveInvitation(repositoryPath, record); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := ListInvitations(repositoryPath, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].Pending {
+		t.Fatalf("released invitation = %#v", infos)
+	}
+	saved, err := loadInvitation(repositoryPath, record.ID)
+	if err != nil || saved.Pending != nil {
+		t.Fatalf("saved invitation pending = %#v, %v", saved.Pending, err)
+	}
+	authorized, err := os.ReadFile(authorizedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(authorized), marker) {
+		t.Fatalf("expired authorization remains: %s", authorized)
+	}
+}
+
 func TestPairingAttemptRateLimit(t *testing.T) {
 	service := &Service{attempts: make(map[string]attemptWindow)}
 	now := time.Now()

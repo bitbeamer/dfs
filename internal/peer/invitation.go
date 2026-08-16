@@ -17,7 +17,10 @@ import (
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
-const invitationDirectory = "invitations"
+const (
+	invitationDirectory = "invitations"
+	pairingLease        = 5 * time.Minute
+)
 
 type invitationRecord struct {
 	Version      int          `json:"version"`
@@ -110,6 +113,13 @@ func ListInvitations(repositoryPath string, now time.Time) ([]InvitationInfo, er
 			}
 			_ = os.Remove(filepath.Join(directory, entry.Name()))
 			continue
+		}
+		if record.Pending != nil && !record.Pending.ExpiresAt.After(now) {
+			_ = removeAuthorizedMarker(record.Pending.AuthorizedMarker)
+			record.Pending = nil
+			if err := saveInvitation(repositoryPath, record); err != nil {
+				return nil, err
+			}
 		}
 		result = append(result, InvitationInfo{ID: record.ID, ExpiresAt: record.ExpiresAt, Pending: record.Pending != nil})
 	}

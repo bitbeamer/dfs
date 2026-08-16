@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -17,6 +20,7 @@ import (
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
+	dfssetup "github.com/bitbeamer/dfs/internal/setup"
 	"github.com/spf13/cobra"
 )
 
@@ -41,7 +45,7 @@ func New() *cobra.Command {
 	root.SetErr(app.Err)
 	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (or set DFS_REPO)")
 	root.AddCommand(
-		app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(),
+		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(),
 		app.storageCommand(),
 		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
@@ -49,6 +53,85 @@ func New() *cobra.Command {
 		app.doctorCommand(),
 	)
 	return root
+}
+
+func (a *App) setupCommand() *cobra.Command {
+	var repositoryPath, mountpoint, name, limit, installer string
+	var discoveryTimeout time.Duration
+	var resume, abort, yes bool
+	command := &cobra.Command{
+		Use: "setup", Args: cobra.NoArgs,
+		Short: "Join, install, mount, and verify DFS as one recoverable transaction",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cacheLimit, err := config.ParseSize(limit)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
+			if abort {
+				if err := dfssetup.Abort(ctx, repositoryPath, installer, a.Out); err != nil {
+					return err
+				}
+				fmt.Fprintln(a.Out, "Aborted DFS setup and removed its managed state")
+				return nil
+			}
+			invitation := ""
+			reader := bufio.NewReader(cmd.InOrStdin())
+			if !resume {
+				fmt.Fprint(a.Out, "Paste DFS invitation: ")
+				invitation, err = reader.ReadString('\n')
+				if err != nil && !errors.Is(err, io.EOF) {
+					return fmt.Errorf("read DFS invitation: %w", err)
+				}
+				invitation = strings.TrimSpace(invitation)
+				if invitation == "" {
+					return errors.New("DFS invitation is empty")
+				}
+			}
+			approve := func(state *dfssetup.State) error {
+				shortID := state.FileSystemID
+				if len(shortID) > 12 {
+					shortID = shortID[:12]
+				}
+				if yes {
+					fmt.Fprintf(a.Out, "Approved joining DFS filesystem %s as %s\n", shortID, state.Name)
+					return nil
+				}
+				fmt.Fprintf(a.Out, "Join DFS filesystem %s as %s and install its managed mount? [y/N] ", shortID, state.Name)
+				answer, readErr := reader.ReadString('\n')
+				if readErr != nil && !errors.Is(readErr, io.EOF) {
+					return readErr
+				}
+				answer = strings.ToLower(strings.TrimSpace(answer))
+				if answer != "y" && answer != "yes" {
+					return errors.New("DFS setup was not approved; resume later with dfs setup --resume")
+				}
+				return nil
+			}
+			state, err := dfssetup.Run(ctx, dfssetup.Options{Invitation: invitation, Repository: repositoryPath, Mountpoint: mountpoint,
+				Name: name, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
+				Out: a.Out, Approve: approve})
+			if err != nil {
+				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup --resume or roll back with dfs setup --abort)", err)
+			}
+			fmt.Fprintf(a.Out, "DFS setup verified: %s is mounted at %s\n", state.NetworkName, state.Mountpoint)
+			return nil
+		},
+	}
+	home, _ := os.UserHomeDir()
+	command.Flags().StringVar(&repositoryPath, "repository", filepath.Join(home, ".local", "share", "dfs", "repository"), "private DFS repository path")
+	command.Flags().StringVar(&mountpoint, "mountpoint", filepath.Join(home, "dfs_storage"), "mounted DFS volume path")
+	command.Flags().StringVar(&name, "name", "", "peer name (defaults to hostname)")
+	command.Flags().StringVar(&limit, "cache-limit", "100GiB", "maximum local content cache")
+	command.Flags().DurationVar(&discoveryTimeout, "timeout", 3*time.Second, "how long to discover the invited network")
+	command.Flags().StringVar(&installer, "installer", "", "service installer script (advanced)")
+	_ = command.Flags().MarkHidden("installer")
+	command.Flags().BoolVar(&resume, "resume", false, "resume the recorded setup transaction")
+	command.Flags().BoolVar(&abort, "abort", false, "roll back the recorded setup transaction")
+	command.Flags().BoolVarP(&yes, "yes", "y", false, "approve setup without an interactive confirmation")
+	command.MarkFlagsMutuallyExclusive("resume", "abort")
+	return command
 }
 
 func (a *App) networkCommand() *cobra.Command {

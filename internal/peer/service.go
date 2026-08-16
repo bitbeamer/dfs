@@ -209,6 +209,13 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		return
 	}
 	delete(s.attempts, remote)
+	if record.Pending != nil && !record.Pending.ExpiresAt.After(time.Now()) {
+		if err := removeAuthorizedMarker(record.Pending.AuthorizedMarker); err != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "cannot release expired pairing session")
+			return
+		}
+		record.Pending = nil
+	}
 	if record.Pending != nil {
 		if record.Pending.PeerID != input.PeerID {
 			writeProtocolError(response, http.StatusConflict, "pairing invitation is already in use")
@@ -220,6 +227,7 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 			return
 		}
 		record.Pending.CompletionHash = secretHash(completionSecret)
+		record.Pending.ExpiresAt = minTime(record.ExpiresAt, time.Now().UTC().Add(pairingLease))
 		if err := saveInvitation(s.repo.Config.Repository, record); err != nil {
 			writeProtocolError(response, http.StatusInternalServerError, "cannot refresh pairing session")
 			return
@@ -276,7 +284,7 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		SessionID: sessionID, CompletionHash: secretHash(completionSecret), PeerID: input.PeerID,
 		PeerName: strings.TrimSpace(input.PeerName), ReverseURL: reverseURL, CloneURL: cloneURL,
 		AuthorizedMarker: authorizedMarker,
-		ExpiresAt:        minTime(record.ExpiresAt, time.Now().UTC().Add(30*time.Minute)),
+		ExpiresAt:        minTime(record.ExpiresAt, time.Now().UTC().Add(pairingLease)),
 	}
 	if err := saveInvitation(s.repo.Config.Repository, record); err != nil {
 		_ = removeAuthorizedMarker(authorizedMarker)
