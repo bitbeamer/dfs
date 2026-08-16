@@ -16,6 +16,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/repository"
+	"github.com/bitbeamer/dfs/internal/wakeup"
 )
 
 const transportKeyFile = "peer-ssh-key"
@@ -326,7 +327,16 @@ func ServeSSH(repositoryPath string) error {
 		}
 		command := exec.CommandContext(ctx, gitService, repositoryPath)
 		command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
-		return command.Run()
+		if err := command.Run(); err != nil {
+			return err
+		}
+		if service == "git-receive-pack" {
+			// QUIC receives run in the mount process and can wake its scheduler
+			// directly. SSH fallback receives run in this restricted child, so
+			// notify the mount through its repository-specific runtime socket.
+			_ = wakeup.Notify(repositoryPath, "managed Git receive")
+		}
+		return nil
 	}
 	annexShell, err := executablePath("git-annex-shell", "/opt/homebrew/bin", "/usr/local/bin")
 	if err != nil {

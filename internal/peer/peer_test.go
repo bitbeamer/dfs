@@ -23,6 +23,7 @@ import (
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
+	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/pion/mdns/v2"
 )
 
@@ -358,6 +359,32 @@ func TestServeSSHDispatchesRepositoryRestrictedGitService(t *testing.T) {
 	}
 	if string(data) != repositoryPath+"\n" {
 		t.Fatalf("Git service invocation:\n%s", data)
+	}
+}
+
+func TestServeSSHReceiveNotifiesRunningMount(t *testing.T) {
+	directory := t.TempDir()
+	script := filepath.Join(directory, "git-receive-pack")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	repositoryPath := filepath.Join(directory, "repository")
+	listener, err := wakeup.Listen(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	t.Setenv("SSH_ORIGINAL_COMMAND", "git-receive-pack '"+repositoryPath+"'")
+	if err := ServeSSH(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	reason, err := listener.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason != "managed Git receive" {
+		t.Fatalf("event = %q", reason)
 	}
 }
 

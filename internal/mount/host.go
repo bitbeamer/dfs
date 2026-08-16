@@ -18,6 +18,7 @@ import (
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/syncer"
+	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
 	"github.com/hanwen/go-fuse/v2/fuse/pathfs"
@@ -150,6 +151,22 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
 	repo.SetManagedFetcher(managed.FetchPath)
 	scheduler.SetReconciler(func(ctx context.Context) error { return peer.ReconcileMembership(ctx, repo) })
+	eventListener, err := wakeup.Listen(repo.Config.Repository)
+	if err != nil {
+		return fmt.Errorf("listen for repository events: %w", err)
+	}
+	defer eventListener.Close()
+	go func() {
+		for {
+			reason, receiveErr := eventListener.Receive()
+			if receiveErr != nil {
+				return
+			}
+			if reason != "" {
+				scheduler.Notify(reason)
+			}
+		}
+	}()
 
 	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))
 	// The annex working tree may replace a regular file with a symlink after a
