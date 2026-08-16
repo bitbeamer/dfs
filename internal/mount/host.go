@@ -173,8 +173,6 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
 	}
-	scheduler.Start()
-	defer scheduler.Stop()
 	if !options.DisablePeerDiscovery {
 		peerService, peerErr := peer.Start(repo, logger, options.PairingPort)
 		if peerErr != nil {
@@ -190,6 +188,12 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 			}()
 		}
 	}
+	// Bind the peer transport before starting background synchronization. A
+	// migration commit can trigger an immediate sync; starting it first could
+	// hold the repository lock until the peer startup context expired and leave
+	// the configured port temporarily unbound.
+	scheduler.Start()
+	defer scheduler.Stop()
 	logger.Info("mount ready", "mountpoint", mountpoint)
 	health.update("ready", true, nil)
 	notifySystemd("READY=1\nSTATUS=DFS mounted at " + mountpoint)
