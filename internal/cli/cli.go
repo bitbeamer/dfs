@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	dfscore "github.com/bitbeamer/dfs/internal/daemon"
 	"github.com/bitbeamer/dfs/internal/managed"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/peer"
@@ -49,7 +50,7 @@ func New() *cobra.Command {
 	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (or set DFS_REPO)")
 	root.AddCommand(
 		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
-		app.storageCommand(),
+		app.storageCommand(), app.daemonCommand(),
 		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
 		app.cacheCommand(), app.historyCommand(), app.restoreCommand(), app.conflictsCommand(),
@@ -653,8 +654,6 @@ func (a *App) storageCommand() *cobra.Command {
 
 func (a *App) mountCommand() *cobra.Command {
 	var logLevel, logFormat, logFile string
-	var pairingPort int
-	var discovery bool
 	var fuseDebug, recoverStaleSession, managed bool
 	cmd := &cobra.Command{
 		Use: "mount <mountpoint>", Args: cobra.ExactArgs(1), Short: "Mount the DFS namespace and run automatic sync",
@@ -680,8 +679,7 @@ func (a *App) mountCommand() *cobra.Command {
 			}
 			return dfsmount.Run(repo, args[0], dfsmount.Options{
 				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug,
-				RecoverStaleSession: recoverStaleSession, Signals: mountSignals, PairingPort: pairingPort,
-				DisablePeerDiscovery: !discovery,
+				RecoverStaleSession: recoverStaleSession, Signals: mountSignals,
 			})
 		},
 	}
@@ -691,8 +689,42 @@ func (a *App) mountCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&fuseDebug, "fuse-debug", false, "log low-level FUSE protocol requests and enable debug logging (very noisy)")
 	cmd.Flags().BoolVar(&recoverStaleSession, "recover-stale-session", false, "take over after verifying another host's recorded mount is inactive")
 	cmd.Flags().BoolVar(&managed, "managed", false, "run under a service manager without interactive output")
-	cmd.Flags().IntVar(&pairingPort, "pair-port", peer.DefaultPairingPort, "TCP port for authenticated peer pairing")
-	cmd.Flags().BoolVar(&discovery, "discovery", true, "advertise this DFS network and accept authenticated pairing")
+	return cmd
+}
+
+func (a *App) daemonCommand() *cobra.Command {
+	var logLevel, logFormat, logFile, mountpoint string
+	var pairingPort int
+	var managed bool
+	cmd := &cobra.Command{Use: "daemon", Args: cobra.NoArgs, Short: "Run the frontend-independent DFS core",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			signals := make(chan os.Signal, 2)
+			signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(signals)
+			logger, closer, err := newMountLogger(logLevel, logFormat, logFile, a.Err, false)
+			if err != nil {
+				return err
+			}
+			if closer != nil {
+				defer closer.Close()
+			}
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			if !managed {
+				fmt.Fprintf(a.Out, "Running DFS core for %s; press Ctrl-C to stop\n", repo.Config.Repository)
+			}
+			return dfscore.Run(repo, dfscore.Options{Context: cmd.Context(), Logger: logger, Signals: signals,
+				PairingPort: pairingPort, Mountpoint: mountpoint})
+		}}
+	cmd.Flags().StringVar(&logLevel, "log-level", "error", "logging level: debug, info, warn, or error")
+	cmd.Flags().StringVar(&logFormat, "log-format", "text", "structured log format: text or json")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "append logs to this file as well as stderr")
+	cmd.Flags().StringVar(&mountpoint, "mountpoint", "", "configured frontend mountpoint for status display")
+	cmd.Flags().IntVar(&pairingPort, "pair-port", peer.DefaultPairingPort, "UDP port for authenticated peer transport")
+	cmd.Flags().BoolVar(&managed, "managed", false, "run under a service manager without interactive output")
 	return cmd
 }
 
@@ -729,7 +761,7 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 			if err != nil {
 				return errors.Join(environmentErr, err)
 			}
-			report, healthErr := dfsmount.CheckHealth(repositoryPath)
+			report, healthErr := dfscore.CheckHealth(repositoryPath)
 			var clusterReport *peer.MeshReport
 			var clusterErr error
 			if cluster && healthErr == nil {
@@ -750,9 +782,9 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 				encoder := json.NewEncoder(a.Out)
 				encoder.SetIndent("", "  ")
 				if err := encoder.Encode(struct {
-					Environment environmentHealth     `json:"environment"`
-					Service     dfsmount.HealthReport `json:"service"`
-					Cluster     *peer.MeshReport      `json:"cluster,omitempty"`
+					Environment environmentHealth    `json:"environment"`
+					Service     dfscore.HealthReport `json:"service"`
+					Cluster     *peer.MeshReport     `json:"cluster,omitempty"`
 				}{Environment: environment, Service: report, Cluster: clusterReport}); err != nil {
 					return err
 				}
@@ -779,12 +811,12 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 	return cmd
 }
 
-func printServiceHealth(output io.Writer, report dfsmount.HealthReport) {
+func printServiceHealth(output io.Writer, report dfscore.HealthReport) {
 	fmt.Fprintln(output, "DFS HEALTH")
 	printServiceDetails(output, report)
 }
 
-func printServiceDetails(output io.Writer, report dfsmount.HealthReport) {
+func printServiceDetails(output io.Writer, report dfscore.HealthReport) {
 	printServiceSummary(output, report)
 	if report.Operational != nil {
 		printNodeHealth(output, *report.Operational)
@@ -809,8 +841,8 @@ func printEnvironmentHealth(output io.Writer, report environmentHealth) {
 	_ = table.Flush()
 }
 
-func printServiceSummary(output io.Writer, report dfsmount.HealthReport) {
-	fmt.Fprintf(output, "Service: %s  Peer: %s  PID: %d  Mount: %s  Updated: %s\n",
+func printServiceSummary(output io.Writer, report dfscore.HealthReport) {
+	fmt.Fprintf(output, "Core: %s  Peer: %s  PID: %d  Mount: %s  Updated: %s\n",
 		strings.ToUpper(report.State), report.Peer, report.PID, report.Mountpoint, formatHealthTime(report.UpdatedAt))
 }
 

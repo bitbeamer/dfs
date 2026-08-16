@@ -1,4 +1,4 @@
-package mount
+package daemon
 
 import (
 	"net"
@@ -13,17 +13,14 @@ import (
 
 func TestHealthReportRoundTripAndCheck(t *testing.T) {
 	repository := t.TempDir()
-	mountpoint := t.TempDir()
 	hostname, err := os.Hostname()
 	if err != nil {
 		t.Fatal(err)
 	}
-	report := HealthReport{
-		Version: healthVersion, State: "ready", Healthy: true, PID: os.Getpid(),
-		Hostname: hostname, Peer: "test", Repository: repository, Mountpoint: mountpoint,
+	report := HealthReport{Version: healthVersion, Mode: "core", State: "ready", Healthy: true, PID: os.Getpid(),
+		Hostname: hostname, Peer: "test", Repository: repository, Mountpoint: "/configured/mount",
 		StartedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
-		Operational: &peer.DiagnosticReport{Version: 2, PeerName: "test", ReconciliationStatus: "ready"},
-	}
+		Operational: &peer.DiagnosticReport{Version: 2, PeerName: "test", ReconciliationStatus: "ready"}}
 	if err := writeHealth(HealthPath(repository), report); err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +28,7 @@ func TestHealthReportRoundTripAndCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if checked.Peer != "test" || checked.Mountpoint != mountpoint || checked.Operational == nil || checked.Operational.ReconciliationStatus != "ready" {
+	if checked.Peer != "test" || checked.Operational == nil {
 		t.Fatalf("checked health = %+v", checked)
 	}
 	info, err := os.Stat(HealthPath(repository))
@@ -45,20 +42,14 @@ func TestHealthReportRoundTripAndCheck(t *testing.T) {
 
 func TestHealthCheckRejectsStoppedAndStaleReports(t *testing.T) {
 	repository := t.TempDir()
-	report := HealthReport{
-		Version: healthVersion, State: "stopped", PID: os.Getpid(),
-		Repository: repository, Mountpoint: t.TempDir(), UpdatedAt: time.Now().UTC(),
-	}
+	report := HealthReport{Version: healthVersion, Mode: "core", State: "stopped", PID: os.Getpid(), Repository: repository, UpdatedAt: time.Now().UTC()}
 	if err := writeHealth(HealthPath(repository), report); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := CheckHealth(repository); err == nil || !strings.Contains(err.Error(), "stopped") {
 		t.Fatalf("stopped health error = %v", err)
 	}
-
-	report.State = "ready"
-	report.Healthy = true
-	report.UpdatedAt = time.Now().Add(-healthMaxAge - time.Second)
+	report.State, report.Healthy, report.UpdatedAt = "ready", true, time.Now().Add(-healthMaxAge-time.Second)
 	if err := writeHealth(HealthPath(repository), report); err != nil {
 		t.Fatal(err)
 	}
@@ -68,8 +59,7 @@ func TestHealthCheckRejectsStoppedAndStaleReports(t *testing.T) {
 }
 
 func TestReadHealthExplainsMissingReport(t *testing.T) {
-	repository := filepath.Join(t.TempDir(), "repository")
-	if _, err := ReadHealth(repository); err == nil || !strings.Contains(err.Error(), "has not started") {
+	if _, err := ReadHealth(filepath.Join(t.TempDir(), "repository")); err == nil || !strings.Contains(err.Error(), "has not started") {
 		t.Fatalf("missing health error = %v", err)
 	}
 }
@@ -80,30 +70,23 @@ func TestNotifySystemdSendsDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 	socketPath := temporary.Name()
-	if err := temporary.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(socketPath); err != nil {
-		t.Fatal(err)
-	}
+	_ = temporary.Close()
+	_ = os.Remove(socketPath)
 	t.Cleanup(func() { _ = os.Remove(socketPath) })
-	address := &net.UnixAddr{Name: socketPath, Net: "unixgram"}
-	listener, err := net.ListenUnixgram("unixgram", address)
+	listener, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: socketPath, Net: "unixgram"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
 	t.Setenv("NOTIFY_SOCKET", socketPath)
-	notifySystemd("READY=1\nSTATUS=mounted")
-	if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
+	notifySystemd("READY=1\nSTATUS=core")
+	_ = listener.SetReadDeadline(time.Now().Add(time.Second))
 	buffer := make([]byte, 128)
 	count, _, err := listener.ReadFromUnix(buffer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(buffer[:count]); got != "READY=1\nSTATUS=mounted" {
+	if got := string(buffer[:count]); got != "READY=1\nSTATUS=core" {
 		t.Fatalf("notification = %q", got)
 	}
 }

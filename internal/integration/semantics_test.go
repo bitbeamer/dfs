@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	dfscore "github.com/bitbeamer/dfs/internal/daemon"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"golang.org/x/sys/unix"
@@ -490,6 +491,7 @@ func mountSemanticTestFS(t *testing.T) (string, *repository.Repository) {
 		t.Fatal(err)
 	}
 	mountpoint := filepath.Join(home, "mnt")
+	startTestCore(t, repo.Config.Repository, mountpoint)
 	mountContext, cancelMount := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -497,7 +499,7 @@ func mountSemanticTestFS(t *testing.T) (string, *repository.Repository) {
 		errCh <- dfsmount.Run(repo, mountpoint, dfsmount.Options{Context: mountContext, Logger: logger})
 	}()
 	waitForPath(t, filepath.Join(mountpoint, readyName), 10*time.Second)
-	if health, err := dfsmount.CheckHealth(repo.Config.Repository); err != nil || health.State != "ready" {
+	if health, err := dfscore.CheckHealth(repo.Config.Repository); err != nil || health.State != "ready" {
 		t.Fatalf("mount health after startup = %+v, %v", health, err)
 	}
 	t.Cleanup(func() {
@@ -506,9 +508,6 @@ func mountSemanticTestFS(t *testing.T) (string, *repository.Repository) {
 		case err := <-errCh:
 			if err != nil {
 				t.Errorf("mount shutdown: %v", err)
-			}
-			if health, healthErr := dfsmount.ReadHealth(repo.Config.Repository); healthErr != nil || health.State != "stopped" {
-				t.Errorf("mount health after shutdown = %+v, %v", health, healthErr)
 			}
 		case <-time.After(10 * time.Second):
 			t.Error("mount did not stop")

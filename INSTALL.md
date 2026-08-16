@@ -81,10 +81,9 @@ make build
 ```
 
 Do not copy `bin/dfs` over the installed binary while a daemon is running.
-Rerun the installer for the current platform. The installer stops that managed
-mount, installs the newly built binary, reloads its service definition, starts
-the mount, and waits for DFS to report healthy. Let the command finish; if it is
-interrupted after stopping the old daemon, rerun the same installer command.
+Rerun the installer for the current platform. It stops the mount frontend and
+core daemon, installs the binary, reloads both service definitions, starts the
+core before the mount, and waits for health and mount readiness.
 
 The installed executable is shared, but every active filesystem has its own
 service. On a host with multiple DFS filesystems, rerun the installer once for
@@ -100,7 +99,7 @@ cd ~/dfs
   ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 
 DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
-systemctl --user --no-pager --full status "dfs-mount-$DFS_INSTANCE"
+systemctl --user --no-pager --full status "dfs-core-$DFS_INSTANCE" "dfs-mount-$DFS_INSTANCE"
 ~/.local/bin/dfs --repo ~/.local/share/dfs/repository health
 ```
 
@@ -112,6 +111,7 @@ cd ~/dfs
   ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 
 DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+launchctl print "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
 "$HOME/Library/Application Support/DFS/bin/dfs" \
   --repo ~/.local/share/dfs/repository health
@@ -169,9 +169,9 @@ Use a unique repository and mountpoint for every logical filesystem:
   ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 ```
 
-The installer creates a filesystem-specific systemd service or launchd agent,
-starts it, and waits for the mount to become healthy. It now advertises the
-filesystem to nearby peers. `dfs setup` currently joins an existing filesystem;
+The installer creates a filesystem-specific core service and mount frontend,
+starts the core first, and waits for both health and mount readiness. The core
+advertises the filesystem to nearby peers. `dfs setup` currently joins an existing filesystem;
 creation of the first peer is the explicit `init` plus installer flow above.
 
 ## 3. Join and approve
@@ -241,7 +241,7 @@ dfs --repo ~/.local/share/dfs/repository peer list
 ```
 
 `health` checks required commands and the platform FUSE dependency, then reports
-the managed mount plus filesystem identity, logical size and file count,
+the independent core plus filesystem identity, logical size and file count,
 instance port, role, repository and metadata size, cache and disk use, content
 holdings, pins, reconciliation, and timestamped peer observations.
 `health --cluster` actively collects those details from all responding members,

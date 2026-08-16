@@ -14,10 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/daemon"
 	"github.com/bitbeamer/dfs/internal/managed"
-	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/bitbeamer/dfs/internal/syncer"
 	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
@@ -25,14 +24,18 @@ import (
 )
 
 type Options struct {
-	Context              context.Context
-	Logger               *slog.Logger
-	FUSEDebug            bool
-	RecoverStaleSession  bool
-	Signals              <-chan os.Signal
-	PairingPort          int
-	DisablePeerDiscovery bool
+	Context             context.Context
+	Logger              *slog.Logger
+	FUSEDebug           bool
+	RecoverStaleSession bool
+	Signals             <-chan os.Signal
 }
+
+type daemonNotifier struct{ repository string }
+
+func (n daemonNotifier) Notify(reason string) { _ = wakeup.Notify(n.repository, reason) }
+func (daemonNotifier) BeginWrite()            {}
+func (daemonNotifier) EndWrite()              {}
 
 type fuseLogWriter struct{ logger *slog.Logger }
 
@@ -118,15 +121,9 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	}
 	logger = logger.With("peer", repo.Config.Name)
 	repo.SetLogger(logger)
-	health := newHealthReporter(repo.Config.Name, repo.Config.Repository, mountpoint, logger)
-	health.update("starting", false, nil)
-	notifySystemd("STATUS=Starting DFS mount")
-	defer func() {
-		if runErr != nil {
-			health.update("failed", false, runErr)
-			notifySystemd("STATUS=DFS mount failed: " + runErr.Error())
-		}
-	}()
+	if _, err := daemon.CheckHealth(repo.Config.Repository); err != nil {
+		return fmt.Errorf("DFS core daemon is not ready: %w", err)
+	}
 	logger.Info("mount starting",
 		"repository", repo.Config.Repository,
 		"mountpoint", mountpoint,
@@ -152,30 +149,13 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	if clearedStale {
 		logger.Info("stale mountpoint detached", "mountpoint", mountpoint)
 	}
-	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
 	repo.SetManagedFetcher(managed.FetchPath)
 	repo.SetManagedRangeFetcher(managed.FetchRange)
-	scheduler.SetReconciler(func(ctx context.Context) error { return peer.ReconcileMembership(ctx, repo) })
-	eventListener, err := wakeup.Listen(repo.Config.Repository)
-	if err != nil {
-		return fmt.Errorf("listen for repository events: %w", err)
-	}
-	defer eventListener.Close()
-	go func() {
-		for {
-			reason, receiveErr := eventListener.Receive()
-			if receiveErr != nil {
-				return
-			}
-			if reason != "" {
-				scheduler.Notify(reason)
-			}
-		}
-	}()
+	notifier := daemonNotifier{repository: repo.Config.Repository}
 
 	operationCtx, cancelOperations := context.WithCancel(ctx)
 	defer cancelOperations()
-	filesystem := NewFileSystemWithContext(operationCtx, repo, scheduler, logger.With("component", "filesystem"))
+	filesystem := NewFileSystemWithContext(operationCtx, repo, notifier, logger.With("component", "filesystem"))
 	// The annex working tree may replace a regular file with a symlink after a
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
@@ -188,7 +168,22 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger:      logger.With("component", "fuse"),
 	}
 	filesystem.cacheInvalidator = invalidator
-	scheduler.SetEntryInvalidator(invalidator)
+	frontendEvents, err := wakeup.ListenFrontend(repo.Config.Repository)
+	if err != nil {
+		return fmt.Errorf("listen for core namespace events: %w", err)
+	}
+	defer frontendEvents.Close()
+	go func() {
+		for {
+			path, receiveErr := frontendEvents.Receive()
+			if receiveErr != nil {
+				return
+			}
+			if path != "" {
+				invalidator.InvalidateEntry(path)
+			}
+		}
+	}()
 	mountOptions := &fuse.MountOptions{
 		FsName: "dfs", Name: "dfs", DisableXAttrs: false,
 		Options: []string{"default_permissions"}, Debug: options.FUSEDebug,
@@ -213,43 +208,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
 	}
-	if !options.DisablePeerDiscovery {
-		peerService, peerErr := peer.Start(repo, logger, options.PairingPort, func(reason string, paths []string) {
-			scheduler.Invalidate(paths)
-			scheduler.Notify(reason)
-		})
-		if peerErr != nil {
-			// Multicast is unavailable on some networks. Keep the filesystem usable,
-			// but make the missing onboarding service visible in managed-service logs.
-			logger.Warn("peer discovery unavailable", "error", peerErr)
-		} else {
-			defer func() {
-				if err := peerService.Close(); err != nil {
-					logger.Warn("stopping peer discovery failed", "error", err)
-				}
-			}()
-		}
-	}
-	// Bind the peer transport before starting background synchronization. A
-	// migration commit can trigger an immediate sync; starting it first could
-	// hold the repository lock until the peer startup context expired and leave
-	// the configured port temporarily unbound.
-	scheduler.Start()
-	defer scheduler.Stop()
 	logger.Info("mount ready", "mountpoint", mountpoint)
-	health.update("ready", true, nil)
-	notifySystemd("READY=1\nSTATUS=DFS mounted at " + mountpoint)
-	heartbeatStop := make(chan struct{})
-	heartbeatDone := make(chan struct{})
-	observationDone := make(chan struct{})
-	go func() {
-		health.heartbeat(heartbeatStop)
-		close(heartbeatDone)
-	}()
-	go func() {
-		health.observe(heartbeatStop, repo, repo.Config.SyncInterval)
-		close(observationDone)
-	}()
 	serveDone := make(chan struct{})
 	go func() {
 		server.Serve()
@@ -260,13 +219,8 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	// an on-demand content fetch must not keep macFUSE teardown blocked after the
 	// daemon has received SIGTERM.
 	cancelOperations()
-	close(heartbeatStop)
-	<-heartbeatDone
-	<-observationDone
 	if shutdown {
 		logger.Info("shutdown requested", "reason", shutdownReason)
-		health.update("stopping", false, nil)
-		notifySystemd("STOPPING=1\nSTATUS=Unmounting DFS")
 		if err := unmountAndWait(server, serveDone, func() error { return forceUnmount(mountpoint) }, normalUnmountGrace); err != nil {
 			logger.Error("automatic unmount failed",
 				"mountpoint", mountpoint,
@@ -277,7 +231,6 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		}
 	}
 	logger.Info("mount stopped", "mountpoint", mountpoint)
-	health.update("stopped", false, nil)
 	return nil
 }
 

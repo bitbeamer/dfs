@@ -127,18 +127,20 @@ Initialize the first peer, then install its managed mount service:
   ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 ```
 
-The installer copies the binary and creates a user service whose name contains
-the filesystem's 12-character ID. systemd or launchd starts the mount at login,
-restarts it after failure, records logs, and uses DFS health reporting.
+The installer copies the binary and creates two filesystem-specific user
+services: an independent core daemon and a FUSE frontend. systemd or launchd
+starts the core first, then the mount, and restarts either after failure.
 
-A manual foreground mount is also available for development:
+A manual foreground core and mount are also available for development. Run
+them in separate terminals:
 
 ```sh
+./bin/dfs --repo ~/.local/share/dfs/repository daemon
 ./bin/dfs --repo ~/.local/share/dfs/repository mount ~/dfs_storage
 ```
 
-Press Ctrl-C to unmount it cleanly, or run `dfs unmount ~/dfs_storage` in
-another terminal.
+Stopping or unmounting the frontend does not stop synchronization, QUIC,
+pin hydration, cache maintenance, or health. Stop the daemon separately.
 
 ## Add another peer
 
@@ -240,11 +242,10 @@ second peer can join with:
   --name laptop-archive --cache-limit 25GiB
 ```
 
-Each managed instance receives a filesystem-specific systemd unit or launchd
-label, separate health/runtime data, separate logs, and the first available
-transport port. Installing or uninstalling one instance does not replace the
-others. Rerun the installer once for every repository after building a new DFS
-binary so every active daemon is upgraded.
+Each managed instance receives filesystem-specific core and mount services,
+separate health/runtime data, separate logs, and the first available transport
+port. Installing or uninstalling one instance does not replace the others.
+Rerun the installer once for every repository after building a new DFS binary.
 
 ## Work with files and local storage
 
@@ -353,20 +354,21 @@ For a repository, derive the managed instance ID with:
 DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
 ```
 
-On systemd:
+On systemd (the core owns health and networking; the mount is a frontend):
 
 ```sh
-systemctl --user status "dfs-mount-$DFS_INSTANCE"
-journalctl --user -u "dfs-mount-$DFS_INSTANCE" -f
-systemctl --user restart "dfs-mount-$DFS_INSTANCE"
+systemctl --user status "dfs-core-$DFS_INSTANCE" "dfs-mount-$DFS_INSTANCE"
+journalctl --user -u "dfs-core-$DFS_INSTANCE" -f
+systemctl --user restart "dfs-core-$DFS_INSTANCE"
 ```
 
 On launchd:
 
 ```sh
+launchctl print "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
-launchctl kickstart -k "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
-tail -F "$HOME/Library/Logs/DFS/mount-$DFS_INSTANCE.stderr.log"
+launchctl kickstart -k "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
+tail -F "$HOME/Library/Logs/DFS/core-$DFS_INSTANCE.stderr.log"
 ```
 
 Remove one managed service while retaining its repository and the shared
@@ -377,8 +379,8 @@ installed binary with:
 ./scripts/install-macos.sh --uninstall ~/.local/share/dfs/repository
 ```
 
-Managed services use JSON `info` logging. Manual mounts default to structured
-text at `error` level; use `--log-level info`, `--log-level debug`,
+Managed services use JSON `info` logging. Manual daemons and mounts default to
+structured text at `error` level; use `--log-level info`, `--log-level debug`,
 `--log-file <path>`, or the very noisy `--fuse-debug` as needed.
 
 Mount startup holds an exclusive repository session and performs conservative

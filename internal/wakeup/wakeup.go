@@ -1,4 +1,5 @@
-// Package wakeup delivers repository-specific events to a running DFS mount.
+// Package wakeup delivers repository-specific events between the DFS core and
+// its local frontends.
 package wakeup
 
 import (
@@ -17,6 +18,14 @@ type Listener struct {
 }
 
 func Path(repository string) string {
+	return socketPath(repository, "events")
+}
+
+func FrontendPath(repository string) string {
+	return socketPath(repository, "frontend")
+}
+
+func socketPath(repository, kind string) string {
 	absolute, err := filepath.Abs(repository)
 	if err != nil {
 		absolute = repository
@@ -24,11 +33,18 @@ func Path(repository string) string {
 	digest := sha256.Sum256([]byte(filepath.Clean(absolute)))
 	// Darwin limits Unix-domain socket paths to roughly 100 bytes. A fixed,
 	// short runtime location also supports repositories nested under long paths.
-	return filepath.Join("/tmp", fmt.Sprintf("dfs-%d-%x-events.sock", os.Getuid(), digest[:8]))
+	return filepath.Join("/tmp", fmt.Sprintf("dfs-%d-%x-%s.sock", os.Getuid(), digest[:8], kind))
 }
 
 func Listen(repository string) (*Listener, error) {
-	path := Path(repository)
+	return listen(Path(repository))
+}
+
+func ListenFrontend(repository string) (*Listener, error) {
+	return listen(FrontendPath(repository))
+}
+
+func listen(path string) (*Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -76,11 +92,19 @@ func (l *Listener) Close() error {
 }
 
 func Notify(repository, reason string) error {
-	connection, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: Path(repository), Net: "unixgram"})
+	return notify(Path(repository), reason)
+}
+
+func NotifyFrontend(repository, path string) error {
+	return notify(FrontendPath(repository), path)
+}
+
+func notify(socket, value string) error {
+	connection, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: socket, Net: "unixgram"})
 	if err != nil {
 		return err
 	}
 	defer connection.Close()
-	_, err = connection.Write([]byte(reason))
+	_, err = connection.Write([]byte(value))
 	return err
 }

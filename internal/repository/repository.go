@@ -19,6 +19,7 @@ import (
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 const RelayRemote = "dfs-relay"
@@ -256,13 +257,51 @@ func (r *Repository) SetNetworkName(name string) error {
 func (r *Repository) WithWorkTreeLock(fn func() error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	unlock, err := r.lockWorkTreeProcess(context.Background())
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return fn()
 }
 
 func (r *Repository) CommitPending(ctx context.Context, message string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	unlock, err := r.lockWorkTreeProcess(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
 	return r.commitPendingLocked(ctx, message)
+}
+
+func (r *Repository) lockWorkTreeProcess(ctx context.Context) (func(), error) {
+	if strings.TrimSpace(r.Config.Repository) == "" {
+		return func() {}, nil
+	}
+	path := filepath.Join(r.Config.Repository, filepath.FromSlash(config.Directory), "worktree.lock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
+			return func() { _ = unix.Flock(int(file.Fd()), unix.LOCK_UN); _ = file.Close() }, nil
+		} else if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			_ = file.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // RepairLegacyPrivateState removes runtime files that older DFS versions kept
@@ -383,6 +422,11 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 func (r *Repository) ApplyReceived(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	unlock, err := r.lockWorkTreeProcess(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	refs, err := r.runner.Run(ctx, "git", "for-each-ref", "--format=%(refname)", "refs/heads/dfs-incoming", "refs/heads/synced/main")
 	if err != nil {
 		return err
@@ -404,11 +448,18 @@ func (r *Repository) SyncDirectional(ctx context.Context, metadataOnly, pull, pu
 		return err
 	}
 	r.mu.Lock()
+	processUnlock, lockErr := r.lockWorkTreeProcess(ctx)
+	if lockErr != nil {
+		r.mu.Unlock()
+		return lockErr
+	}
 	if _, err := r.commitPendingLocked(ctx, "Synchronize local changes"); err != nil {
+		processUnlock()
 		r.mu.Unlock()
 		return err
 	}
 	remotes, err := r.remotesLocked(ctx)
+	processUnlock()
 	r.mu.Unlock()
 	if err != nil {
 		return err
@@ -428,7 +479,13 @@ func (r *Repository) SyncDirectional(ctx context.Context, metadataOnly, pull, pu
 	}
 	if len(remotes) == 0 {
 		r.mu.Lock()
+		unlock, lockErr := r.lockWorkTreeProcess(ctx)
+		if lockErr != nil {
+			r.mu.Unlock()
+			return lockErr
+		}
 		_, err := r.runner.Run(ctx, "git", args...)
+		unlock()
 		r.mu.Unlock()
 		return err
 	}
@@ -512,7 +569,15 @@ func (r *Repository) SyncDirectional(ctx context.Context, metadataOnly, pull, pu
 			for attempt := 0; attempt < remoteSyncAttempts; attempt++ {
 				syncCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
 				r.mu.Lock()
+				unlock, lockErr := r.lockWorkTreeProcess(syncCtx)
+				if lockErr != nil {
+					r.mu.Unlock()
+					cancel()
+					syncErr = lockErr
+					break
+				}
 				_, syncErr = r.runner.Run(syncCtx, "git", remoteArgs...)
+				unlock()
 				r.mu.Unlock()
 				cancel()
 				if syncErr == nil {

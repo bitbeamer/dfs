@@ -23,10 +23,11 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   instance=${filesystem_id:0:12}
   [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
   label="io.bitbeamer.dfs.mount.$instance"
-  plist_path="$plist_dir/$label.plist"
+  core_label="io.bitbeamer.dfs.core.$instance"
   launchctl bootout "$domain/$label" 2>/dev/null || true
-  rm -f "$plist_path"
-  printf 'Removed %s (application retained at %s).\n' "$label" "$app_dir"
+  launchctl bootout "$domain/$core_label" 2>/dev/null || true
+  rm -f "$plist_dir/$label.plist" "$plist_dir/$core_label.plist"
+  printf 'Removed %s and %s (application retained at %s).\n' "$core_label" "$label" "$app_dir"
   exit 0
 fi
 
@@ -66,6 +67,8 @@ instance=${filesystem_id:0:12}
 [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
 label="io.bitbeamer.dfs.mount.$instance"
 plist_path="$plist_dir/$label.plist"
+core_label="io.bitbeamer.dfs.core.$instance"
+core_plist_path="$plist_dir/$core_label.plist"
 legacy_plist_path="$plist_dir/io.bitbeamer.dfs.mount.plist"
 
 for command in codesign git git-annex launchctl plutil; do
@@ -81,15 +84,16 @@ if [[ -f "$legacy_plist_path" ]] && grep -Fq -- "$repository" "$legacy_plist_pat
   launchctl bootout "$domain/io.bitbeamer.dfs.mount" 2>/dev/null || true
   rm -f "$legacy_plist_path"
 fi
-if launchctl print "$domain/$label" >/dev/null 2>&1; then
-  launchctl bootout "$domain/$label"
+if launchctl print "$domain/$label" >/dev/null 2>&1 || launchctl print "$domain/$core_label" >/dev/null 2>&1; then
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  launchctl bootout "$domain/$core_label" 2>/dev/null || true
   for _ in $(seq 1 30); do
     "$source_binary" --repo "$repository" health >/dev/null 2>&1 || break
     sleep 1
   done
 fi
 if "$source_binary" --repo "$repository" health >/dev/null 2>&1; then
-  printf 'Repository is already mounted outside the managed service; stop that mount before installing.\n' >&2
+  printf 'Repository core is already running outside the managed service; stop it before installing.\n' >&2
   exit 1
 fi
 if [[ "$source_binary" != "$install_path" ]]; then
@@ -140,6 +144,43 @@ repository_xml=$(xml_escape "$repository")
 mountpoint_xml=$(xml_escape "$mountpoint")
 stdout_xml=$(xml_escape "$log_dir/mount-$instance.stdout.log")
 stderr_xml=$(xml_escape "$log_dir/mount-$instance.stderr.log")
+core_stdout_xml=$(xml_escape "$log_dir/core-$instance.stdout.log")
+core_stderr_xml=$(xml_escape "$log_dir/core-$instance.stderr.log")
+
+cat >"$core_plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$core_label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$binary_xml</string>
+    <string>--repo</string>
+    <string>$repository_xml</string>
+    <string>daemon</string>
+    <string>--managed</string>
+    <string>--pair-port</string>
+    <string>$pair_port</string>
+    <string>--mountpoint</string>
+    <string>$mountpoint_xml</string>
+    <string>--log-level</string>
+    <string>info</string>
+    <string>--log-format</string>
+    <string>json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>$core_stdout_xml</string>
+  <key>StandardErrorPath</key><string>$core_stderr_xml</string>
+</dict>
+</plist>
+EOF
 
 cat >"$plist_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -155,8 +196,6 @@ cat >"$plist_path" <<EOF
     <string>$repository_xml</string>
     <string>mount</string>
     <string>--managed</string>
-    <string>--pair-port</string>
-    <string>$pair_port</string>
     <string>--log-level</string>
     <string>info</string>
     <string>--log-format</string>
@@ -188,27 +227,38 @@ cat >"$plist_path" <<EOF
 EOF
 
 plutil -lint "$plist_path"
+plutil -lint "$core_plist_path"
 launchctl bootout "$domain/$label" 2>/dev/null || true
+launchctl bootout "$domain/$core_label" 2>/dev/null || true
 bootstrapped=false
 for _ in $(seq 1 30); do
-  if launchctl bootstrap "$domain" "$plist_path"; then
+  if launchctl bootstrap "$domain" "$core_plist_path"; then
     bootstrapped=true
     break
   fi
   sleep 1
 done
 if [[ "$bootstrapped" != true ]]; then
-  printf 'Could not bootstrap %s after waiting for launchd teardown.\n' "$label" >&2
+  printf 'Could not bootstrap %s after waiting for launchd teardown.\n' "$core_label" >&2
   exit 1
 fi
-launchctl kickstart "$domain/$label"
+launchctl kickstart "$domain/$core_label"
 
 for _ in $(seq 1 120); do
   if "$install_path" --repo "$repository" health >/dev/null 2>&1; then
-    printf 'Installed %s and mounted %s.\n' "$label" "$mountpoint"
-    exit 0
+    launchctl bootstrap "$domain" "$plist_path"
+    launchctl kickstart "$domain/$label"
+    for _ in $(seq 1 60); do
+      if mount | grep -Fq " on $mountpoint "; then
+        printf 'Installed %s and %s; mounted %s.\n' "$core_label" "$label" "$mountpoint"
+        exit 0
+      fi
+      sleep 1
+    done
+    printf 'Core is healthy but %s did not mount; inspect %s.\n' "$label" "$stderr_xml" >&2
+    exit 1
   fi
   sleep 1
 done
-printf 'Service did not become healthy; inspect %s and run: launchctl print %s/%s\n' "$stderr_xml" "$domain" "$label" >&2
+printf 'Core did not become healthy; inspect %s and run: launchctl print %s/%s\n' "$core_stderr_xml" "$domain" "$core_label" >&2
 exit 1

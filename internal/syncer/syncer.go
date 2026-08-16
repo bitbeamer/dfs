@@ -73,8 +73,27 @@ func (s *Scheduler) SetReconciler(reconcile func(context.Context) error) {
 }
 
 func (s *Scheduler) Stop() {
+	_ = s.StopContext(context.Background())
+}
+
+func (s *Scheduler) StopContext(ctx context.Context) error {
 	s.once.Do(func() { close(s.stop) })
-	<-s.done
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		s.activeMu.Lock()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.activeMu.Unlock()
+		select {
+		case <-s.done:
+			return nil
+		case <-time.After(time.Second):
+			return ctx.Err()
+		}
+	}
 }
 
 func (s *Scheduler) Notify(reason string) {

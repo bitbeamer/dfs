@@ -1,4 +1,4 @@
-package mount
+package daemon
 
 import (
 	"context"
@@ -21,21 +21,21 @@ import (
 )
 
 const (
-	healthVersion     = 1
-	healthHeartbeat   = 30 * time.Second
-	healthMaxAge      = 2 * time.Minute
-	healthStatTimeout = 3 * time.Second
+	healthVersion   = 2
+	healthHeartbeat = 30 * time.Second
+	healthMaxAge    = 2 * time.Minute
 )
 
 type HealthReport struct {
 	Version          int                    `json:"version"`
+	Mode             string                 `json:"mode"`
 	State            string                 `json:"state"`
 	Healthy          bool                   `json:"healthy"`
 	PID              int                    `json:"pid"`
 	Hostname         string                 `json:"hostname"`
 	Peer             string                 `json:"peer"`
 	Repository       string                 `json:"repository"`
-	Mountpoint       string                 `json:"mountpoint"`
+	Mountpoint       string                 `json:"mountpoint,omitempty"`
 	StartedAt        time.Time              `json:"started_at"`
 	UpdatedAt        time.Time              `json:"updated_at"`
 	Error            string                 `json:"error,omitempty"`
@@ -54,24 +54,18 @@ func HealthPath(repository string) string {
 	return filepath.Join(repository, filepath.FromSlash(config.Directory), "health.json")
 }
 
-func newHealthReporter(peer, repository, mountpoint string, logger *slog.Logger) *healthReporter {
+func newHealthReporter(peerName, repository, mountpoint string, logger *slog.Logger) *healthReporter {
 	hostname, _ := os.Hostname()
 	now := time.Now().UTC()
-	return &healthReporter{
-		path: HealthPath(repository), logger: logger.With("component", "health"),
-		report: HealthReport{
-			Version: healthVersion, State: "starting", PID: os.Getpid(), Hostname: hostname,
-			Peer: peer, Repository: repository, Mountpoint: mountpoint, StartedAt: now, UpdatedAt: now,
-		},
-	}
+	return &healthReporter{path: HealthPath(repository), logger: logger.With("component", "health"), report: HealthReport{
+		Version: healthVersion, Mode: "core", State: "starting", PID: os.Getpid(), Hostname: hostname,
+		Peer: peerName, Repository: repository, Mountpoint: mountpoint, StartedAt: now, UpdatedAt: now,
+	}}
 }
 
 func (r *healthReporter) update(state string, healthy bool, err error) {
 	r.mu.Lock()
-	r.report.State = state
-	r.report.Healthy = healthy
-	r.report.UpdatedAt = time.Now().UTC()
-	r.report.Error = ""
+	r.report.State, r.report.Healthy, r.report.UpdatedAt, r.report.Error = state, healthy, time.Now().UTC(), ""
 	if err != nil {
 		r.report.Error = err.Error()
 	}
@@ -105,30 +99,14 @@ func (r *healthReporter) observe(stop <-chan struct{}, repo *repository.Reposito
 	for {
 		select {
 		case <-timer.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-			type observation struct {
-				report peer.DiagnosticReport
-				err    error
-			}
-			result := make(chan observation, 1)
-			go func() {
-				report, err := peer.Diagnose(ctx, repo, 10*time.Second)
-				result <- observation{report: report, err: err}
-			}()
-			var observed observation
-			select {
-			case observed = <-result:
-				cancel()
-			case <-stop:
-				cancel()
-				return
-			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			report, err := peer.Diagnose(ctx, repo, 10*time.Second)
+			cancel()
 			r.mu.Lock()
-			if observed.err != nil {
-				r.report.OperationalError = observed.err.Error()
+			if err != nil {
+				r.report.OperationalError = err.Error()
 			} else {
-				r.report.Operational = &observed.report
-				r.report.OperationalError = ""
+				r.report.Operational, r.report.OperationalError = &report, ""
 			}
 			snapshot := r.report
 			r.mu.Unlock()
@@ -148,56 +126,55 @@ func writeHealth(path string, report HealthReport) error {
 		return err
 	}
 	data = append(data, '\n')
-	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(directory, ".health-*")
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".health-*")
 	if err != nil {
 		return err
 	}
 	temporaryPath := temporary.Name()
-	cleanup := func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
-	}
+	defer os.Remove(temporaryPath)
 	if err := temporary.Chmod(0o600); err != nil {
-		cleanup()
+		_ = temporary.Close()
 		return err
 	}
 	if _, err := temporary.Write(data); err != nil {
-		cleanup()
+		_ = temporary.Close()
 		return err
 	}
 	if err := temporary.Sync(); err != nil {
-		cleanup()
+		_ = temporary.Close()
 		return err
 	}
 	if err := temporary.Close(); err != nil {
-		_ = os.Remove(temporaryPath)
 		return err
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
-		_ = os.Remove(temporaryPath)
 		return err
 	}
-	return syncDirectory(directory)
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func ReadHealth(repository string) (HealthReport, error) {
 	data, err := os.ReadFile(HealthPath(repository))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return HealthReport{}, errors.New("no mount health report; the service has not started")
+			return HealthReport{}, errors.New("no core health report; the daemon has not started")
 		}
 		return HealthReport{}, err
 	}
 	var report HealthReport
 	if err := json.Unmarshal(data, &report); err != nil {
-		return HealthReport{}, fmt.Errorf("decode mount health report: %w", err)
+		return report, fmt.Errorf("decode core health report: %w", err)
 	}
 	if report.Version != healthVersion {
-		return report, fmt.Errorf("unsupported mount health report version %d", report.Version)
+		return report, fmt.Errorf("unsupported core health report version %d", report.Version)
 	}
 	return report, nil
 }
@@ -207,34 +184,24 @@ func CheckHealth(repository string) (HealthReport, error) {
 	if err != nil {
 		return report, err
 	}
+	if report.Mode != "core" {
+		return report, fmt.Errorf("health report is not owned by the independent core daemon")
+	}
 	if report.State != "ready" || !report.Healthy {
 		if report.Error != "" {
-			return report, fmt.Errorf("mount state is %s: %s", report.State, report.Error)
+			return report, fmt.Errorf("core state is %s: %s", report.State, report.Error)
 		}
-		return report, fmt.Errorf("mount state is %s", report.State)
+		return report, fmt.Errorf("core state is %s", report.State)
 	}
 	if time.Since(report.UpdatedAt) > healthMaxAge {
-		return report, fmt.Errorf("mount heartbeat is stale (last update %s)", report.UpdatedAt.Format(time.RFC3339))
+		return report, fmt.Errorf("core heartbeat is stale (last update %s)", report.UpdatedAt.Format(time.RFC3339))
 	}
 	hostname, _ := os.Hostname()
 	if report.Hostname == "" || report.Hostname != hostname {
-		return report, fmt.Errorf("mount health belongs to host %q", report.Hostname)
+		return report, fmt.Errorf("core health belongs to host %q", report.Hostname)
 	}
 	if report.PID <= 0 || !processAlive(report.PID) {
-		return report, fmt.Errorf("mount process %d is not running", report.PID)
-	}
-	statResult := make(chan error, 1)
-	go func() {
-		_, err := os.Stat(report.Mountpoint)
-		statResult <- err
-	}()
-	select {
-	case err := <-statResult:
-		if err != nil {
-			return report, fmt.Errorf("mountpoint %s is not accessible: %w", report.Mountpoint, err)
-		}
-	case <-time.After(healthStatTimeout):
-		return report, fmt.Errorf("mountpoint %s did not respond within %s", report.Mountpoint, healthStatTimeout)
+		return report, fmt.Errorf("core process %d is not running", report.PID)
 	}
 	return report, nil
 }

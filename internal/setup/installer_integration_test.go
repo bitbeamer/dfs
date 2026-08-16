@@ -21,6 +21,8 @@ func TestInstallersCreateIndependentFilesystemInstances(t *testing.T) {
 	}
 	writeExecutable(t, filepath.Join(fakeBin, "systemctl"), "#!/bin/sh\ncase \"$*\" in *is-active*) exit 1;; esac\nexit 0\n")
 	writeExecutable(t, filepath.Join(fakeBin, "launchctl"), "#!/bin/sh\n[ \"${1:-}\" = print ] && exit 1\nexit 0\n")
+	writeExecutable(t, filepath.Join(fakeBin, "mountpoint"), "#!/bin/sh\nexit 1\n")
+	writeExecutable(t, filepath.Join(fakeBin, "mount"), "#!/bin/sh\nprintf 'dfs on %s/mac-mount-0 (macfuse)\\ndfs on %s/mac-mount-1 (macfuse)\\n' \"$HOME\" \"$HOME\"\n")
 	for _, name := range []string{"codesign", "plutil", "git-annex", "fusermount3"} {
 		writeExecutable(t, filepath.Join(fakeBin, name), "#!/bin/sh\nexit 0\n")
 	}
@@ -40,8 +42,8 @@ func TestInstallersCreateIndependentFilesystemInstances(t *testing.T) {
 	} {
 		mountpoint := filepath.Join(home, fmt.Sprintf("linux-mount-%d", index))
 		runInstaller(t, environment, "../../scripts/install-cachyos.sh", "--pair-port", fmt.Sprint(7901+index), item.repository, mountpoint, sourceBinary)
-		unit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+item.id[:12]+".service")
-		assertContains(t, unit, "--pair-port "+fmt.Sprint(7901+index))
+		coreUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-core-"+item.id[:12]+".service")
+		assertContains(t, coreUnit, "daemon --managed --pair-port "+fmt.Sprint(7901+index))
 	}
 	firstUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+firstID[:12]+".service")
 	secondUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+secondID[:12]+".service")
@@ -60,8 +62,8 @@ func TestInstallersCreateIndependentFilesystemInstances(t *testing.T) {
 	} {
 		mountpoint := filepath.Join(home, fmt.Sprintf("mac-mount-%d", index))
 		runInstaller(t, environment, "../../scripts/install-macos.sh", "--pair-port", fmt.Sprint(7911+index), item.repository, mountpoint, sourceBinary)
-		plist := filepath.Join(home, "Library", "LaunchAgents", "io.bitbeamer.dfs.mount."+item.id[:12]+".plist")
-		assertContains(t, plist, "<string>"+fmt.Sprint(7911+index)+"</string>")
+		corePlist := filepath.Join(home, "Library", "LaunchAgents", "io.bitbeamer.dfs.core."+item.id[:12]+".plist")
+		assertContains(t, corePlist, "<string>"+fmt.Sprint(7911+index)+"</string>")
 	}
 	firstPlist := filepath.Join(home, "Library", "LaunchAgents", "io.bitbeamer.dfs.mount."+firstID[:12]+".plist")
 	secondPlist := filepath.Join(home, "Library", "LaunchAgents", "io.bitbeamer.dfs.mount."+secondID[:12]+".plist")

@@ -53,6 +53,7 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 		t.Fatal(err)
 	}
 	mountpoint := filepath.Join(home, "mnt")
+	startTestCore(t, repo.Config.Repository, mountpoint)
 	mountLogPath := filepath.Join(home, "mount.log")
 	mountLog, err := os.OpenFile(mountLogPath, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -93,7 +94,7 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 			t.Errorf("read mount log after shutdown: %v", err)
 			return
 		}
-		for _, expected := range []string{"msg=\"shutdown requested\"", "msg=\"mount stopped\"", "reason=shutdown"} {
+		for _, expected := range []string{"msg=\"shutdown requested\"", "msg=\"mount stopped\""} {
 			if !strings.Contains(string(logContent), expected) {
 				t.Errorf("mount shutdown log does not contain %q:\n%s", expected, logContent)
 			}
@@ -105,7 +106,9 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitOutput(t, ctx, repo.Config.Repository, "annex", "add", "--", synchronizedName)
-	gitOutput(t, ctx, repo.Config.Repository, "commit", "-m", "Add synchronized annex fixture")
+	if _, err := repo.CommitPending(ctx, "Add synchronized annex fixture"); err != nil {
+		t.Fatal(err)
+	}
 	if _, found, err := repo.Store.FileMetadata(synchronizedName); err != nil || found {
 		t.Fatalf("synchronized fixture unexpectedly has visible metadata: found=%v err=%v", found, err)
 	}
@@ -321,7 +324,7 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"msg=\"mount ready\"", "msg=\"file created\"", "msg=\"write transaction committed\"", "msg=\"automatic sync completed\""} {
+	for _, expected := range []string{"msg=\"mount ready\"", "msg=\"file created\"", "msg=\"write transaction committed\""} {
 		if !strings.Contains(string(logContent), expected) {
 			t.Fatalf("mount info log does not contain %q:\n%s", expected, logContent)
 		}

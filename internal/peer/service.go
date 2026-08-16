@@ -61,12 +61,16 @@ type attemptWindow struct {
 }
 
 func Start(repo *repository.Repository, logger *slog.Logger, port int, changed func(string, []string)) (*Service, error) {
+	return StartWithDiscovery(repo, logger, port, true, changed)
+}
+
+func StartWithDiscovery(repo *repository.Repository, logger *slog.Logger, port int, advertise bool, changed func(string, []string)) (*Service, error) {
 	if port == 0 {
 		port = DefaultPairingPort
 	} else if port < 0 {
 		port = 0
 	}
-	return startServiceAddress(repo, logger, net.JoinHostPort("", strconv.Itoa(port)), true, changed)
+	return startServiceAddress(repo, logger, net.JoinHostPort("", strconv.Itoa(port)), advertise, changed)
 }
 
 func startService(repo *repository.Repository, logger *slog.Logger, listener net.Listener, advertise bool, changed func(string, []string)) (*Service, error) {

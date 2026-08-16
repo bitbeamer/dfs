@@ -16,12 +16,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   filesystem_id=$(git -C "$repository" rev-list --max-parents=0 HEAD | sort | head -n 1)
   instance=${filesystem_id:0:12}
   [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
-  unit_name="dfs-mount-$instance.service"
-  unit_path="$unit_dir/$unit_name"
-  systemctl --user disable --now "$unit_name" 2>/dev/null || true
-  rm -f "$unit_path"
+  mount_unit_name="dfs-mount-$instance.service"
+  core_unit_name="dfs-core-$instance.service"
+  systemctl --user disable --now "$mount_unit_name" "$core_unit_name" 2>/dev/null || true
+  rm -f "$unit_dir/$mount_unit_name" "$unit_dir/$core_unit_name"
   systemctl --user daemon-reload
-  printf 'Removed %s (binary retained at %s).\n' "$unit_name" "$install_path"
+  printf 'Removed %s and %s (binary retained at %s).\n' "$mount_unit_name" "$core_unit_name" "$install_path"
   exit 0
 fi
 
@@ -50,9 +50,11 @@ instance=${filesystem_id:0:12}
 [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
 unit_name="dfs-mount-$instance.service"
 unit_path="$unit_dir/$unit_name"
+core_unit_name="dfs-core-$instance.service"
+core_unit_path="$unit_dir/$core_unit_name"
 legacy_unit_path="$unit_dir/dfs-mount.service"
 
-for command in git git-annex fusermount3 systemctl; do
+for command in git git-annex fusermount3 mountpoint systemctl; do
   command -v "$command" >/dev/null || { printf 'Required command not found: %s\n' "$command" >&2; exit 1; }
 done
 if [[ ! -x "$source_binary" ]]; then
@@ -65,15 +67,15 @@ if [[ -f "$legacy_unit_path" ]] && grep -Fq -- "$repository" "$legacy_unit_path"
   rm -f "$legacy_unit_path"
   systemctl --user daemon-reload
 fi
-if systemctl --user is-active --quiet "$unit_name" 2>/dev/null; then
-  systemctl --user stop "$unit_name"
+if systemctl --user is-active --quiet "$unit_name" 2>/dev/null || systemctl --user is-active --quiet "$core_unit_name" 2>/dev/null; then
+  systemctl --user stop "$unit_name" "$core_unit_name"
   for _ in $(seq 1 30); do
     "$source_binary" --repo "$repository" health >/dev/null 2>&1 || break
     sleep 1
   done
 fi
-if "$source_binary" --repo "$repository" health >/dev/null 2>&1; then
-  printf 'Repository is already mounted outside the managed service; stop that mount before installing.\n' >&2
+if mountpoint -q "$mountpoint"; then
+  printf 'Mountpoint is already active outside the managed service; unmount it before installing.\n' >&2
   exit 1
 fi
 if [[ "$source_binary" != "$install_path" ]]; then
@@ -92,9 +94,9 @@ binary_arg=$(systemd_quote "$install_path")
 repository_arg=$(systemd_quote "$repository")
 mountpoint_arg=$(systemd_quote "$mountpoint")
 
-cat >"$unit_path" <<EOF
+cat >"$core_unit_path" <<EOF
 [Unit]
-Description=DFS managed FUSE mount
+Description=DFS independent core daemon
 Documentation=https://github.com/bitbeamer/dfs
 Wants=network-online.target
 After=network-online.target
@@ -102,11 +104,11 @@ After=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=$binary_arg --repo $repository_arg mount --managed --pair-port $pair_port --log-level info --log-format json $mountpoint_arg
+ExecStart=$binary_arg --repo $repository_arg daemon --managed --pair-port $pair_port --mountpoint $mountpoint_arg --log-level info --log-format json
 ExecStartPost=$binary_arg --repo $repository_arg health
 Restart=on-failure
 RestartSec=5s
-TimeoutStartSec=10min
+TimeoutStartSec=2min
 TimeoutStopSec=30s
 WatchdogSec=90s
 UMask=0077
@@ -116,7 +118,28 @@ Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 WantedBy=default.target
 EOF
 
+cat >"$unit_path" <<EOF
+[Unit]
+Description=DFS FUSE frontend
+Documentation=https://github.com/bitbeamer/dfs
+Requires=$core_unit_name
+After=$core_unit_name
+
+[Service]
+Type=simple
+ExecStart=$binary_arg --repo $repository_arg mount --managed --log-level info --log-format json $mountpoint_arg
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target
+EOF
+
 systemctl --user daemon-reload
+systemctl --user enable --now "$core_unit_name"
 systemctl --user enable --now "$unit_name"
 systemctl --user --no-pager --full status "$unit_name"
-printf 'Installed %s. Health: %s --repo %s health\n' "$unit_name" "$install_path" "$repository"
+printf 'Installed %s and %s. Health: %s --repo %s health\n' "$core_unit_name" "$unit_name" "$install_path" "$repository"
