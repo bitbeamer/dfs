@@ -267,7 +267,7 @@ func TestAnnexTargetChangeRefreshesFollowingHandle(t *testing.T) {
 	}
 }
 
-func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
+func TestTrackedFileGetAttrDoesNotWaitForWorkTreeUpdates(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)
 	locked := make(chan struct{})
@@ -281,10 +281,9 @@ func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
 	}()
 	<-locked
 
-	called := make(chan struct{})
 	done := make(chan struct{})
 	file := &trackedFile{
-		File:       &attrFile{File: nodefs.NewDefaultFile(), called: called},
+		File:       &attrFile{File: nodefs.NewDefaultFile()},
 		filesystem: filesystem,
 		path:       "annex.txt",
 	}
@@ -293,16 +292,11 @@ func TestTrackedFileGetAttrWaitsForWorkTreeUpdates(t *testing.T) {
 		close(done)
 	}()
 	select {
-	case <-called:
-		t.Fatal("handle attributes observed the worktree during an annex update")
-	case <-time.After(50 * time.Millisecond):
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("read-only handle attributes waited for the repository lock")
 	}
 	close(release)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("handle attributes did not resume after the annex update")
-	}
 }
 
 func TestTrackedFileGetAttrUsesVisibleInode(t *testing.T) {

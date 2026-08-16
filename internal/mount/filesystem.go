@@ -282,9 +282,10 @@ func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nod
 	return tracked, fuse.OK
 }
 
-// openBackingRead pins one worktree version to an open file descriptor while
-// excluding DFS sync/commit operations that replace annex links. A broken
-// annex link is hydrated outside the repository lock and then opened again.
+// openBackingRead pins one worktree version to an open file descriptor. Git
+// and git-annex publish path changes with atomic renames, so an opened
+// descriptor remains valid without holding the repository lock across
+// read-only opens. A broken annex link is hydrated and then opened again.
 func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, string, error) {
 	// Match go-fuse's loopback behavior: the kernel translates append writes to
 	// explicit offsets before they reach a file handle.
@@ -295,18 +296,15 @@ func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, st
 			annexTarget string
 			needsFetch  bool
 		)
-		err := f.repo.WithWorkTreeLock(func() error {
-			fullPath := f.full(path)
-			var annexed bool
-			annexTarget, annexed = annexLinkTarget(fullPath)
-			var openErr error
-			handle, openErr = os.OpenFile(fullPath, int(flags), 0)
-			if openErr != nil && annexed && errors.Is(openErr, os.ErrNotExist) {
-				needsFetch = true
-				return nil
-			}
-			return openErr
-		})
+		fullPath := f.full(path)
+		var annexed bool
+		annexTarget, annexed = annexLinkTarget(fullPath)
+		err := error(nil)
+		handle, err = os.OpenFile(fullPath, int(flags), 0)
+		if err != nil && annexed && errors.Is(err, os.ErrNotExist) {
+			needsFetch = true
+			err = nil
+		}
 		if err != nil {
 			return nil, annexTarget, err
 		}
@@ -352,30 +350,22 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	var code fuse.Status
-	err := t.filesystem.repo.WithWorkTreeLock(func() error {
-		code = t.File.GetAttr(out)
-		if code != fuse.OK {
-			return nil
-		}
-		if attr, ok := t.filesystem.stagedAttr(t.path); ok {
-			if attr.Ino != 0 {
-				out.Ino = attr.Ino
-			}
-			return nil
-		}
-		// FileSystem.GetAttr presents the inode and metadata captured when a
-		// write was published. Apply the same view to open handles: git-annex
-		// may replace the worktree file with a symlink to an object, but that
-		// internal representation change must not make fstat disagree with stat
-		// and cause name-following readers to reopen identical content.
-		t.filesystem.applyVisibleAttr(t.path, out, annexSymlink(t.filesystem.full(t.path)))
-		t.filesystem.applyStableAnnexInode(t.path, out)
-		return nil
-	})
-	if err != nil {
-		return status(err)
+	code := t.File.GetAttr(out)
+	if code != fuse.OK {
+		return code
 	}
+	if attr, ok := t.filesystem.stagedAttr(t.path); ok {
+		if attr.Ino != 0 {
+			out.Ino = attr.Ino
+		}
+		return fuse.OK
+	}
+	// FileSystem.GetAttr presents the inode and metadata captured when a write
+	// was published. Apply the same view to open handles: git-annex may replace
+	// the worktree file with a symlink to an object, but that internal
+	// representation change must not make fstat disagree with stat.
+	t.filesystem.applyVisibleAttr(t.path, out, annexSymlink(t.filesystem.full(t.path)))
+	t.filesystem.applyStableAnnexInode(t.path, out)
 	if refreshed && t.filesystem.cacheInvalidator != nil {
 		t.filesystem.cacheInvalidator.InvalidateContent(t.path)
 	}
@@ -386,14 +376,7 @@ func (t *trackedFile) refreshAnnexTarget() (bool, fuse.Status) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	var current string
-	err := t.filesystem.repo.WithWorkTreeLock(func() error {
-		current, _ = annexLinkTarget(t.filesystem.full(t.path))
-		return nil
-	})
-	if err != nil {
-		return false, status(err)
-	}
+	current, _ := annexLinkTarget(t.filesystem.full(t.path))
 	if current == "" || current == t.annexTarget {
 		return false, fuse.OK
 	}
