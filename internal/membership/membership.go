@@ -1,8 +1,11 @@
 package membership
 
 import (
+	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -19,13 +23,13 @@ import (
 )
 
 const (
-	Version             = 1
-	sharedDirectory     = ".dfs/members"
-	privateKeyFile      = "membership-key.pem"
-	trustedMembersFile  = "trusted-members.json"
-	revokedMembersFile  = "revoked-members.json"
-	membershipAttribute = ".dfs/members/** annex.largefiles=nothing"
-	revocationAttribute = ".dfs/revocations/** annex.largefiles=nothing"
+	Version            = 1
+	SharedRef          = "refs/heads/dfs-membership"
+	privateKeyFile     = "membership-key.pem"
+	trustedMembersFile = "trusted-members.json"
+	revokedMembersFile = "revoked-members.json"
+	membersPrefix      = "members/"
+	revocationsPrefix  = "revocations/"
 )
 
 func KeyPath(repositoryPath string) string {
@@ -109,28 +113,12 @@ func SaveRevocation(repositoryPath string, revocation Revocation) error {
 	if err := validateRevocation(revocation); err != nil {
 		return err
 	}
-	if err := ensureAttributes(repositoryPath); err != nil {
-		return err
-	}
-	directory := filepath.Join(repositoryPath, ".dfs", "revocations")
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(revocation, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	path := filepath.Join(directory, revocation.PeerID+".json")
-	temporary := path + ".new"
-	if err := os.WriteFile(temporary, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
-		return err
-	}
-	return nil
+	return writeSharedFile(repositoryPath, revocationsPrefix+revocation.PeerID+".json", data)
 }
 
 func Endorse(record Record, approverID string, private ed25519.PrivateKey) (Endorsement, error) {
@@ -292,54 +280,28 @@ func Save(repositoryPath string, record Record) error {
 	if record.ApprovedBy == "" || record.ApprovalSignature == "" {
 		return errors.New("membership record is not approved")
 	}
-	if err := ensureAttributes(repositoryPath); err != nil {
-		return err
-	}
-	directory := filepath.Join(repositoryPath, filepath.FromSlash(sharedDirectory))
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	path := filepath.Join(directory, record.Payload.PeerID+".json")
-	temporary := path + ".new"
-	if err := os.WriteFile(temporary, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
-		return err
-	}
-	return nil
+	return writeSharedFile(repositoryPath, membersPrefix+record.Payload.PeerID+".json", data)
 }
 
 func LoadAll(repositoryPath string) ([]Record, error) {
-	directory := filepath.Join(repositoryPath, filepath.FromSlash(sharedDirectory))
-	entries, err := os.ReadDir(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	files, err := loadSharedPrefix(repositoryPath, SharedRef, membersPrefix)
 	if err != nil {
 		return nil, err
 	}
 	var records []Record
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
-		if err != nil {
-			return nil, err
-		}
+	for path, data := range files {
+		name := strings.TrimPrefix(path, membersPrefix)
 		var record Record
 		if err := json.Unmarshal(data, &record); err != nil {
-			return nil, fmt.Errorf("decode membership %s: %w", entry.Name(), err)
+			return nil, fmt.Errorf("decode membership %s: %w", name, err)
 		}
-		if record.Payload.PeerID+".json" != entry.Name() {
-			return nil, fmt.Errorf("membership filename does not match peer ID: %s", entry.Name())
+		if record.Payload.PeerID+".json" != name {
+			return nil, fmt.Errorf("membership filename does not match peer ID: %s", name)
 		}
 		records = append(records, record)
 	}
@@ -540,24 +502,14 @@ func validateRevocation(revocation Revocation) error {
 
 func acceptedRevocations(repositoryPath, filesystemID string, records map[string]Record, trusted map[string]string) (map[string]bool, error) {
 	result := make(map[string]bool)
-	directory := filepath.Join(repositoryPath, ".dfs", "revocations")
-	entries, err := os.ReadDir(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return result, nil
-	}
+	files, err := loadSharedPrefix(repositoryPath, SharedRef, revocationsPrefix)
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
-		if err != nil {
-			return nil, err
-		}
+	for path, data := range files {
+		name := strings.TrimPrefix(path, revocationsPrefix)
 		var revocation Revocation
-		if json.Unmarshal(data, &revocation) != nil || revocation.FileSystemID != filesystemID || revocation.PeerID+".json" != entry.Name() {
+		if json.Unmarshal(data, &revocation) != nil || revocation.FileSystemID != filesystemID || revocation.PeerID+".json" != name {
 			continue
 		}
 		approver, ok := records[revocation.RevokedBy]
@@ -643,30 +595,392 @@ func validPeerID(value string) bool {
 	return true
 }
 
-func ensureAttributes(repositoryPath string) error {
-	path := filepath.Join(repositoryPath, ".gitattributes")
-	data, err := os.ReadFile(path)
+// MigrateLegacySharedState moves control-plane records out of the worktree and
+// into a dedicated Git ref. Only the two historical DFS directories and their
+// exact annex attributes are touched; unrelated user attributes are retained.
+func MigrateLegacySharedState(repositoryPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := runGit(ctx, repositoryPath, nil, "rev-parse", "--git-dir"); err != nil {
+		return fmt.Errorf("locate Git metadata for membership migration: %w", err)
+	}
+	for _, item := range []struct {
+		directory string
+		prefix    string
+	}{
+		{filepath.Join(repositoryPath, ".dfs", "members"), membersPrefix},
+		{filepath.Join(repositoryPath, ".dfs", "revocations"), revocationsPrefix},
+	} {
+		entries, err := os.ReadDir(item.directory)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(item.directory, entry.Name()))
+			if err != nil {
+				return err
+			}
+			if err := writeSharedFile(repositoryPath, item.prefix+entry.Name(), data); err != nil {
+				return fmt.Errorf("import legacy membership metadata %s: %w", entry.Name(), err)
+			}
+		}
+	}
+	if _, err := runGit(ctx, repositoryPath, nil, "rm", "-r", "-f", "--ignore-unmatch", "--", ".dfs/members", ".dfs/revocations"); err != nil {
+		return fmt.Errorf("remove legacy membership files from worktree: %w", err)
+	}
+	attributesPath := filepath.Join(repositoryPath, ".gitattributes")
+	attributes, err := os.ReadFile(attributesPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	hasMembership, hasRevocations := false, false
-	for _, line := range strings.Split(string(data), "\n") {
-		hasMembership = hasMembership || strings.TrimSpace(line) == membershipAttribute
-		hasRevocations = hasRevocations || strings.TrimSpace(line) == revocationAttribute
+	if err == nil {
+		var retained []string
+		changed := false
+		for _, line := range strings.Split(string(attributes), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == ".dfs/members/** annex.largefiles=nothing" || trimmed == ".dfs/revocations/** annex.largefiles=nothing" {
+				changed = true
+				continue
+			}
+			retained = append(retained, line)
+		}
+		if changed {
+			data := []byte(strings.TrimRight(strings.Join(retained, "\n"), "\n"))
+			if len(data) > 0 {
+				data = append(data, '\n')
+				if err := os.WriteFile(attributesPath, data, 0o644); err != nil {
+					return err
+				}
+				if _, err := runGit(ctx, repositoryPath, nil, "add", "--", ".gitattributes"); err != nil {
+					return err
+				}
+			} else {
+				if err := os.Remove(attributesPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				if _, err := runGit(ctx, repositoryPath, nil, "add", "-A", "--", ".gitattributes"); err != nil {
+					return err
+				}
+			}
+		}
 	}
-	if hasMembership && hasRevocations {
+	staged, err := runGit(ctx, repositoryPath, nil, "diff", "--cached", "--name-only", "--", ".dfs/members", ".dfs/revocations", ".gitattributes")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(staged)) != "" {
+		arguments := []string{"commit", "-m", "Move DFS membership into Git metadata", "--"}
+		arguments = append(arguments, strings.Fields(string(staged))...)
+		if _, err := runGit(ctx, repositoryPath, nil, arguments...); err != nil {
+			return fmt.Errorf("commit membership metadata migration: %w", err)
+		}
+	}
+	_ = os.Remove(filepath.Join(repositoryPath, ".dfs", "members"))
+	_ = os.Remove(filepath.Join(repositoryPath, ".dfs", "revocations"))
+	_ = os.Remove(filepath.Join(repositoryPath, ".dfs"))
+	return nil
+}
+
+// Sync exchanges the dedicated membership ref with configured Git remotes.
+// Records are merged by signed generation and the resulting commit has every
+// fetched ref as a parent, allowing ordinary fast-forward pushes.
+func Sync(ctx context.Context, repositoryPath string, remotes []string) error {
+	refs := []string{SharedRef}
+	var fetched []struct {
+		remote string
+		ref    string
+	}
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		if remote == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(remote))
+		tracking := fmt.Sprintf("refs/dfs/remotes/%x", digest[:8])
+		if _, err := runGit(ctx, repositoryPath, nil, "fetch", "--no-tags", remote, "+"+SharedRef+":"+tracking); err != nil {
+			continue
+		}
+		refs = append(refs, tracking)
+		fetched = append(fetched, struct {
+			remote string
+			ref    string
+		}{remote: remote, ref: tracking})
+	}
+	trusted, err := LoadTrusted(repositoryPath)
+	if err != nil {
+		return err
+	}
+	merged := make(map[string][]byte)
+	for _, ref := range refs {
+		files, err := loadSharedPrefix(repositoryPath, ref, "")
+		if err != nil {
+			return err
+		}
+		for path, data := range files {
+			if !validSharedDocument(path, data, trusted) {
+				continue
+			}
+			if current, exists := merged[path]; !exists || newerSharedDocument(path, data, current) {
+				merged[path] = data
+			}
+		}
+	}
+	for path, data := range merged {
+		if err := writeSharedFile(repositoryPath, path, data); err != nil {
+			return err
+		}
+	}
+	remoteRefs := make([]string, 0, len(fetched))
+	for _, item := range fetched {
+		remoteRefs = append(remoteRefs, item.ref)
+	}
+	if err := joinSharedHistories(ctx, repositoryPath, remoteRefs); err != nil {
+		return err
+	}
+	for _, item := range fetched {
+		_, _ = runGit(ctx, repositoryPath, nil, "push", item.remote, SharedRef+":"+SharedRef)
+	}
+	return nil
+}
+
+func writeSharedFile(repositoryPath, path string, data []byte) error {
+	if !strings.HasPrefix(path, membersPrefix) && !strings.HasPrefix(path, revocationsPrefix) {
+		return errors.New("invalid DFS membership metadata path")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 5; attempt++ {
+		old, _ := resolveRef(ctx, repositoryPath, SharedRef)
+		if old != "" {
+			if existing, err := runGit(ctx, repositoryPath, nil, "show", SharedRef+":"+path); err == nil && bytes.Equal(existing, data) {
+				return nil
+			}
+		}
+		gitDirectory, err := runGit(ctx, repositoryPath, nil, "rev-parse", "--git-dir")
+		if err != nil {
+			return err
+		}
+		gitPath := strings.TrimSpace(string(gitDirectory))
+		if !filepath.IsAbs(gitPath) {
+			gitPath = filepath.Join(repositoryPath, gitPath)
+		}
+		if err := os.MkdirAll(filepath.Join(gitPath, "dfs"), 0o700); err != nil {
+			return err
+		}
+		index, err := os.CreateTemp(filepath.Join(gitPath, "dfs"), "membership-index-*")
+		if err != nil {
+			return err
+		}
+		indexPath := index.Name()
+		_ = index.Close()
+		_ = os.Remove(indexPath)
+		environment := []string{"GIT_INDEX_FILE=" + indexPath}
+		if old == "" {
+			_, err = runGitEnv(ctx, repositoryPath, environment, nil, "read-tree", "--empty")
+		} else {
+			_, err = runGitEnv(ctx, repositoryPath, environment, nil, "read-tree", old+"^{tree}")
+		}
+		if err == nil {
+			var blob []byte
+			blob, err = runGitEnv(ctx, repositoryPath, environment, data, "hash-object", "-w", "--stdin")
+			if err == nil {
+				_, err = runGitEnv(ctx, repositoryPath, environment, nil, "update-index", "--add", "--cacheinfo", "100644", strings.TrimSpace(string(blob)), path)
+			}
+		}
+		var tree []byte
+		if err == nil {
+			tree, err = runGitEnv(ctx, repositoryPath, environment, nil, "write-tree")
+		}
+		_ = os.Remove(indexPath)
+		if err != nil {
+			return err
+		}
+		arguments := []string{"commit-tree", strings.TrimSpace(string(tree)), "-m", "Update DFS membership metadata"}
+		if old != "" {
+			arguments = append(arguments, "-p", old)
+		}
+		commit, err := runGit(ctx, repositoryPath, nil, arguments...)
+		if err != nil {
+			return err
+		}
+		if _, err := runGit(ctx, repositoryPath, nil, "update-ref", SharedRef, strings.TrimSpace(string(commit)), old); err == nil {
+			return nil
+		}
+	}
+	return errors.New("membership metadata changed concurrently too many times")
+}
+
+func removeSharedFile(repositoryPath, path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	old, err := resolveRef(ctx, repositoryPath, SharedRef)
+	if err != nil || old == "" {
+		return err
+	}
+	gitDirectory, err := runGit(ctx, repositoryPath, nil, "rev-parse", "--git-dir")
+	if err != nil {
+		return err
+	}
+	gitPath := strings.TrimSpace(string(gitDirectory))
+	if !filepath.IsAbs(gitPath) {
+		gitPath = filepath.Join(repositoryPath, gitPath)
+	}
+	index, err := os.CreateTemp(gitPath, "membership-index-*")
+	if err != nil {
+		return err
+	}
+	indexPath := index.Name()
+	_ = index.Close()
+	_ = os.Remove(indexPath)
+	defer os.Remove(indexPath)
+	environment := []string{"GIT_INDEX_FILE=" + indexPath}
+	if _, err := runGitEnv(ctx, repositoryPath, environment, nil, "read-tree", old+"^{tree}"); err != nil {
+		return err
+	}
+	if _, err := runGitEnv(ctx, repositoryPath, environment, nil, "update-index", "--force-remove", "--", path); err != nil {
+		return err
+	}
+	tree, err := runGitEnv(ctx, repositoryPath, environment, nil, "write-tree")
+	if err != nil {
+		return err
+	}
+	commit, err := runGit(ctx, repositoryPath, nil, "commit-tree", strings.TrimSpace(string(tree)), "-p", old, "-m", "Update DFS membership metadata")
+	if err != nil {
+		return err
+	}
+	_, err = runGit(ctx, repositoryPath, nil, "update-ref", SharedRef, strings.TrimSpace(string(commit)), old)
+	return err
+}
+
+func loadSharedPrefix(repositoryPath, ref, prefix string) (map[string][]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if value, _ := resolveRef(ctx, repositoryPath, ref); value == "" {
+		return make(map[string][]byte), nil
+	}
+	arguments := []string{"ls-tree", "-r", "--name-only", ref}
+	if prefix != "" {
+		arguments = append(arguments, "--", strings.TrimSuffix(prefix, "/"))
+	}
+	listing, err := runGit(ctx, repositoryPath, nil, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]byte)
+	for _, path := range strings.Split(strings.TrimSpace(string(listing)), "\n") {
+		if path == "" || (prefix != "" && !strings.HasPrefix(path, prefix)) {
+			continue
+		}
+		data, err := runGit(ctx, repositoryPath, nil, "show", ref+":"+path)
+		if err != nil {
+			return nil, err
+		}
+		result[path] = data
+	}
+	return result, nil
+}
+
+func validSharedDocument(path string, data []byte, trusted map[string]string) bool {
+	if strings.HasPrefix(path, membersPrefix) {
+		var record Record
+		if json.Unmarshal(data, &record) != nil || VerifySelf(record) != nil || path != membersPrefix+record.Payload.PeerID+".json" {
+			return false
+		}
+		return trusted[record.Payload.PeerID] == "" || trusted[record.Payload.PeerID] == record.Payload.SigningPublicKey
+	}
+	if strings.HasPrefix(path, revocationsPrefix) {
+		var revocation Revocation
+		return json.Unmarshal(data, &revocation) == nil && validateRevocation(revocation) == nil && path == revocationsPrefix+revocation.PeerID+".json"
+	}
+	return false
+}
+
+func newerSharedDocument(path string, candidate, current []byte) bool {
+	var candidateGeneration, currentGeneration uint64
+	var candidateTime, currentTime time.Time
+	if strings.HasPrefix(path, membersPrefix) {
+		var left, right Record
+		if json.Unmarshal(candidate, &left) == nil && json.Unmarshal(current, &right) == nil {
+			candidateGeneration, currentGeneration = left.Payload.Generation, right.Payload.Generation
+			candidateTime, currentTime = left.Payload.UpdatedAt, right.Payload.UpdatedAt
+		}
+	} else {
+		var left, right Revocation
+		if json.Unmarshal(candidate, &left) == nil && json.Unmarshal(current, &right) == nil {
+			candidateGeneration, currentGeneration = left.Generation, right.Generation
+			candidateTime, currentTime = left.UpdatedAt, right.UpdatedAt
+		}
+	}
+	if candidateGeneration != currentGeneration {
+		return candidateGeneration > currentGeneration
+	}
+	if !candidateTime.Equal(currentTime) {
+		return candidateTime.After(currentTime)
+	}
+	return bytes.Compare(candidate, current) > 0
+}
+
+func joinSharedHistories(ctx context.Context, repositoryPath string, refs []string) error {
+	current, err := resolveRef(ctx, repositoryPath, SharedRef)
+	if err != nil || current == "" {
+		return err
+	}
+	var parents []string
+	for _, ref := range refs {
+		value, _ := resolveRef(ctx, repositoryPath, ref)
+		if value == "" || value == current {
+			continue
+		}
+		if _, err := runGit(ctx, repositoryPath, nil, "merge-base", "--is-ancestor", value, current); err != nil {
+			parents = append(parents, value)
+		}
+	}
+	if len(parents) == 0 {
 		return nil
 	}
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		data = append(data, '\n')
+	tree, err := runGit(ctx, repositoryPath, nil, "rev-parse", current+"^{tree}")
+	if err != nil {
+		return err
 	}
-	if !hasMembership {
-		data = append(data, membershipAttribute...)
-		data = append(data, '\n')
+	arguments := []string{"commit-tree", strings.TrimSpace(string(tree)), "-p", current}
+	for _, parent := range parents {
+		arguments = append(arguments, "-p", parent)
 	}
-	if !hasRevocations {
-		data = append(data, revocationAttribute...)
-		data = append(data, '\n')
+	arguments = append(arguments, "-m", "Merge DFS membership metadata")
+	commit, err := runGit(ctx, repositoryPath, nil, arguments...)
+	if err != nil {
+		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	_, err = runGit(ctx, repositoryPath, nil, "update-ref", SharedRef, strings.TrimSpace(string(commit)), current)
+	return err
+}
+
+func resolveRef(ctx context.Context, repositoryPath, ref string) (string, error) {
+	value, err := runGit(ctx, repositoryPath, nil, "rev-parse", "--verify", ref)
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(string(value)), nil
+}
+
+func runGit(ctx context.Context, repositoryPath string, input []byte, arguments ...string) ([]byte, error) {
+	return runGitEnv(ctx, repositoryPath, nil, input, arguments...)
+}
+
+func runGitEnv(ctx context.Context, repositoryPath string, environment []string, input []byte, arguments ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", repositoryPath}, arguments...)...)
+	command.Env = append(os.Environ(), environment...)
+	command.Env = append(command.Env,
+		"GIT_AUTHOR_NAME=DFS", "GIT_AUTHOR_EMAIL=dfs@localhost",
+		"GIT_COMMITTER_NAME=DFS", "GIT_COMMITTER_EMAIL=dfs@localhost",
+	)
+	command.Stdin = bytes.NewReader(input)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("git %s: %s", strings.Join(arguments, " "), strings.TrimSpace(string(output)))
+	}
+	return output, nil
 }

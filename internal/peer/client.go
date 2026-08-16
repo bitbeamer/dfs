@@ -36,6 +36,7 @@ type JoinResult struct {
 type PairOptions struct {
 	PeerID         string
 	StateDirectory string
+	PairingPort    int
 }
 
 const pairingResumeFile = "pairing-resume.json"
@@ -111,7 +112,11 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		request.ReverseUser = account.Username
 		request.ReversePath = destination
 	}
-	_, membershipDraft, err := newMembershipDraft(temporary, destination, invitation.FileSystemID, peerID, name, identity.PublicKey, request.SSHHostKeys, DefaultPairingPort)
+	pairingPort := options.PairingPort
+	if pairingPort == 0 {
+		pairingPort = DefaultPairingPort
+	}
+	_, membershipDraft, err := newMembershipDraft(temporary, destination, invitation.FileSystemID, peerID, name, identity.PublicKey, request.SSHHostKeys, pairingPort)
 	if err != nil {
 		return nil, fmt.Errorf("create signed DFS membership: %w", err)
 	}
@@ -245,6 +250,9 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if _, err := repo.AdoptClonedPeer(ctx, start.PeerID); err != nil {
 		return nil, fmt.Errorf("name paired source remote: %w", err)
 	}
+	if err := membership.MigrateLegacySharedState(repo.Config.Repository); err != nil {
+		return nil, fmt.Errorf("migrate DFS membership metadata: %w", err)
+	}
 	if err := membership.Save(repo.Config.Repository, start.Approver); err != nil {
 		return nil, fmt.Errorf("save approving DFS membership: %w", err)
 	}
@@ -264,12 +272,6 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		if err := membership.Trust(repo.Config.Repository, endorsement.PeerID, endorsement.SigningPublicKey); err != nil {
 			return nil, fmt.Errorf("trust endorsed DFS member: %w", err)
 		}
-	}
-	memberPaths := []string{".gitattributes",
-		filepath.ToSlash(filepath.Join(".dfs", "members", start.PeerID+".json")),
-		filepath.ToSlash(filepath.Join(".dfs", "members", peerID+".json"))}
-	if _, err := repo.CommitControlFiles(ctx, "Join DFS membership", memberPaths...); err != nil {
-		return nil, fmt.Errorf("commit DFS membership: %w", err)
 	}
 	resume := pairingResume{
 		Version: ProtocolVersion, Endpoint: endpoint, CertificateSHA256: invitation.CertificateSHA256,

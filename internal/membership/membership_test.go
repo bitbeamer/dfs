@@ -1,8 +1,11 @@
 package membership
 
 import (
+	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,7 +13,7 @@ import (
 )
 
 func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
-	shared := t.TempDir()
+	shared := gitMembershipRepository(t)
 	filesystemID := strings.Repeat("a", 40)
 	aliceKey, alicePublic, err := EnsureKey(t.TempDir())
 	if err != nil {
@@ -68,12 +71,117 @@ func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
 	if len(accepted) != 1 || accepted[0].Payload.PeerID != "alice-peer" {
 		t.Fatalf("membership after revocation = %#v", accepted)
 	}
-	if err := os.Remove(filepath.Join(shared, ".dfs", "revocations", "bob-peer.json")); err != nil {
+	if err := removeSharedFile(shared, revocationsPrefix+"bob-peer.json"); err != nil {
 		t.Fatal(err)
 	}
 	accepted, err = Accepted(shared, filesystemID)
 	if err != nil || len(accepted) != 1 || accepted[0].Payload.PeerID != "alice-peer" {
 		t.Fatalf("locally persisted revocation was undone: %#v, %v", accepted, err)
+	}
+}
+
+func TestLegacyMembershipMovesOutOfWorktree(t *testing.T) {
+	repositoryPath := gitMembershipRepository(t)
+	key, public, err := EnsureKey(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := signedTestRecord(t, strings.Repeat("d", 40), "alice-peer", "admin", public, key)
+	record, err = Approve(record, "alice-peer", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(repositoryPath, ".dfs", "members")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "alice-peer.json"), append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attributes := "*.bin annex.largefiles=anything\n.dfs/members/** annex.largefiles=nothing\n.dfs/revocations/** annex.largefiles=nothing\n"
+	if err := os.WriteFile(filepath.Join(repositoryPath, ".gitattributes"), []byte(attributes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitMembershipRun(t, repositoryPath, "add", ".dfs/members/alice-peer.json", ".gitattributes")
+	gitMembershipRun(t, repositoryPath, "commit", "-m", "Legacy membership")
+	if err := MigrateLegacySharedState(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repositoryPath, ".dfs", "members")); !os.IsNotExist(err) {
+		t.Fatalf("legacy membership remains visible: %v", err)
+	}
+	remaining, err := os.ReadFile(filepath.Join(repositoryPath, ".gitattributes"))
+	if err != nil || string(remaining) != "*.bin annex.largefiles=anything\n" {
+		t.Fatalf("retained attributes = %q, %v", remaining, err)
+	}
+	records, err := LoadAll(repositoryPath)
+	if err != nil || len(records) != 1 || records[0].Payload.PeerID != "alice-peer" {
+		t.Fatalf("migrated records = %#v, %v", records, err)
+	}
+	if output, err := exec.Command("git", "-C", repositoryPath, "ls-tree", "-r", "--name-only", "HEAD").Output(); err != nil || strings.Contains(string(output), ".dfs/") {
+		t.Fatalf("worktree still tracks DFS membership: %s, %v", output, err)
+	}
+}
+
+func TestMembershipRefSynchronizesWithoutWorktreeFiles(t *testing.T) {
+	first := gitMembershipRepository(t)
+	second := filepath.Join(t.TempDir(), "second")
+	if output, err := exec.Command("git", "clone", first, second).CombinedOutput(); err != nil {
+		t.Fatalf("clone second repository: %v\n%s", err, output)
+	}
+	gitMembershipRun(t, second, "config", "user.name", "Membership Test")
+	gitMembershipRun(t, second, "config", "user.email", "membership@example.invalid")
+	gitMembershipRun(t, first, "remote", "add", "second", second)
+	gitMembershipRun(t, second, "remote", "add", "first", first)
+	filesystemID := strings.Repeat("e", 40)
+	firstKey, firstPublic, err := EnsureKey(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondKey, secondPublic, err := EnsureKey(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRecord := signedTestRecord(t, filesystemID, "first-peer", "admin", firstPublic, firstKey)
+	firstRecord, err = Approve(firstRecord, "first-peer", firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRecord := signedTestRecord(t, filesystemID, "second-peer", "member", secondPublic, secondKey)
+	secondRecord, err = Approve(secondRecord, "first-peer", firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(first, firstRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(second, secondRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := Trust(first, "first-peer", firstPublic); err != nil {
+		t.Fatal(err)
+	}
+	if err := Trust(second, "first-peer", firstPublic); err != nil {
+		t.Fatal(err)
+	}
+	if err := Sync(context.Background(), first, []string{"second"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Sync(context.Background(), second, []string{"first"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, repositoryPath := range []string{first, second} {
+		records, err := LoadAll(repositoryPath)
+		if err != nil || len(records) != 2 {
+			t.Fatalf("records in %s = %#v, %v", repositoryPath, records, err)
+		}
+		if _, err := os.Stat(filepath.Join(repositoryPath, ".dfs")); !os.IsNotExist(err) {
+			t.Fatalf("membership leaked into worktree %s: %v", repositoryPath, err)
+		}
 	}
 }
 
@@ -137,4 +245,22 @@ func signedTestRecord(t *testing.T, filesystemID, peerID, role, public string, k
 		t.Fatal(err)
 	}
 	return record
+}
+
+func gitMembershipRepository(t *testing.T) string {
+	t.Helper()
+	repositoryPath := t.TempDir()
+	gitMembershipRun(t, repositoryPath, "init", "-b", "main")
+	gitMembershipRun(t, repositoryPath, "config", "user.name", "Membership Test")
+	gitMembershipRun(t, repositoryPath, "config", "user.email", "membership@example.invalid")
+	gitMembershipRun(t, repositoryPath, "commit", "--allow-empty", "-m", "Initialize")
+	return repositoryPath
+}
+
+func gitMembershipRun(t *testing.T, repositoryPath string, arguments ...string) {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repositoryPath}, arguments...)...)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(arguments, " "), err, output)
+	}
 }

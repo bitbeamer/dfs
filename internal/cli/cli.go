@@ -91,6 +91,7 @@ func (a *App) transportCommand() *cobra.Command {
 
 func (a *App) setupCommand() *cobra.Command {
 	var repositoryPath, mountpoint, name, limit, installer string
+	var pairingPort int
 	var discoveryTimeout time.Duration
 	var resume, abort, yes bool
 	command := &cobra.Command{
@@ -129,10 +130,10 @@ func (a *App) setupCommand() *cobra.Command {
 					shortID = shortID[:12]
 				}
 				if yes {
-					fmt.Fprintf(a.Out, "Approved joining DFS filesystem %s as %s\n", shortID, state.Name)
+					fmt.Fprintf(a.Out, "Approved joining DFS filesystem %s as %s on managed port %d\n", shortID, state.Name, state.PairingPort)
 					return nil
 				}
-				fmt.Fprintf(a.Out, "Join DFS filesystem %s as %s and install its managed mount? [y/N] ", shortID, state.Name)
+				fmt.Fprintf(a.Out, "Join DFS filesystem %s as %s and install its managed mount on port %d? [y/N] ", shortID, state.Name, state.PairingPort)
 				answer, readErr := reader.ReadString('\n')
 				if readErr != nil && !errors.Is(readErr, io.EOF) {
 					return readErr
@@ -145,11 +146,11 @@ func (a *App) setupCommand() *cobra.Command {
 			}
 			state, err := dfssetup.Run(ctx, dfssetup.Options{Invitation: invitation, Repository: repositoryPath, Mountpoint: mountpoint,
 				Name: name, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
-				Out: a.Out, Approve: approve})
+				PairingPort: pairingPort, Out: a.Out, Approve: approve})
 			if err != nil {
 				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup --resume or roll back with dfs setup --abort)", err)
 			}
-			fmt.Fprintf(a.Out, "DFS setup verified: %s is mounted at %s\n", state.NetworkName, state.Mountpoint)
+			fmt.Fprintf(a.Out, "DFS setup verified: %s is mounted at %s on managed port %d\n", state.NetworkName, state.Mountpoint, state.PairingPort)
 			return nil
 		},
 	}
@@ -159,6 +160,7 @@ func (a *App) setupCommand() *cobra.Command {
 	command.Flags().StringVar(&name, "name", "", "peer name (defaults to hostname)")
 	command.Flags().StringVar(&limit, "cache-limit", "100GiB", "maximum local content cache")
 	command.Flags().DurationVar(&discoveryTimeout, "timeout", 3*time.Second, "how long to discover the invited network")
+	command.Flags().IntVar(&pairingPort, "pair-port", 0, "local managed transport port (defaults to the first free port from 7843)")
 	command.Flags().StringVar(&installer, "installer", "", "service installer script (advanced)")
 	_ = command.Flags().MarkHidden("installer")
 	command.Flags().BoolVar(&resume, "resume", false, "resume the recorded setup transaction")

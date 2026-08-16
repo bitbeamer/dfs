@@ -104,7 +104,8 @@ cd ~/dfs
 ./scripts/install-cachyos.sh \
   ~/.local/share/dfs/repository ~/DFS ./bin/dfs
 
-systemctl --user --no-pager --full status dfs-mount
+DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+systemctl --user --no-pager --full status "dfs-mount-$DFS_INSTANCE"
 ~/.local/bin/dfs --repo ~/.local/share/dfs/repository health
 ```
 
@@ -115,7 +116,8 @@ cd ~/dfs
 ./scripts/install-macos.sh \
   ~/.local/share/dfs/repository ~/DFS ./bin/dfs
 
-launchctl print gui/$(id -u)/io.bitbeamer.dfs.mount
+DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
 "$HOME/Library/Application Support/DFS/bin/dfs" \
   --repo ~/.local/share/dfs/repository health
 ```
@@ -145,7 +147,11 @@ export PATH
 directories to its own dependency search path, so diagnostics do not depend on
 interactive shell startup files.
 
-The existing peer and the new peer must be able to reach each other over managed QUIC and the SSH fallback. On a default-drop firewall, allow UDP 5353, both UDP and TCP 7843, and the SSH server port (normally TCP 22) from the trusted LAN.
+The existing peer and the new peer must be able to reach each other over managed
+QUIC and the SSH fallback. On a default-drop firewall, allow UDP 5353, both UDP
+and TCP for each filesystem instance's selected managed port, and the SSH server
+port (normally TCP 22) from the trusted LAN. The first instance normally uses
+7843; subsequent automatic setups select the next free port and print it.
 
 ## 2. Create a new filesystem (first peer only)
 
@@ -199,7 +205,11 @@ transaction created, run:
 ```
 
 Use `--repository` and `--mountpoint` on the initial command to override their
-defaults. Resume and abort use the paths saved by the active transaction. The
+defaults. Setup state and locks are repository-specific, so multiple incomplete
+or completed filesystem transactions do not collide. Resume and abort select
+the transaction using `--repository`; use the same non-default repository path
+you supplied initially. `--pair-port` selects an explicit local TCP/UDP port;
+otherwise DFS uses the first free port beginning at 7843. The
 lower-level `network join` and installer scripts remain available for debugging
 and manual deployments.
 
@@ -225,8 +235,8 @@ DFS binds each peer identity to the machine hostname recorded during `init` or
 open or mount the repository and reports the old peer ID. It never silently
 transfers the old identity to the renamed machine. Re-add it as a new peer:
 
-1. Uninstall its managed mount with `scripts/install-macos.sh --uninstall` or
-   `scripts/install-cachyos.sh --uninstall`.
+1. Uninstall its managed mount with `scripts/install-macos.sh --uninstall <repository>`
+   or `scripts/install-cachyos.sh --uninstall <repository>`.
 2. On another mesh member, run
    `dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<old-id>`.
 3. Move the renamed machine's old repository aside as a backup, create a new

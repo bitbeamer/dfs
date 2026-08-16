@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>io.bitbeamer.dfs.mount</string>
+  <string>io.bitbeamer.dfs.mount.@DFS_INSTANCE@</string>
   <key>ProgramArguments</key>
   <array>
     <string>@DFS_BINARY@</string>
@@ -11,6 +11,8 @@
     <string>@DFS_REPOSITORY@</string>
     <string>mount</string>
     <string>--managed</string>
+    <string>--pair-port</string>
+    <string>@DFS_PAIR_PORT@</string>
     <string>--log-level</string>
     <string>info</string>
     <string>--log-format</string>

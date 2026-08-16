@@ -93,6 +93,9 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	if err != nil {
 		return nil, err
 	}
+	if err := membership.MigrateLegacySharedState(repo.Config.Repository); err != nil {
+		return nil, fmt.Errorf("migrate DFS membership metadata: %w", err)
+	}
 	certificate, fingerprint, err := loadOrCreateCertificate(repo.Config.Repository)
 	if err != nil {
 		return nil, err
@@ -432,11 +435,6 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 		}
 		if err := membership.Save(s.repo.Config.Repository, pending.Membership); err != nil {
 			writeProtocolError(response, http.StatusInternalServerError, "cannot publish peer membership")
-			return
-		}
-		memberPath := filepath.ToSlash(filepath.Join(".dfs", "members", pending.PeerID+".json"))
-		if _, err := s.repo.CommitControlFiles(request.Context(), "Approve DFS peer membership", ".gitattributes", memberPath); err != nil {
-			writeProtocolError(response, http.StatusInternalServerError, "cannot commit peer membership")
 			return
 		}
 		if err := membership.Trust(s.repo.Config.Repository, pending.Membership.Payload.PeerID, pending.Membership.Payload.SigningPublicKey); err != nil {

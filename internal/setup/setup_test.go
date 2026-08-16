@@ -57,3 +57,31 @@ func TestSetupPersistsApprovalAndIdentityForResume(t *testing.T) {
 		t.Fatalf("pairing identity changed across resume: %q != %q", resumedPeerID, firstPeerID)
 	}
 }
+
+func TestSetupStateAndPairingDirectoriesAreRepositoryScoped(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+	first, err := StatePath(filepath.Join(home, "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := StatePath(filepath.Join(home, "second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("repository-scoped setup paths collide: %s", first)
+	}
+	if pairingPath(first) == pairingPath(second) {
+		t.Fatalf("repository-scoped pairing paths collide: %s", pairingPath(first))
+	}
+}
+
+func TestChoosePairingPortRejectsInvalidValues(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		if _, err := choosePairingPort(port); err == nil {
+			t.Fatalf("choosePairingPort(%d) unexpectedly succeeded", port)
+		}
+	}
+}

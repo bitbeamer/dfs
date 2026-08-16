@@ -229,34 +229,6 @@ func (r *Repository) CommitPending(ctx context.Context, message string) (bool, e
 	return r.commitPendingLocked(ctx, message)
 }
 
-// CommitControlFiles publishes DFS-owned shared metadata without sweeping
-// unrelated user worktree changes into the commit.
-func (r *Repository) CommitControlFiles(ctx context.Context, message string, paths ...string) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(paths) == 0 {
-		return false, nil
-	}
-	add := append([]string{"add", "--"}, paths...)
-	if _, err := r.runner.Run(ctx, "git", add...); err != nil {
-		return false, err
-	}
-	statusArgs := append([]string{"status", "--porcelain", "--"}, paths...)
-	status, err := r.runner.Run(ctx, "git", statusArgs...)
-	if err != nil {
-		return false, err
-	}
-	if strings.TrimSpace(status) == "" {
-		return false, nil
-	}
-	commitArgs := []string{"commit", "-m", message, "--"}
-	commitArgs = append(commitArgs, paths...)
-	if _, err := r.runner.Run(ctx, "git", commitArgs...); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // RepairLegacyPrivateState removes runtime files that older DFS versions kept
 // in the worktree from Git's index. If they are the only merge conflicts left
 // by git-annex sync, it also completes that cleanup merge.

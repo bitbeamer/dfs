@@ -68,9 +68,6 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	if err := membership.Trust(repo.Config.Repository, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
 		return nil, membership.Record{}, err
 	}
-	if _, err := repo.CommitControlFiles(ctx, "Publish DFS peer membership", ".gitattributes", filepath.ToSlash(filepath.Join(".dfs", "members", repo.Config.PeerID+".json"))); err != nil {
-		return nil, membership.Record{}, err
-	}
 	return private, record, nil
 }
 
@@ -123,15 +120,22 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 	if err != nil {
 		return err
 	}
+	remotes, err := repo.Remotes(ctx)
+	if err != nil {
+		return err
+	}
+	remoteNames := make([]string, 0, len(remotes))
+	for _, remote := range remotes {
+		remoteNames = append(remoteNames, remote.Name)
+	}
+	if err := membership.Sync(ctx, repo.Config.Repository, remoteNames); err != nil {
+		return fmt.Errorf("synchronize DFS membership metadata: %w", err)
+	}
 	accepted, err := acceptedMembership(ctx, repo, filesystemID)
 	if err != nil {
 		return err
 	}
 	revoked, err := membership.AcceptedRevocations(repo.Config.Repository, filesystemID)
-	if err != nil {
-		return err
-	}
-	remotes, err := repo.Remotes(ctx)
 	if err != nil {
 		return err
 	}
@@ -221,9 +225,7 @@ func RevokeMembership(ctx context.Context, repo *repository.Repository, remote s
 	if err := membership.SaveRevocation(repo.Config.Repository, revocation); err != nil {
 		return err
 	}
-	path := filepath.ToSlash(filepath.Join(".dfs", "revocations", target.Payload.PeerID+".json"))
-	_, err = repo.CommitControlFiles(ctx, "Revoke DFS peer membership", ".gitattributes", path)
-	return err
+	return nil
 }
 
 func remoteName(peerID string) string {

@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-unit_name="dfs-mount.service"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-unit_path="$unit_dir/$unit_name"
 install_path="$HOME/.local/bin/dfs"
+pair_port=7843
 
 usage() {
-  printf 'Usage: %s <repository> <mountpoint> [dfs-binary]\n' "$0" >&2
-  printf '       %s --uninstall\n' "$0" >&2
+  printf 'Usage: %s [--pair-port PORT] <repository> <mountpoint> [dfs-binary]\n' "$0" >&2
+  printf '       %s --uninstall <repository>\n' "$0" >&2
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
+  [[ $# -eq 2 ]] || { usage; exit 2; }
+  repository=$(realpath "$2")
+  filesystem_id=$(git -C "$repository" rev-list --max-parents=0 HEAD | sort | head -n 1)
+  instance=${filesystem_id:0:12}
+  [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
+  unit_name="dfs-mount-$instance.service"
+  unit_path="$unit_dir/$unit_name"
   systemctl --user disable --now "$unit_name" 2>/dev/null || true
   rm -f "$unit_path"
   systemctl --user daemon-reload
@@ -19,10 +25,19 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--pair-port" ]]; then
+  [[ $# -ge 3 ]] || { usage; exit 2; }
+  pair_port=$2
+  shift 2
+fi
 if (( $# < 2 || $# > 3 )); then
   usage
   exit 2
 fi
+[[ "$pair_port" =~ ^[0-9]+$ ]] && (( pair_port >= 1 && pair_port <= 65535 )) || {
+  printf 'Pairing port must be between 1 and 65535.\n' >&2
+  exit 2
+}
 
 repository=$(realpath "$1")
 mountpoint=$2
@@ -30,6 +45,12 @@ source_binary=${3:-./bin/dfs}
 source_binary=$(realpath "$source_binary")
 mkdir -p "$mountpoint" "$unit_dir" "$(dirname "$install_path")"
 mountpoint=$(realpath "$mountpoint")
+filesystem_id=$(git -C "$repository" rev-list --max-parents=0 HEAD | sort | head -n 1)
+instance=${filesystem_id:0:12}
+[[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
+unit_name="dfs-mount-$instance.service"
+unit_path="$unit_dir/$unit_name"
+legacy_unit_path="$unit_dir/dfs-mount.service"
 
 for command in git git-annex fusermount3 systemctl; do
   command -v "$command" >/dev/null || { printf 'Required command not found: %s\n' "$command" >&2; exit 1; }
@@ -37,6 +58,12 @@ done
 if [[ ! -x "$source_binary" ]]; then
   printf 'DFS binary is not executable: %s\n' "$source_binary" >&2
   exit 1
+fi
+# Migrate the original singleton unit only when it belongs to this repository.
+if [[ -f "$legacy_unit_path" ]] && grep -Fq -- "$repository" "$legacy_unit_path"; then
+  systemctl --user disable --now dfs-mount.service 2>/dev/null || true
+  rm -f "$legacy_unit_path"
+  systemctl --user daemon-reload
 fi
 if systemctl --user is-active --quiet "$unit_name" 2>/dev/null; then
   systemctl --user stop "$unit_name"
@@ -75,7 +102,7 @@ After=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=$binary_arg --repo $repository_arg mount --managed --log-level info --log-format json $mountpoint_arg
+ExecStart=$binary_arg --repo $repository_arg mount --managed --pair-port $pair_port --log-level info --log-format json $mountpoint_arg
 ExecStartPost=$binary_arg --repo $repository_arg health
 Restart=on-failure
 RestartSec=5s

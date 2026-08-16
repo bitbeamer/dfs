@@ -7,7 +7,7 @@ After=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart="@DFS_BINARY@" --repo "@DFS_REPOSITORY@" mount --managed --log-level info --log-format json "@DFS_MOUNTPOINT@"
+ExecStart="@DFS_BINARY@" --repo "@DFS_REPOSITORY@" mount --managed --pair-port @DFS_PAIR_PORT@ --log-level info --log-format json "@DFS_MOUNTPOINT@"
 ExecStartPost="@DFS_BINARY@" --repo "@DFS_REPOSITORY@" health
 Restart=on-failure
 RestartSec=5s

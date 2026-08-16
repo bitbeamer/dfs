@@ -77,13 +77,17 @@ make build
   ~/.local/share/dfs/repository ~/DFS ./bin/dfs
 ```
 
-This installs the binary as `~/.local/bin/dfs`, writes and enables `~/.config/systemd/user/dfs-mount.service`, waits for systemd's DFS readiness notification, and enables a watchdog. Useful commands are:
+This installs the shared binary as `~/.local/bin/dfs` and creates one service
+whose name contains the filesystem's 12-character ID. A second repository gets
+a second independent service instead of replacing the first. Determine the
+instance name and inspect it with:
 
 ```sh
-systemctl --user status dfs-mount
-journalctl --user -u dfs-mount -f
-systemctl --user restart dfs-mount
-systemctl --user stop dfs-mount
+DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+systemctl --user status "dfs-mount-$DFS_INSTANCE"
+journalctl --user -u "dfs-mount-$DFS_INSTANCE" -f
+systemctl --user restart "dfs-mount-$DFS_INSTANCE"
+systemctl --user stop "dfs-mount-$DFS_INSTANCE"
 dfs --repo ~/.local/share/dfs/repository health
 ```
 
@@ -101,20 +105,25 @@ make build
   ~/.local/share/dfs/repository ~/DFS ./bin/dfs
 ```
 
-This installs a signed helper at `~/Library/Application Support/DFS/DFS.app`, keeps `~/Library/Application Support/DFS/bin/dfs` as a compatibility link, creates `~/Library/LaunchAgents/io.bitbeamer.dfs.mount.plist`, loads it into the current GUI login session, and waits for the mount to report healthy. Allow **DFS** under **System Settings → Privacy & Security → Local Network** when macOS prompts. Inspect or control it with:
+This installs one shared signed helper at `~/Library/Application Support/DFS/DFS.app`
+and creates a filesystem-specific launch agent. Multiple launch agents can run
+the shared executable concurrently with distinct repositories, mountpoints,
+logs, and transport ports. Allow **DFS** under **System Settings → Privacy &
+Security → Local Network** when macOS prompts. Inspect or control an instance with:
 
 ```sh
-launchctl print gui/$(id -u)/io.bitbeamer.dfs.mount
-launchctl kickstart -k gui/$(id -u)/io.bitbeamer.dfs.mount
+DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
+launchctl kickstart -k "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
 dfs --repo ~/.local/share/dfs/repository health
-tail -F ~/Library/Logs/DFS/mount.stderr.log
+tail -F "$HOME/Library/Logs/DFS/mount-$DFS_INSTANCE.stderr.log"
 ```
 
 Rerun the platform installer after building a new DFS version. To disable and remove a service definition while retaining the installed binary and repository data:
 
 ```sh
-./scripts/install-cachyos.sh --uninstall  # CachyOS
-./scripts/install-macos.sh --uninstall    # macOS
+./scripts/install-cachyos.sh --uninstall ~/.local/share/dfs/repository
+./scripts/install-macos.sh --uninstall ~/.local/share/dfs/repository
 ```
 
 Packagers can use the templates under `packaging/systemd` and `packaging/launchd`. The installers generate equivalent definitions with absolute, safely escaped local paths.
@@ -149,14 +158,20 @@ joins the network, installs the platform user service, mounts the default
 interrupted attempt continues with `dfs setup --resume`; `dfs setup --abort`
 removes an incomplete transaction and the repository it created. Reading the
 invitation from the prompt keeps its bearer secret out of shell history.
+Setup transactions are keyed by repository path, so separate filesystems can
+be joined or resumed independently. Each managed instance uses the first free
+TCP/UDP port beginning at 7843; pass `--pair-port` to select one explicitly.
 
 `dfs network discover`, `dfs network join`, and the installer scripts remain as
 lower-level diagnostic and manual controls.
 
 The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing itself prefers QUIC and falls back to the pinned HTTPS endpoint. After admission, mutually authenticated QUIC is the primary transport for Git metadata, annex content, diagnostics, and membership traffic. Pairing also adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; this repository-scoped SSH path remains the automatic fallback when QUIC cannot be established. The forced command delegates only Git and git-annex operations to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository and accepts one fixed, read-only diagnostic command. It does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
 
-Each admitted device also publishes a signed record under `.dfs/members` with
-its stable ID, hostname, role, generation, signing key, and transport endpoint.
+Each admitted device also publishes a signed record in the dedicated
+`refs/heads/dfs-membership` Git metadata ref with its stable ID, hostname, role,
+generation, signing key, and transport endpoint. Membership and revocation data
+never enters the user worktree or mounted filesystem; private keys and local
+trust pins remain under `.git/dfs` and are never replicated.
 The approving member signs the admission and endorses its current roster, so a
 single approval establishes the new device's full mesh. Periodic sync verifies
 the signature chain and automatically reconciles missing remotes, pinned host
@@ -182,7 +197,12 @@ Pairing records the completion token privately after the clone. If the final rec
 
 mDNS normally stays within one LAN and may be blocked by guest Wi-Fi isolation or VLAN boundaries. A currently mounted inviter embeds its `.local` pairing endpoint in the invitation as a fallback. `pair invite --clone-url <url>` can override the authenticated clone URL for routed or advanced setups; the manual join flow remains available.
 
-A default-drop host firewall must allow UDP 5353 for mDNS, both UDP and TCP 7843 for managed QUIC and the HTTPS pairing fallback, and the SSH server port (normally TCP 22) from the trusted LAN on every device that receives direct peer connections. The pairing/transport port can be changed with `dfs mount --pair-port <port>`; managed-service definitions must use the same fixed port allowed by the firewall. DFS logs a warning and continues mounting when discovery or the pairing listener cannot start.
+A default-drop host firewall must allow UDP 5353 for mDNS, both UDP and TCP for
+every instance's managed port, and the SSH server port (normally TCP 22) from
+the trusted LAN. The first instance normally uses 7843, the next automatic
+setup normally uses 7844, and so on. `dfs setup` prints its selected port;
+manual service installs set it with `--pair-port`. DFS logs a warning and
+continues mounting when discovery or the pairing listener cannot start.
 
 Use `dfs mount --discovery=false` when a peer must not advertise the filesystem or run a pairing endpoint. Manual configured remotes continue to work.
 
