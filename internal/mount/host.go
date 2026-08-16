@@ -155,8 +155,16 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		mountOptions.Logger = log.New(fuseLogWriter{logger.With("component", "fuse")}, "", 0)
 	}
 	nodeOptions := nodefs.NewOptions()
-	nodeOptions.EntryTimeout = time.Second
-	nodeOptions.AttrTimeout = time.Second
+	if runtime.GOOS == "darwin" {
+		// Git and git-annex update the backing worktree outside FUSE requests.
+		// macOS can otherwise retain a positive vnode indefinitely even after a
+		// successful FUSE deletion notification, making removed names pass stat.
+		nodeOptions.EntryTimeout = 0
+		nodeOptions.AttrTimeout = 0
+	} else {
+		nodeOptions.EntryTimeout = time.Second
+		nodeOptions.AttrTimeout = time.Second
+	}
 	server, _, err := nodefs.Mount(mountpoint, pathNodes.Root(), mountOptions, nodeOptions)
 	if err != nil {
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
