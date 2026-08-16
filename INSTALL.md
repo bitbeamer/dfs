@@ -186,6 +186,43 @@ dfs --repo ~/.local/share/dfs/repository peer list
 dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
 
+## Mounted-volume acceptance test
+
+After installing or updating DFS, run the same live-mount acceptance suite on
+every available macOS and Arch/CachyOS peer:
+
+```sh
+cd ~/dfs
+make test-mount MOUNTPOINT=~/dfs_storage \
+  PEERS='zeus.local:/Users/christian/dfs_storage iris.local:/Users/christian/dfs_storage'
+
+# Equivalent direct invocation with a 45-second propagation deadline:
+./scripts/test-mounted-volume.sh --sync-timeout 45 ~/dfs_storage \
+  zeus.local:/Users/christian/dfs_storage \
+  iris.local:/Users/christian/dfs_storage
+```
+
+The suite creates a uniquely named `.dfs-mount-test-*` directory inside the
+mount, exercises common file and metadata operations, and removes that test
+directory on success, failure, or interruption. For every supplied peer it
+also verifies that an exact filename and its content are created, renamed,
+updated, and deleted before the propagation deadline. The output reports the
+observed number of seconds for every peer and operation. It does not modify
+existing files. The default 45-second deadline allows one pass of DFS's
+30-second synchronization schedule plus network latency. The peers must be
+reachable through non-interactive SSH. Arch
+requires the `attr` package for its extended-attribute check:
+
+```sh
+sudo pacman -S --needed attr
+```
+
+Run this suite after every source change that can affect mounted filesystem
+behavior, as well as after replacing a managed daemon. If no second peer is
+available, local filesystem checks can be run explicitly with
+`TEST_MOUNT_FLAGS=--local-only`; this mode reports the synchronization checks as
+skipped and must not be treated as a complete cross-peer acceptance test.
+
 Run the mesh check while all peers you expect to validate are mounted and
 advertising. It exits unsuccessfully if any discovered peer lacks a direct
 remote or any directed Git/SSH connection fails.
