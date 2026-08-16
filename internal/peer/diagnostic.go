@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
@@ -72,29 +71,19 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	report := DiagnosticReport{
 		Version: 1, FileSystemID: filesystemID, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
 	}
-	var wait sync.WaitGroup
-	var mu sync.Mutex
 	for _, remote := range remotes {
 		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
 			continue
 		}
-		remote := remote
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			probeCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			check := RemoteDiagnostic{Name: remote.Name, Reachable: true}
-			if err := repo.ProbeRemote(probeCtx, remote.Name); err != nil {
-				check.Reachable = false
-				check.Error = conciseError(err)
-			}
-			mu.Lock()
-			report.Remotes = append(report.Remotes, check)
-			mu.Unlock()
-		}()
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		check := RemoteDiagnostic{Name: remote.Name, Reachable: true}
+		if err := repo.ProbeRemote(probeCtx, remote.Name); err != nil {
+			check.Reachable = false
+			check.Error = conciseError(err)
+		}
+		cancel()
+		report.Remotes = append(report.Remotes, check)
 	}
-	wait.Wait()
 	sort.Slice(report.Remotes, func(i, j int) bool { return report.Remotes[i].Name < report.Remotes[j].Name })
 	return report, nil
 }
@@ -138,8 +127,6 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	}
 	reports[local.PeerID] = local
 
-	var wait sync.WaitGroup
-	var mu sync.Mutex
 	for _, remote := range remotes {
 		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
 			continue
@@ -150,34 +137,27 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 			peerID = strings.TrimPrefix(remote.Name, "dfs-peer-")
 			peers[peerID] = MeshPeer{PeerID: peerID, PeerName: remote.Name}
 		}
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			requestCtx, cancel := context.WithTimeout(ctx, probeTimeout+time.Second)
-			defer cancel()
-			report, requestErr := requestDiagnostic(requestCtx, repo, remote, probeTimeout)
-			mu.Lock()
-			defer mu.Unlock()
-			if requestErr != nil {
-				reportErrors[peerID] = conciseError(requestErr)
-				return
-			}
-			if report.FileSystemID != filesystemID || pairedRemoteName(report.PeerID) != remote.Name {
-				reportErrors[peerID] = "remote diagnostic returned a different filesystem or peer identity"
-				return
-			}
-			if report.PeerID != peerID {
-				delete(peers, peerID)
-				delete(reportErrors, peerID)
-				peers[report.PeerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
-			} else {
-				peers[peerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
-			}
-			reports[peerID] = report
-			reports[report.PeerID] = report
-		}()
+		requestCtx, cancel := context.WithTimeout(ctx, probeTimeout+time.Second)
+		report, requestErr := requestDiagnostic(requestCtx, repo, remote, probeTimeout)
+		cancel()
+		if requestErr != nil {
+			reportErrors[peerID] = conciseError(requestErr)
+			continue
+		}
+		if report.FileSystemID != filesystemID || pairedRemoteName(report.PeerID) != remote.Name {
+			reportErrors[peerID] = "remote diagnostic returned a different filesystem or peer identity"
+			continue
+		}
+		if report.PeerID != peerID {
+			delete(peers, peerID)
+			delete(reportErrors, peerID)
+			peers[report.PeerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
+		} else {
+			peers[peerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
+		}
+		reports[peerID] = report
+		reports[report.PeerID] = report
 	}
-	wait.Wait()
 	return evaluateMesh(peers, reports, reportErrors), nil
 }
 
