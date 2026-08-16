@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -115,7 +116,10 @@ func (s *Scheduler) sync(reason string) {
 	s.logger.Info("automatic sync started", "reason", reason)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	if err := s.repo.Sync(ctx, true); err != nil {
+	passes, err := syncUntilConverged(ctx, 4, 2, s.repo.TreeID, func(ctx context.Context) error {
+		return s.repo.Sync(ctx, true)
+	})
+	if err != nil {
 		s.logger.Error("automatic sync failed", "reason", reason, "duration", time.Since(started), "error", err)
 		return
 	}
@@ -138,8 +142,48 @@ func (s *Scheduler) sync(reason string) {
 		s.logger.Info("automatic sync completed",
 			"reason", reason,
 			"duration", time.Since(started),
+			"convergence_passes", passes,
 			"pins_refreshed", refreshed,
 			"files_evicted", len(dropped),
 		)
 	}
+}
+
+func syncUntilConverged(
+	ctx context.Context,
+	maxPasses, stablePasses int,
+	treeID func(context.Context) (string, error),
+	syncPass func(context.Context) error,
+) (int, error) {
+	if maxPasses < 1 || stablePasses < 1 {
+		return 0, fmt.Errorf("invalid convergence limits: max=%d stable=%d", maxPasses, stablePasses)
+	}
+	previous, err := treeID(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("read tree before synchronization: %w", err)
+	}
+	changed := false
+	stable := 0
+	for pass := 1; pass <= maxPasses; pass++ {
+		if err := syncPass(ctx); err != nil {
+			return pass, err
+		}
+		current, err := treeID(ctx)
+		if err != nil {
+			return pass, fmt.Errorf("read tree after synchronization: %w", err)
+		}
+		if current == previous {
+			stable++
+			// Do not make every unchanged periodic sync run twice. Once a pass
+			// has changed the tree, require two confirming stable passes.
+			if !changed || stable >= stablePasses {
+				return pass, nil
+			}
+		} else {
+			changed = true
+			stable = 0
+		}
+		previous = current
+	}
+	return maxPasses, fmt.Errorf("filesystem tree did not converge after %d synchronization passes", maxPasses)
 }

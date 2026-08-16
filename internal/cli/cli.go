@@ -816,6 +816,9 @@ func (a *App) doctorCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use: "doctor", Args: cobra.NoArgs, Short: "Check build and runtime dependencies",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := prepareDoctorPath(runtime.GOOS); err != nil {
+				return fmt.Errorf("prepare dependency search path: %w", err)
+			}
 			commands := []string{"git", "git-annex", "git-annex-shell", "ssh", "ssh-keygen", "rsync"}
 			if runtime.GOOS == "linux" {
 				commands = append(commands, "fusermount3")
@@ -884,6 +887,26 @@ func (a *App) doctorCommand() *cobra.Command {
 	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the mesh check")
 	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer connection probe")
 	return cmd
+}
+
+func prepareDoctorPath(goos string) error {
+	if goos != "darwin" {
+		return nil
+	}
+	current := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
+	seen := make(map[string]bool, len(current)+2)
+	for _, directory := range current {
+		seen[directory] = true
+	}
+	result := make([]string, 0, len(current)+2)
+	for _, directory := range []string{"/opt/homebrew/bin", "/usr/local/bin"} {
+		if !seen[directory] {
+			result = append(result, directory)
+			seen[directory] = true
+		}
+	}
+	result = append(result, current...)
+	return os.Setenv("PATH", strings.Join(result, string(os.PathListSeparator)))
 }
 
 func printMeshReport(output io.Writer, report peer.MeshReport) {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -29,5 +30,21 @@ func TestPrintMeshReport(t *testing.T) {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("mesh output does not contain %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestPrepareDoctorPathAddsHomebrewForNoninteractiveMacOS(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/bin")
+	if err := prepareDoctorPath("darwin"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := os.Getenv("PATH"), "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"; got != want {
+		t.Fatalf("PATH = %q, want %q", got, want)
+	}
+	if err := prepareDoctorPath("darwin"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(os.Getenv("PATH"), "/opt/homebrew/bin") != 1 {
+		t.Fatalf("PATH contains duplicate Homebrew entries: %q", os.Getenv("PATH"))
 	}
 }

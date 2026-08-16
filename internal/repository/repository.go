@@ -353,6 +353,19 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 	return err
 }
 
+// TreeID returns the current worktree snapshot recorded by HEAD. Comparing
+// tree IDs ignores git-annex's metadata-only sync commits while still
+// detecting user-visible path and content changes.
+func (r *Repository) TreeID(ctx context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, err := r.runner.Run(ctx, "git", "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
+}
+
 func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

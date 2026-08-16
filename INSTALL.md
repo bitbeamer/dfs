@@ -132,6 +132,19 @@ building through a non-interactive SSH command, make it explicit first:
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
+To make Homebrew available to every non-interactive zsh command permanently,
+add the following to `~/.zshenv` on the Mac:
+
+```sh
+typeset -U path PATH
+path=(/opt/homebrew/bin /usr/local/bin $path)
+export PATH
+```
+
+`dfs doctor` also adds the standard Apple Silicon and Intel Homebrew binary
+directories to its own dependency search path, so diagnostics do not depend on
+interactive shell startup files.
+
 The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353, TCP 7843, and the SSH server port (normally TCP 22) from the trusted LAN.
 
 ## 2. Create a new filesystem (first peer only)
