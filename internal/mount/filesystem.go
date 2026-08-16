@@ -42,7 +42,14 @@ type FileSystem struct {
 	attrs            map[string]visibleState
 	annexInodesMu    sync.Mutex
 	annexInodes      map[string]uint64
+	hydrationsMu     sync.Mutex
+	hydrations       map[string]*hydrationCall
 	cacheInvalidator contentInvalidator
+}
+
+type hydrationCall struct {
+	done chan struct{}
+	err  error
 }
 
 type trackedFile struct {
@@ -72,6 +79,7 @@ func NewFileSystemWithContext(ctx stdcontext.Context, repo *repository.Repositor
 		sizes: make(map[string]uint64), writes: make(map[string]*writeTransaction),
 		attrs:       make(map[string]visibleState),
 		annexInodes: make(map[string]uint64),
+		hydrations:  make(map[string]*hydrationCall),
 	}
 }
 
@@ -120,6 +128,40 @@ func annexLinkTarget(path string) (string, bool) {
 
 func (f *FileSystem) hydrate(name string) error {
 	path := clean(name)
+	key := "path:" + path
+	if target, annexed := annexLinkTarget(f.full(path)); annexed {
+		// Different names can reference the same annex object. Finder and Quick
+		// Look commonly open several related files concurrently for previews;
+		// one transfer should satisfy every waiter for that object.
+		targetPath := filepath.FromSlash(target)
+		if !filepath.IsAbs(targetPath) {
+			targetPath = filepath.Join(filepath.Dir(f.full(path)), targetPath)
+		}
+		key = "annex:" + filepath.Clean(targetPath)
+	}
+	f.hydrationsMu.Lock()
+	if active := f.hydrations[key]; active != nil {
+		f.hydrationsMu.Unlock()
+		select {
+		case <-active.done:
+			return active.err
+		case <-f.lifetime.Done():
+			return f.lifetime.Err()
+		}
+	}
+	active := &hydrationCall{done: make(chan struct{})}
+	f.hydrations[key] = active
+	f.hydrationsMu.Unlock()
+
+	active.err = f.hydrateOnce(path)
+	f.hydrationsMu.Lock()
+	delete(f.hydrations, key)
+	close(active.done)
+	f.hydrationsMu.Unlock()
+	return active.err
+}
+
+func (f *FileSystem) hydrateOnce(path string) error {
 	started := time.Now()
 	f.logger.Info("content hydration started", "path", path)
 	// Interactive reads take priority over outbound and maintenance syncs. The

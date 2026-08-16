@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -134,6 +135,59 @@ func TestHydrationStopsWhenMountLifetimeIsCanceled(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("hydration did not stop after mount cancellation")
+	}
+}
+
+func TestConcurrentHydrationOfSameAnnexObjectIsCoalesced(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	target := filepath.Join(root, ".git", "annex", "objects", "AA", "BB", "SHA256E-s2--same", "SHA256E-s2--same")
+	paths := []string{"first.bin", filepath.Join("nested", "second.bin")}
+	for _, path := range paths {
+		linkPath := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		relativeTarget, err := filepath.Rel(filepath.Dir(linkPath), target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(relativeTarget, linkPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	var callsMu sync.Mutex
+	filesystem.repo.SetManagedFetcher(func(context.Context, *repository.Repository, string, string) error {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+		return nil
+	})
+
+	results := make(chan error, 2)
+	go func() { results <- filesystem.hydrate(filepath.ToSlash(paths[0])) }()
+	<-started
+	go func() { results <- filesystem.hydrate(filepath.ToSlash(paths[1])) }()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("managed fetch calls = %d, want 1", calls)
 	}
 }
 

@@ -50,7 +50,8 @@ content to be present locally.
   SSH, with `doctor --mesh`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
   membership, and peer health with `dfs health`; add `--mesh` for an active
-  whole-cluster check and namespace-convergence comparison.
+  whole-cluster check and namespace-convergence comparison. Health output lists
+  every pinned file or directory with its logical size and missing-file count.
 - Run more than one active DFS filesystem on the same host. Each repository has
   independent state, mountpoint, service, logs, and TCP/UDP transport port.
 
@@ -435,8 +436,16 @@ writer follow POSIX behavior supported by FUSE.
 Opening a file updates its cache-recency record once. Sequential reads do not
 write SQLite state for every FUSE block, so large cached files stream at local
 filesystem speed instead of being limited by metadata transactions.
+Concurrent opens of names that reference the same missing git-annex object
+share one hydration transfer. This prevents Finder and Quick Look preview
+requests from queueing redundant downloads of duplicate content.
 Daemon shutdown cancels in-flight content hydration before beginning FUSE
 unmount, preventing a sleeping or unreachable peer from trapping mount teardown.
+
+After remote namespace changes, DFS invalidates kernel FUSE entries on every
+platform. On KDE Plasma it also emits the standard `KDirNotify` directory
+signals, so Dolphin refreshes remotely added, renamed, and deleted entries
+without requiring a manual F5 reload.
 
 Automatic metadata synchronization runs after completed transactions and every
 30 seconds. Each remote is probed and synchronized independently; an unavailable

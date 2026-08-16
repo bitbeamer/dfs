@@ -3,7 +3,8 @@ module github.com/bitbeamer/dfs
 go 1.26
 
 require (
-	github.com/hanwen/go-fuse/v2 v2.10.1
+	github.com/godbus/dbus/v5 v5.1.0
+	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/pion/mdns/v2 v2.1.1-0.20260801091339-3a7972cb31dc
 	github.com/quic-go/quic-go v0.61.0
 	github.com/spf13/cobra v1.10.1

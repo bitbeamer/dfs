@@ -14,19 +14,28 @@ import (
 )
 
 type HealthStats struct {
-	LogicalFiles       int64 `json:"logical_files"`
-	LogicalBytes       int64 `json:"logical_bytes"`
-	ContentFiles       int64 `json:"content_files"`
-	ContentBytes       int64 `json:"content_bytes"`
-	PinnedPaths        int64 `json:"pinned_paths"`
-	MissingPinnedFiles int64 `json:"missing_pinned_files"`
-	CacheBytes         int64 `json:"cache_bytes"`
-	CacheLimitBytes    int64 `json:"cache_limit_bytes"`
-	RepositoryBytes    int64 `json:"repository_bytes"`
-	MetadataBytes      int64 `json:"metadata_bytes"`
-	PrivateStateBytes  int64 `json:"private_state_bytes"`
-	DiskTotalBytes     int64 `json:"disk_total_bytes"`
-	DiskAvailableBytes int64 `json:"disk_available_bytes"`
+	LogicalFiles       int64              `json:"logical_files"`
+	LogicalBytes       int64              `json:"logical_bytes"`
+	ContentFiles       int64              `json:"content_files"`
+	ContentBytes       int64              `json:"content_bytes"`
+	PinnedPaths        int64              `json:"pinned_paths"`
+	MissingPinnedFiles int64              `json:"missing_pinned_files"`
+	CacheBytes         int64              `json:"cache_bytes"`
+	CacheLimitBytes    int64              `json:"cache_limit_bytes"`
+	RepositoryBytes    int64              `json:"repository_bytes"`
+	MetadataBytes      int64              `json:"metadata_bytes"`
+	PrivateStateBytes  int64              `json:"private_state_bytes"`
+	DiskTotalBytes     int64              `json:"disk_total_bytes"`
+	DiskAvailableBytes int64              `json:"disk_available_bytes"`
+	Pinned             []PinnedPathHealth `json:"pinned,omitempty"`
+}
+
+type PinnedPathHealth struct {
+	Path         string `json:"path"`
+	Kind         string `json:"kind"`
+	LogicalFiles int64  `json:"logical_files"`
+	LogicalBytes int64  `json:"logical_bytes"`
+	MissingFiles int64  `json:"missing_files"`
 }
 
 type annexHealthFile struct {
@@ -57,8 +66,10 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 	}
 	stats := HealthStats{PinnedPaths: int64(len(pins)), CacheLimitBytes: r.Config.CacheLimit}
 	annexed := make(map[string]annexHealthFile, len(all))
+	fileSizes := make(map[string]int64, len(all))
 	for _, file := range all {
 		annexed[file.Path] = file
+		fileSizes[file.Path] = file.Size
 		stats.LogicalBytes += file.Size
 		if pathMatchesAnyPin(file.Path, pins) {
 			if _, found := local[file.Path]; !found {
@@ -85,8 +96,10 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 		}
 		if size, parseErr := strconv.ParseInt(fields[1], 10, 64); parseErr == nil {
 			stats.LogicalBytes += size
+			fileSizes[path] = size
 		}
 	}
+	stats.Pinned = pinnedPathHealth(pins, fileSizes, local, annexed)
 	stats.CacheBytes, err = directorySize(filepath.Join(r.Config.Repository, ".git", "annex", "objects"), nil)
 	if err != nil {
 		return HealthStats{}, err
@@ -115,6 +128,34 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 		stats.DiskAvailableBytes = int64(filesystem.Bavail) * int64(filesystem.Bsize)
 	}
 	return stats, nil
+}
+
+func pinnedPathHealth(pins []string, fileSizes map[string]int64, local map[string]annexHealthFile, annexed map[string]annexHealthFile) []PinnedPathHealth {
+	result := make([]PinnedPathHealth, 0, len(pins))
+	for _, original := range pins {
+		pin := strings.Trim(filepath.ToSlash(original), "/")
+		entry := PinnedPathHealth{Path: pin, Kind: "directory"}
+		if _, found := fileSizes[pin]; found {
+			entry.Kind = "file"
+		}
+		for path, size := range fileSizes {
+			if pin != "" && path != pin && !strings.HasPrefix(path, pin+"/") {
+				continue
+			}
+			entry.LogicalFiles++
+			entry.LogicalBytes += size
+			if _, isAnnexed := annexed[path]; isAnnexed {
+				if _, isLocal := local[path]; !isLocal {
+					entry.MissingFiles++
+				}
+			}
+		}
+		if entry.LogicalFiles == 0 {
+			entry.Kind = "missing"
+		}
+		result = append(result, entry)
+	}
+	return result
 }
 
 func (r *Repository) annexHealthFilesLocked(ctx context.Context) ([]annexHealthFile, error) {

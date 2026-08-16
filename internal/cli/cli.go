@@ -732,6 +732,7 @@ func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
 		config.FormatSize(report.Stats.PrivateStateBytes), config.FormatSize(report.Stats.CacheBytes),
 		config.FormatSize(report.Stats.CacheLimitBytes), config.FormatSize(report.Stats.DiskAvailableBytes),
 		config.FormatSize(report.Stats.DiskTotalBytes))
+	printPinnedHealth(output, "", report.Stats.Pinned)
 	if len(report.Remotes) > 0 {
 		fmt.Fprintln(output, "\nPeers")
 		table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
@@ -781,6 +782,26 @@ func printMeshHealth(output io.Writer, report peer.MeshReport) {
 			config.FormatSize(node.Stats.DiskAvailableBytes), node.ReconciliationStatus, formatHealthTime(node.ObservedAt))
 	}
 	_ = table.Flush()
+	var pinnedRows int
+	for _, node := range report.Reports {
+		pinnedRows += len(node.Stats.Pinned)
+	}
+	if pinnedRows > 0 {
+		fmt.Fprintln(output, "\nPinned content")
+		pins := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(pins, "PEER\tPATH\tTYPE\tFILES\tLOGICAL\tMISSING")
+		for _, participant := range report.Peers {
+			node, found := reports[participant.PeerID]
+			if !found {
+				continue
+			}
+			for _, pin := range node.Stats.Pinned {
+				fmt.Fprintf(pins, "%s\t%s\t%s\t%d\t%s\t%d\n", meshPeerLabel(participant), displayPinnedPath(pin.Path),
+					strings.ToUpper(pin.Kind), pin.LogicalFiles, config.FormatSize(pin.LogicalBytes), pin.MissingFiles)
+			}
+		}
+		_ = pins.Flush()
+	}
 	printMeshReport(output, report)
 
 	issues := append([]peer.HealthIssue(nil), report.Issues...)
@@ -794,6 +815,34 @@ func printMeshHealth(output io.Writer, report peer.MeshReport) {
 		}
 	}
 	printHealthIssues(output, issues, nil)
+}
+
+func printPinnedHealth(output io.Writer, peerName string, pinned []repository.PinnedPathHealth) {
+	if len(pinned) == 0 {
+		return
+	}
+	fmt.Fprintln(output, "\nPinned content")
+	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+	if peerName == "" {
+		fmt.Fprintln(table, "PATH\tTYPE\tFILES\tLOGICAL\tMISSING")
+	} else {
+		fmt.Fprintln(table, "PEER\tPATH\tTYPE\tFILES\tLOGICAL\tMISSING")
+	}
+	for _, pin := range pinned {
+		if peerName != "" {
+			fmt.Fprintf(table, "%s\t", peerName)
+		}
+		fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%d\n", displayPinnedPath(pin.Path), strings.ToUpper(pin.Kind),
+			pin.LogicalFiles, config.FormatSize(pin.LogicalBytes), pin.MissingFiles)
+	}
+	_ = table.Flush()
+}
+
+func displayPinnedPath(path string) string {
+	if path == "" {
+		return "."
+	}
+	return path
 }
 
 func nodeHealthStatus(report peer.DiagnosticReport) string {

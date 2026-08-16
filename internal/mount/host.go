@@ -47,8 +47,9 @@ type mountpointAccess struct {
 }
 
 type nodeContentInvalidator struct {
-	paths  entryNotifier
-	logger *slog.Logger
+	paths       entryNotifier
+	directories directoryChangeNotifier
+	logger      *slog.Logger
 }
 
 type entryNotifier interface {
@@ -75,6 +76,9 @@ func (i nodeContentInvalidator) InvalidateEntry(path string) {
 		status := i.invalidateEntry(path)
 		if status != fuse.OK && i.logger != nil {
 			i.logger.Warn("FUSE entry invalidation failed", "path", path, "status", status)
+		}
+		if i.directories != nil {
+			i.directories.NotifyPath(path)
 		}
 	})
 }
@@ -175,7 +179,13 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
-	invalidator := nodeContentInvalidator{paths: pathNodes, logger: logger.With("component", "fuse")}
+	directoryNotifier := newDirectoryChangeNotifier(mountpoint, logger.With("component", "desktop"))
+	defer directoryNotifier.Close()
+	invalidator := nodeContentInvalidator{
+		paths:       pathNodes,
+		directories: directoryNotifier,
+		logger:      logger.With("component", "fuse"),
+	}
 	filesystem.cacheInvalidator = invalidator
 	scheduler.SetEntryInvalidator(invalidator)
 	mountOptions := &fuse.MountOptions{

@@ -154,6 +154,10 @@ func TestHealthStatsReportNamespaceAndStorageWithoutHydration(t *testing.T) {
 	if stats.ContentFiles != 1 || stats.MissingPinnedFiles != 0 || stats.PinnedPaths != 1 {
 		t.Fatalf("content policy stats = %+v", stats)
 	}
+	if len(stats.Pinned) != 1 || stats.Pinned[0].Path != "item.txt" || stats.Pinned[0].Kind != "file" ||
+		stats.Pinned[0].LogicalFiles != 1 || stats.Pinned[0].LogicalBytes != int64(len("health content\n")) {
+		t.Fatalf("pinned path stats = %+v", stats.Pinned)
+	}
 	if stats.RepositoryBytes <= 0 || stats.MetadataBytes <= 0 || stats.DiskAvailableBytes <= 0 {
 		t.Fatalf("storage stats = %+v", stats)
 	}
