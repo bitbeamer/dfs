@@ -186,6 +186,12 @@ dfs --repo ~/.local/share/dfs/repository peer list
 dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
 
+`doctor --mesh` verifies both the restricted SSH transport used internally by
+DFS and ordinary passwordless, non-interactive SSH for every directed peer
+pair. A missing account key or `known_hosts` entry is reported on the exact
+`FROM` → `TO` row as `PASSWORDLESS_SSH_FAILED`. Verify ordinary SSH separately
+with `ssh -o BatchMode=yes <peer>.local true` when repairing that status.
+
 ## Mounted-volume acceptance test
 
 After installing or updating DFS, run the same live-mount acceptance suite on

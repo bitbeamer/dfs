@@ -376,7 +376,7 @@ func TestServeDiagnosticReturnsRepositoryIdentity(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Version != 1 || report.PeerID != cfg.PeerID || report.PeerName != cfg.Name || report.FileSystemID == "" {
+	if report.Version != 2 || report.PeerID != cfg.PeerID || report.PeerName != cfg.Name || report.FileSystemID == "" {
 		t.Fatalf("diagnostic report = %#v", report)
 	}
 	if len(report.Remotes) != 2 || !report.Remotes[0].Reachable || report.Remotes[1].Reachable || report.Remotes[1].Error == "" {
@@ -393,13 +393,13 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	reports := map[string]DiagnosticReport{
 		"aaaaaaaaaaaaaaaa": {
 			PeerID: "aaaaaaaaaaaaaaaa", Remotes: []RemoteDiagnostic{
-				{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true},
+				{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, PasswordlessSSH: true},
 				{Name: "dfs-peer-cccccccccccc", Reachable: false, Error: "connection refused"},
 			},
 		},
 		"bbbbbbbbbbbbbbbb": {
 			PeerID: "bbbbbbbbbbbbbbbb", Remotes: []RemoteDiagnostic{
-				{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true},
+				{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, PasswordlessSSHError: "publickey denied"},
 			},
 		},
 	}
@@ -409,7 +409,7 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	}
 	want := map[string]string{
 		"desktop>laptop": "OK", "desktop>server": "FAILED",
-		"laptop>desktop": "OK", "laptop>server": "NOT_CONFIGURED",
+		"laptop>desktop": "PASSWORDLESS_SSH_FAILED", "laptop>server": "NOT_CONFIGURED",
 		"server>desktop": "UNREPORTED", "server>laptop": "UNREPORTED",
 	}
 	for _, connection := range report.Connections {
@@ -426,6 +426,35 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 		if connection.Status != want[key] {
 			t.Errorf("%s status = %q, want %q", key, connection.Status, want[key])
 		}
+	}
+}
+
+func TestProbePasswordlessSSHUsesOrdinaryNonInteractiveSSH(t *testing.T) {
+	directory := t.TempDir()
+	capture := filepath.Join(directory, "arguments")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\n"
+	if err := os.WriteFile(filepath.Join(directory, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CAPTURE_PATH", capture)
+	if err := probePasswordlessSSH(context.Background(), "ssh://alice@example.test:2222/repository", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	arguments, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"BatchMode=yes\n", "PasswordAuthentication=no\n", "KbdInteractiveAuthentication=no\n",
+		"StrictHostKeyChecking=yes\n", "-p\n2222\n", "--\nalice@example.test\ntrue\n",
+	} {
+		if !strings.Contains(string(arguments), expected) {
+			t.Fatalf("SSH arguments do not contain %q:\n%s", expected, arguments)
+		}
+	}
+	if strings.Contains(string(arguments), "IdentitiesOnly=yes") || strings.Contains(string(arguments), "peer-ssh-key") {
+		t.Fatalf("ordinary SSH probe unexpectedly uses the DFS transport identity:\n%s", arguments)
 	}
 }
 
@@ -481,7 +510,7 @@ func TestRequestDiagnosticUsesPinnedRestrictedSSH(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CAPTURE_PATH", capture)
-	t.Setenv("DIAGNOSTIC_REPORT", `{"version":1,"filesystem_id":"filesystem","peer_id":"bbbbbbbbbbbbbbbb","peer_name":"laptop","remotes":[]}`)
+	t.Setenv("DIAGNOSTIC_REPORT", `{"version":2,"filesystem_id":"filesystem","peer_id":"bbbbbbbbbbbbbbbb","peer_name":"laptop","remotes":[]}`)
 	repo := &repository.Repository{Config: config.Config{Repository: directory}}
 	report, err := requestDiagnostic(context.Background(), repo, repository.Remote{
 		Name: "dfs-peer-bbbbbbbbbbbb", URL: "ssh://alice@example.test:2222/repository",

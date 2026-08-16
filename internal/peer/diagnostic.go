@@ -20,12 +20,14 @@ import (
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
-const diagnosticCommand = "dfs-peer-diagnose-v1"
+const diagnosticCommand = "dfs-peer-diagnose-v2"
 
 type RemoteDiagnostic struct {
-	Name      string `json:"name"`
-	Reachable bool   `json:"reachable"`
-	Error     string `json:"error,omitempty"`
+	Name                 string `json:"name"`
+	Reachable            bool   `json:"reachable"`
+	Error                string `json:"error,omitempty"`
+	PasswordlessSSH      bool   `json:"passwordless_ssh"`
+	PasswordlessSSHError string `json:"passwordless_ssh_error,omitempty"`
 }
 
 type DiagnosticReport struct {
@@ -69,7 +71,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 		return DiagnosticReport{}, err
 	}
 	report := DiagnosticReport{
-		Version: 1, FileSystemID: filesystemID, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
+		Version: 2, FileSystemID: filesystemID, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
 	}
 	for _, remote := range remotes {
 		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
@@ -82,6 +84,13 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			check.Error = conciseError(err)
 		}
 		cancel()
+		sshCtx, sshCancel := context.WithTimeout(ctx, timeout)
+		if err := probePasswordlessSSH(sshCtx, remote.URL, timeout); err != nil {
+			check.PasswordlessSSHError = conciseError(err)
+		} else {
+			check.PasswordlessSSH = true
+		}
+		sshCancel()
 		report.Remotes = append(report.Remotes, check)
 	}
 	sort.Slice(report.Remotes, func(i, j int) bool { return report.Remotes[i].Name < report.Remotes[j].Name })
@@ -197,6 +206,9 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 			} else if !check.Reachable {
 				connection.Status = "FAILED"
 				connection.Error = check.Error
+			} else if !check.PasswordlessSSH {
+				connection.Status = "PASSWORDLESS_SSH_FAILED"
+				connection.Error = check.PasswordlessSSHError
 			} else {
 				connection.Status = "OK"
 			}
@@ -207,6 +219,39 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 		}
 	}
 	return result
+}
+
+func probePasswordlessSSH(ctx context.Context, remoteURL string, timeout time.Duration) error {
+	target, port, err := sshRemote(remoteURL)
+	if err != nil {
+		return err
+	}
+	seconds := int((timeout + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", "PasswordAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "ConnectTimeout=" + strconv.Itoa(seconds),
+	}
+	if port != "" && port != "22" {
+		args = append(args, "-p", port)
+	}
+	args = append(args, "--", target, "true")
+	command := exec.CommandContext(ctx, "ssh", args...)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("passwordless SSH to %s failed: %s", target, message)
+	}
+	return nil
 }
 
 func pairedRemoteName(peerID string) string {
@@ -268,7 +313,7 @@ func requestDiagnostic(ctx context.Context, repo *repository.Repository, remote 
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		return DiagnosticReport{}, fmt.Errorf("decode diagnostic response: %w", err)
 	}
-	if report.Version != 1 || report.PeerID == "" || report.FileSystemID == "" {
+	if report.Version != 2 || report.PeerID == "" || report.FileSystemID == "" {
 		return DiagnosticReport{}, errors.New("remote returned an invalid diagnostic response")
 	}
 	return report, nil
