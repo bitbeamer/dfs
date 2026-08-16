@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
@@ -635,15 +636,44 @@ func (a *App) unmountCommand() *cobra.Command {
 }
 
 func (a *App) healthCommand() *cobra.Command {
-	var asJSON bool
+	var asJSON, mesh bool
+	var discoveryTimeout, peerTimeout time.Duration
 	cmd := &cobra.Command{
-		Use: "health", Args: cobra.NoArgs, Short: "Report managed mount health",
+		Use: "health", Args: cobra.NoArgs, Short: "Report filesystem, storage, and peer health",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repositoryPath, err := config.ResolveRepository(a.repo)
 			if err != nil {
 				return err
 			}
 			report, healthErr := dfsmount.CheckHealth(repositoryPath)
+			if mesh && healthErr == nil {
+				repo, openErr := a.open()
+				if openErr != nil {
+					return openErr
+				}
+				defer repo.Close()
+				meshReport, meshErr := peer.CheckMesh(cmd.Context(), repo, discoveryTimeout, peerTimeout)
+				if asJSON {
+					encoder := json.NewEncoder(a.Out)
+					encoder.SetIndent("", "  ")
+					if err := encoder.Encode(struct {
+						Service dfsmount.HealthReport `json:"service"`
+						Mesh    peer.MeshReport       `json:"mesh"`
+					}{Service: report, Mesh: meshReport}); err != nil {
+						return err
+					}
+				} else {
+					printServiceSummary(a.Out, report)
+					printMeshHealth(a.Out, meshReport)
+				}
+				if meshErr != nil {
+					return meshErr
+				}
+				if !meshReport.Complete {
+					return errors.New("DFS mesh health is degraded")
+				}
+				return nil
+			}
 			if asJSON {
 				encoder := json.NewEncoder(a.Out)
 				encoder.SetIndent("", "  ")
@@ -651,14 +681,193 @@ func (a *App) healthCommand() *cobra.Command {
 					return err
 				}
 			} else if report.Version != 0 {
-				fmt.Fprintf(a.Out, "%s: peer %s mounted at %s (pid %d, updated %s)\n",
-					report.State, report.Peer, report.Mountpoint, report.PID, report.UpdatedAt.Format(time.RFC3339))
+				printServiceHealth(a.Out, report)
 			}
 			return healthErr
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the complete health report as JSON")
+	cmd.Flags().BoolVar(&mesh, "mesh", false, "actively check the entire cluster and every directed peer connection")
+	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the mesh check")
+	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer health probe")
 	return cmd
+}
+
+func printServiceHealth(output io.Writer, report dfsmount.HealthReport) {
+	fmt.Fprintln(output, "DFS HEALTH")
+	printServiceSummary(output, report)
+	if report.Operational != nil {
+		printNodeHealth(output, *report.Operational)
+	} else if report.OperationalError != "" {
+		fmt.Fprintf(output, "Operational check: ERROR (%s)\n", compactHealthDetail(report.OperationalError))
+	} else {
+		fmt.Fprintln(output, "Operational check: PENDING (periodic observation has not completed)")
+	}
+}
+
+func printServiceSummary(output io.Writer, report dfsmount.HealthReport) {
+	fmt.Fprintf(output, "Service: %s  Peer: %s  PID: %d  Mount: %s  Updated: %s\n",
+		strings.ToUpper(report.State), report.Peer, report.PID, report.Mountpoint, formatHealthTime(report.UpdatedAt))
+}
+
+func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
+	status := nodeHealthStatus(report)
+	id := report.FileSystemID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	fmt.Fprintf(output, "Filesystem: %s (%s)  Status: %s  Peer: %s (%s)  Port: %d\n",
+		report.NetworkName, id, status, report.PeerName, report.Role, report.InstancePort)
+	if report.ObservedAt.IsZero() {
+		fmt.Fprintln(output, "Operational data unavailable: update this peer's DFS daemon.")
+		return
+	}
+	fmt.Fprintf(output, "Namespace: %d files, %s logical  Reconciliation: %s  Members: %d (%d configured peers)\n",
+		report.Stats.LogicalFiles, config.FormatSize(report.Stats.LogicalBytes), report.ReconciliationStatus,
+		report.MembershipMembers, report.ConfiguredPeers)
+	fmt.Fprintf(output, "Content: %d local files, %s  Pins: %d (%d missing)\n",
+		report.Stats.ContentFiles, config.FormatSize(report.Stats.ContentBytes), report.Stats.PinnedPaths, report.Stats.MissingPinnedFiles)
+	fmt.Fprintf(output, "Storage: repo %s (metadata %s, private %s)  Cache: %s/%s  Disk free: %s/%s\n",
+		config.FormatSize(report.Stats.RepositoryBytes), config.FormatSize(report.Stats.MetadataBytes),
+		config.FormatSize(report.Stats.PrivateStateBytes), config.FormatSize(report.Stats.CacheBytes),
+		config.FormatSize(report.Stats.CacheLimitBytes), config.FormatSize(report.Stats.DiskAvailableBytes),
+		config.FormatSize(report.Stats.DiskTotalBytes))
+	if len(report.Remotes) > 0 {
+		fmt.Fprintln(output, "\nPeers")
+		table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(table, "PEER\tSTATUS\tTRANSPORT\tDETAIL")
+		for _, remote := range report.Remotes {
+			remoteStatus, detail := "OK", ""
+			if !remote.Reachable {
+				remoteStatus, detail = "UNREACHABLE", compactHealthDetail(remote.Error)
+			} else if !remote.PasswordlessSSH {
+				remoteStatus, detail = "SSH FAILED", compactHealthDetail(remote.PasswordlessSSHError)
+			} else if remote.Transport == "ssh-fallback" {
+				remoteStatus, detail = "FALLBACK", compactHealthDetail(remote.ManagedQUICError)
+			}
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", remoteHealthName(remote), remoteStatus, remote.Transport, detail)
+		}
+		_ = table.Flush()
+	}
+	printHealthIssues(output, report.Issues, nil)
+}
+
+func printMeshHealth(output io.Writer, report peer.MeshReport) {
+	clusterStatus := "HEALTHY"
+	if !report.Complete {
+		clusterStatus = "DEGRADED"
+	}
+	fmt.Fprintln(output, "\nDFS MESH HEALTH")
+	fmt.Fprintf(output, "Status: %s  Namespace: %s  Responding: %d/%d  Observed: %s\n",
+		clusterStatus, strings.ToUpper(report.NamespaceStatus), len(report.Reports), len(report.Peers), formatHealthTime(report.ObservedAt))
+
+	reports := make(map[string]peer.DiagnosticReport, len(report.Reports))
+	for _, node := range report.Reports {
+		reports[node.PeerID] = node
+	}
+	fmt.Fprintln(output, "\nPeers")
+	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "PEER\tROLE\tSTATUS\tPORT\tFILES\tLOGICAL\tCONTENT\tCACHE\tDISK FREE\tRECONCILIATION\tOBSERVED")
+	for _, participant := range report.Peers {
+		node, found := reports[participant.PeerID]
+		if !found {
+			fmt.Fprintf(table, "%s\t-\tUNREPORTED\t-\t-\t-\t-\t-\t-\t-\t-\n", meshPeerLabel(participant))
+			continue
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s/%s\t%s\t%s\t%s\n",
+			meshPeerLabel(participant), node.Role, nodeHealthStatus(node), node.InstancePort,
+			node.Stats.LogicalFiles, config.FormatSize(node.Stats.LogicalBytes), config.FormatSize(node.Stats.ContentBytes),
+			config.FormatSize(node.Stats.CacheBytes), config.FormatSize(node.Stats.CacheLimitBytes),
+			config.FormatSize(node.Stats.DiskAvailableBytes), node.ReconciliationStatus, formatHealthTime(node.ObservedAt))
+	}
+	_ = table.Flush()
+	printMeshReport(output, report)
+
+	issues := append([]peer.HealthIssue(nil), report.Issues...)
+	for _, node := range report.Reports {
+		for _, issue := range node.Issues {
+			switch issue.Code {
+			case "PEER_UNREACHABLE", "PASSWORDLESS_SSH_FAILED", "SSH_FALLBACK":
+				continue // The directed connection table communicates these once and more clearly.
+			}
+			issues = append(issues, issue)
+		}
+	}
+	printHealthIssues(output, issues, nil)
+}
+
+func nodeHealthStatus(report peer.DiagnosticReport) string {
+	if report.ObservedAt.IsZero() {
+		return "UNKNOWN"
+	}
+	status := "OK"
+	for _, issue := range report.Issues {
+		if issue.Severity == "error" {
+			return "ERROR"
+		}
+		status = "DEGRADED"
+	}
+	return status
+}
+
+func remoteHealthName(remote peer.RemoteDiagnostic) string {
+	if remote.PeerName != "" {
+		return remote.PeerName
+	}
+	name := strings.TrimPrefix(remote.Name, "dfs-peer-")
+	if len(name) > 12 {
+		name = name[:12]
+	}
+	return name
+}
+
+func formatHealthTime(value time.Time) string {
+	if value.IsZero() {
+		return "-"
+	}
+	return value.Local().Format("2006-01-02 15:04:05")
+}
+
+func compactHealthDetail(detail string) string {
+	detail = strings.Join(strings.Fields(detail), " ")
+	lower := strings.ToLower(detail)
+	for _, summary := range []struct{ match, text string }{
+		{"connection timed out", "connection timed out"},
+		{"context deadline exceeded", "connection timed out"},
+		{"connection refused", "connection refused"},
+		{"no route to host", "no route to host"},
+		{"permission denied", "permission denied"},
+		{"host key verification failed", "host key verification failed"},
+	} {
+		if strings.Contains(lower, summary.match) {
+			return summary.text
+		}
+	}
+	if len(detail) > 100 {
+		return detail[:97] + "..."
+	}
+	return detail
+}
+
+func printHealthIssues(output io.Writer, issues []peer.HealthIssue, skip map[string]bool) {
+	seen := make(map[string]bool)
+	printedHeader := false
+	for _, issue := range issues {
+		if skip != nil && skip[issue.Code] {
+			continue
+		}
+		key := issue.Code + "|" + compactHealthDetail(issue.Detail)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if !printedHeader {
+			fmt.Fprintln(output, "\nIssues")
+			printedHeader = true
+		}
+		fmt.Fprintf(output, "%s %s: %s\n  Action: %s\n", strings.ToUpper(issue.Severity), issue.Code,
+			compactHealthDetail(issue.Detail), issue.Action)
+	}
 }
 
 func (a *App) syncCommand() *cobra.Command {
@@ -1041,18 +1250,25 @@ func prepareDoctorPath(goos string) error {
 
 func printMeshReport(output io.Writer, report peer.MeshReport) {
 	if len(report.Peers) == 1 {
-		fmt.Fprintf(output, "MESH\tONLY_LOCAL_PEER\t%s\n", meshPeerLabel(report.Peers[0]))
+		fmt.Fprintf(output, "\nConnections\n%s is the only mesh peer.\n", meshPeerLabel(report.Peers[0]))
 		return
 	}
 	names := make(map[string]string, len(report.Peers))
 	for _, participant := range report.Peers {
 		names[participant.PeerID] = meshPeerLabel(participant)
 	}
-	fmt.Fprintln(output, "FROM\tTO\tSTATUS\tDETAIL")
+	fmt.Fprintln(output, "\nConnections")
+	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "FROM\tTO\tSTATUS\tDETAIL")
 	for _, connection := range report.Connections {
-		fmt.Fprintf(output, "%s\t%s\t%s\t%s\n",
-			names[connection.FromPeerID], names[connection.ToPeerID], connection.Status, connection.Error)
+		detail := compactHealthDetail(connection.Error)
+		if detail == "" && connection.Status == "OK" {
+			detail = "QUIC"
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\n",
+			names[connection.FromPeerID], names[connection.ToPeerID], connection.Status, detail)
 	}
+	_ = table.Flush()
 }
 
 func meshPeerLabel(participant peer.MeshPeer) string {
@@ -1060,8 +1276,8 @@ func meshPeerLabel(participant peer.MeshPeer) string {
 	if len(id) > 12 {
 		id = id[:12]
 	}
-	if participant.PeerName == "" || participant.PeerName == participant.PeerID {
+	if participant.PeerName == "" || participant.PeerName == participant.PeerID || strings.HasPrefix(participant.PeerName, "dfs-peer-") {
 		return id
 	}
-	return participant.PeerName + " (" + id + ")"
+	return participant.PeerName
 }

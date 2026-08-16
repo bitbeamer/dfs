@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bitbeamer/dfs/internal/peer"
 )
 
 func TestHealthReportRoundTripAndCheck(t *testing.T) {
@@ -20,6 +22,7 @@ func TestHealthReportRoundTripAndCheck(t *testing.T) {
 		Version: healthVersion, State: "ready", Healthy: true, PID: os.Getpid(),
 		Hostname: hostname, Peer: "test", Repository: repository, Mountpoint: mountpoint,
 		StartedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		Operational: &peer.DiagnosticReport{Version: 2, PeerName: "test", ReconciliationStatus: "ready"},
 	}
 	if err := writeHealth(HealthPath(repository), report); err != nil {
 		t.Fatal(err)
@@ -28,7 +31,7 @@ func TestHealthReportRoundTripAndCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if checked.Peer != "test" || checked.Mountpoint != mountpoint {
+	if checked.Peer != "test" || checked.Mountpoint != mountpoint || checked.Operational == nil || checked.Operational.ReconciliationStatus != "ready" {
 		t.Fatalf("checked health = %+v", checked)
 	}
 	info, err := os.Stat(HealthPath(repository))

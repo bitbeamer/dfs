@@ -118,6 +118,57 @@ func TestSyncIsolatesUnavailableRemoteAndReleasesRepositoryLock(t *testing.T) {
 	}
 }
 
+func TestHealthStatsReportNamespaceAndStorageWithoutHydration(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Health Test\nemail = health@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repo, err := Init(ctx, filepath.Join(home, "repository"), "health", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := os.WriteFile(filepath.Join(repo.Config.Repository, "item.txt"), []byte("health content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitPending(ctx, "Add health fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Store.Pin("item.txt"); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := repo.HealthStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.LogicalFiles != 1 || stats.LogicalBytes != int64(len("health content\n")) {
+		t.Fatalf("logical stats = %+v", stats)
+	}
+	if stats.ContentFiles != 1 || stats.MissingPinnedFiles != 0 || stats.PinnedPaths != 1 {
+		t.Fatalf("content policy stats = %+v", stats)
+	}
+	if stats.RepositoryBytes <= 0 || stats.MetadataBytes <= 0 || stats.DiskAvailableBytes <= 0 {
+		t.Fatalf("storage stats = %+v", stats)
+	}
+	if _, err := repo.runner.Run(ctx, "git", "annex", "drop", "--force", "--", "item.txt"); err != nil {
+		t.Fatal(err)
+	}
+	withoutContent, err := repo.HealthStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutContent.LogicalFiles != stats.LogicalFiles || withoutContent.LogicalBytes != stats.LogicalBytes || withoutContent.ContentFiles != 0 {
+		t.Fatalf("logical stats changed when content was evicted: before=%+v after=%+v", stats, withoutContent)
+	}
+}
+
 func TestDirectionalPushPublishesThroughPeerInbox(t *testing.T) {
 	if _, err := exec.LookPath("git-annex"); err != nil {
 		t.Skip("git-annex is not installed")

@@ -229,9 +229,14 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	notifySystemd("READY=1\nSTATUS=DFS mounted at " + mountpoint)
 	heartbeatStop := make(chan struct{})
 	heartbeatDone := make(chan struct{})
+	observationDone := make(chan struct{})
 	go func() {
 		health.heartbeat(heartbeatStop)
 		close(heartbeatDone)
+	}()
+	go func() {
+		health.observe(heartbeatStop, repo, repo.Config.SyncInterval)
+		close(observationDone)
 	}()
 	serveDone := make(chan struct{})
 	go func() {
@@ -241,6 +246,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	shutdown, shutdownReason := waitForMountStop(ctx, options.Signals, serveDone)
 	close(heartbeatStop)
 	<-heartbeatDone
+	<-observationDone
 	if shutdown {
 		logger.Info("shutdown requested", "reason", shutdownReason)
 		health.update("stopping", false, nil)

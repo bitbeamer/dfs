@@ -441,6 +441,7 @@ func TestServeDiagnosticReturnsRepositoryIdentity(t *testing.T) {
 	gitOutput(t, directory, "config", "user.name", "Diagnostic Test")
 	gitOutput(t, directory, "config", "user.email", "diagnostic@example.invalid")
 	gitOutput(t, directory, "commit", "--allow-empty", "-m", "Initialize")
+	gitOutput(t, directory, "annex", "init", "desktop")
 	reachable := filepath.Join(t.TempDir(), "reachable.git")
 	if err := os.Mkdir(reachable, 0o755); err != nil {
 		t.Fatal(err)
@@ -511,6 +512,21 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 		if connection.Status != want[key] {
 			t.Errorf("%s status = %q, want %q", key, connection.Status, want[key])
 		}
+	}
+}
+
+func TestEvaluateMeshDetectsNamespaceDivergence(t *testing.T) {
+	peers := map[string]MeshPeer{
+		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop"},
+		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop"},
+	}
+	reports := map[string]DiagnosticReport{
+		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop", TreeID: "tree-a", Remotes: []RemoteDiagnostic{{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop", TreeID: "tree-b", Remotes: []RemoteDiagnostic{{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+	}
+	report := evaluateMesh(peers, reports, nil)
+	if report.Complete || report.NamespaceStatus != "inconsistent" || len(report.Issues) != 1 || report.Issues[0].Code != "NAMESPACE_DIVERGED" {
+		t.Fatalf("mesh report = %+v", report)
 	}
 }
 

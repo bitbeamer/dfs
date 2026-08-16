@@ -23,9 +23,9 @@ func TestPrintMeshReport(t *testing.T) {
 	var output bytes.Buffer
 	printMeshReport(&output, report)
 	for _, expected := range []string{
-		"FROM\tTO\tSTATUS\tDETAIL\n",
-		"desktop (a)\tlaptop (b)\tOK\t\n",
-		"laptop (b)\tdesktop (a)\tFAILED\tconnection refused\n",
+		"FROM     TO       STATUS  DETAIL",
+		"desktop  laptop   OK      QUIC",
+		"laptop   desktop  FAILED  connection refused",
 	} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("mesh output does not contain %q:\n%s", expected, output.String())

@@ -26,6 +26,8 @@ const diagnosticCommand = "dfs-peer-diagnose-v2"
 
 type RemoteDiagnostic struct {
 	Name                 string `json:"name"`
+	PeerID               string `json:"peer_id,omitempty"`
+	PeerName             string `json:"peer_name,omitempty"`
 	Reachable            bool   `json:"reachable"`
 	Error                string `json:"error,omitempty"`
 	PasswordlessSSH      bool   `json:"passwordless_ssh"`
@@ -36,29 +38,51 @@ type RemoteDiagnostic struct {
 }
 
 type DiagnosticReport struct {
-	Version      int                `json:"version"`
-	FileSystemID string             `json:"filesystem_id"`
-	PeerID       string             `json:"peer_id"`
-	PeerName     string             `json:"peer_name"`
-	Remotes      []RemoteDiagnostic `json:"remotes"`
+	Version              int                    `json:"version"`
+	ObservedAt           time.Time              `json:"observed_at"`
+	FileSystemID         string                 `json:"filesystem_id"`
+	NetworkName          string                 `json:"network_name"`
+	PeerID               string                 `json:"peer_id"`
+	PeerName             string                 `json:"peer_name"`
+	Role                 string                 `json:"role"`
+	Endpoint             string                 `json:"endpoint,omitempty"`
+	InstancePort         int                    `json:"instance_port,omitempty"`
+	TreeID               string                 `json:"tree_id,omitempty"`
+	MembershipMembers    int                    `json:"membership_members"`
+	ConfiguredPeers      int                    `json:"configured_peers"`
+	ReconciliationStatus string                 `json:"reconciliation_status"`
+	Stats                repository.HealthStats `json:"stats"`
+	Issues               []HealthIssue          `json:"issues,omitempty"`
+	Remotes              []RemoteDiagnostic     `json:"remotes"`
+}
+
+type HealthIssue struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Detail   string `json:"detail"`
+	Action   string `json:"action"`
 }
 
 type MeshPeer struct {
-	PeerID   string
-	PeerName string
+	PeerID   string `json:"peer_id"`
+	PeerName string `json:"peer_name"`
 }
 
 type MeshConnection struct {
-	FromPeerID string
-	ToPeerID   string
-	Status     string
-	Error      string
+	FromPeerID string `json:"from_peer_id"`
+	ToPeerID   string `json:"to_peer_id"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
 }
 
 type MeshReport struct {
-	Peers       []MeshPeer
-	Connections []MeshConnection
-	Complete    bool
+	ObservedAt      time.Time          `json:"observed_at"`
+	Peers           []MeshPeer         `json:"peers"`
+	Connections     []MeshConnection   `json:"connections"`
+	Reports         []DiagnosticReport `json:"reports"`
+	NamespaceStatus string             `json:"namespace_status"`
+	Issues          []HealthIssue      `json:"issues,omitempty"`
+	Complete        bool               `json:"complete"`
 }
 
 // Diagnose probes all paired DFS remotes from this peer without changing any
@@ -78,8 +102,56 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	if err != nil {
 		return DiagnosticReport{}, err
 	}
-	report := DiagnosticReport{
-		Version: 2, FileSystemID: filesystemID, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
+	stats, err := repo.HealthStats(ctx)
+	if err != nil {
+		return DiagnosticReport{}, fmt.Errorf("collect repository health: %w", err)
+	}
+	treeID, err := repo.TreeID(ctx)
+	if err != nil {
+		return DiagnosticReport{}, fmt.Errorf("inspect namespace tree: %w", err)
+	}
+	report := DiagnosticReport{Version: 2, ObservedAt: time.Now().UTC(), FileSystemID: filesystemID,
+		NetworkName: repo.Config.NetworkName, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
+		TreeID: treeID, ConfiguredPeers: len(remotes), Stats: stats, ReconciliationStatus: "ready"}
+	if state, stateErr := readRuntimeState(repo.Config.Repository); stateErr == nil {
+		report.Endpoint = state.Endpoint
+		if endpoint, parseErr := url.Parse(state.Endpoint); parseErr == nil {
+			report.InstancePort, _ = strconv.Atoi(endpoint.Port())
+		}
+	}
+	membersByRemote := make(map[string]MeshPeer)
+	if records, membershipErr := acceptedMembership(ctx, repo, filesystemID); membershipErr == nil {
+		report.MembershipMembers = len(records)
+		for _, record := range records {
+			membersByRemote[pairedRemoteName(record.Payload.PeerID)] = MeshPeer{
+				PeerID: record.Payload.PeerID, PeerName: record.Payload.Name,
+			}
+			if record.Payload.PeerID == repo.Config.PeerID {
+				report.Role = record.Payload.Role
+			}
+		}
+		if expected := len(records) - 1; expected > len(remotes) {
+			report.ReconciliationStatus = "pending"
+			report.Issues = append(report.Issues, HealthIssue{Code: "RECONCILIATION_PENDING", Severity: "warning",
+				Detail: fmt.Sprintf("%d accepted member(s) are not configured as local peers", expected-len(remotes)),
+				Action: "keep peers online and run dfs sync; use dfs health --mesh to identify incomplete edges"})
+		}
+	}
+	if report.Role == "" {
+		report.Role = "unknown"
+	}
+	if stats.MissingPinnedFiles > 0 {
+		report.Issues = append(report.Issues, HealthIssue{Code: "PINNED_CONTENT_MISSING", Severity: "error",
+			Detail: fmt.Sprintf("%d pinned file(s) are not held locally", stats.MissingPinnedFiles),
+			Action: "run dfs sync and verify that another peer or durable remote still holds the content"})
+	}
+	if stats.CacheLimitBytes > 0 && stats.CacheBytes > stats.CacheLimitBytes {
+		report.Issues = append(report.Issues, HealthIssue{Code: "CACHE_OVER_LIMIT", Severity: "warning",
+			Detail: "local annex object storage exceeds the configured cache limit", Action: "run dfs cache prune"})
+	}
+	if stats.DiskTotalBytes > 0 && stats.DiskAvailableBytes < 1<<30 && stats.DiskAvailableBytes < stats.DiskTotalBytes/20 {
+		report.Issues = append(report.Issues, HealthIssue{Code: "DISK_SPACE_LOW", Severity: "warning",
+			Detail: "less than 1 GiB and 5% of the repository filesystem remains available", Action: "free disk space or reduce the local cache limit"})
 	}
 	checks := make([]RemoteDiagnostic, len(remotes))
 	var checksWait sync.WaitGroup
@@ -90,7 +162,8 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 		checksWait.Add(1)
 		go func(index int, remote repository.Remote) {
 			defer checksWait.Done()
-			check := RemoteDiagnostic{Name: remote.Name, Reachable: true}
+			member := membersByRemote[remote.Name]
+			check := RemoteDiagnostic{Name: remote.Name, PeerID: member.PeerID, PeerName: member.PeerName, Reachable: true}
 			managedResult := make(chan error, 1)
 			fallbackResult := make(chan error, 1)
 			sshResult := make(chan error, 1)
@@ -139,6 +212,17 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	for _, check := range checks {
 		if check.Name != "" {
 			report.Remotes = append(report.Remotes, check)
+			if !check.Reachable {
+				report.Issues = append(report.Issues, HealthIssue{Code: "PEER_UNREACHABLE", Severity: "warning",
+					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs doctor --mesh"})
+			} else if check.Transport == "ssh-fallback" {
+				report.Issues = append(report.Issues, HealthIssue{Code: "SSH_FALLBACK", Severity: "warning",
+					Detail: check.Name + " is reachable only through SSH fallback", Action: "check UDP reachability for the peer's managed DFS port"})
+			}
+			if check.Reachable && !check.PasswordlessSSH {
+				report.Issues = append(report.Issues, HealthIssue{Code: "PASSWORDLESS_SSH_FAILED", Severity: "error",
+					Detail: check.Name + ": " + check.PasswordlessSSHError, Action: "configure ordinary non-interactive SSH for this directed peer path"})
+			}
 		}
 	}
 	sort.Slice(report.Remotes, func(i, j int) bool { return report.Remotes[i].Name < report.Remotes[j].Name })
@@ -164,6 +248,11 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	peers := map[string]MeshPeer{
 		repo.Config.PeerID: {PeerID: repo.Config.PeerID, PeerName: repo.Config.Name},
 	}
+	if records, membershipErr := acceptedMembership(ctx, repo, filesystemID); membershipErr == nil {
+		for _, record := range records {
+			peers[record.Payload.PeerID] = MeshPeer{PeerID: record.Payload.PeerID, PeerName: record.Payload.Name}
+		}
+	}
 	if offers, discoverErr := Discover(ctx, discoveryTimeout); discoverErr == nil {
 		for _, offer := range offers {
 			if offer.FileSystemID == filesystemID && offer.PeerID != repo.Config.PeerID {
@@ -184,6 +273,14 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	}
 	reports[local.PeerID] = local
 
+	type reportResult struct {
+		peerID     string
+		remoteName string
+		report     DiagnosticReport
+		err        error
+	}
+	results := make(chan reportResult, len(remotes))
+	requests := 0
 	for _, remote := range remotes {
 		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
 			continue
@@ -194,14 +291,22 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 			peerID = strings.TrimPrefix(remote.Name, "dfs-peer-")
 			peers[peerID] = MeshPeer{PeerID: peerID, PeerName: remote.Name}
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, probeTimeout+time.Second)
-		report, requestErr := requestDiagnostic(requestCtx, repo, remote, probeTimeout)
-		cancel()
+		requests++
+		go func(peerID string) {
+			requestCtx, cancel := context.WithTimeout(ctx, probeTimeout+time.Second)
+			defer cancel()
+			report, requestErr := requestDiagnostic(requestCtx, repo, remote, probeTimeout)
+			results <- reportResult{peerID: peerID, remoteName: remote.Name, report: report, err: requestErr}
+		}(peerID)
+	}
+	for range requests {
+		result := <-results
+		peerID, report, requestErr := result.peerID, result.report, result.err
 		if requestErr != nil {
 			reportErrors[peerID] = conciseError(requestErr)
 			continue
 		}
-		if report.FileSystemID != filesystemID || pairedRemoteName(report.PeerID) != remote.Name {
+		if report.FileSystemID != filesystemID || pairedRemoteName(report.PeerID) != result.remoteName {
 			reportErrors[peerID] = "remote diagnostic returned a different filesystem or peer identity"
 			continue
 		}
@@ -228,7 +333,7 @@ func meshPeerIDForRemote(peers map[string]MeshPeer, remoteName string) string {
 }
 
 func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport, reportErrors map[string]string) MeshReport {
-	result := MeshReport{Complete: true}
+	result := MeshReport{ObservedAt: time.Now().UTC(), Complete: true, NamespaceStatus: "converged"}
 	for _, participant := range peers {
 		result.Peers = append(result.Peers, participant)
 	}
@@ -268,6 +373,30 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 			}
 			result.Connections = append(result.Connections, connection)
 		}
+	}
+	seenReports := make(map[string]bool)
+	trees := make(map[string]bool)
+	missingTree := false
+	for _, participant := range result.Peers {
+		if report, found := reports[participant.PeerID]; found && !seenReports[report.PeerID] {
+			seenReports[report.PeerID] = true
+			result.Reports = append(result.Reports, report)
+			if report.TreeID != "" {
+				trees[report.TreeID] = true
+			} else {
+				missingTree = true
+			}
+		}
+	}
+	sort.Slice(result.Reports, func(i, j int) bool { return result.Reports[i].PeerName < result.Reports[j].PeerName })
+	if len(trees) > 1 {
+		result.NamespaceStatus = "inconsistent"
+		result.Complete = false
+		result.Issues = append(result.Issues, HealthIssue{Code: "NAMESPACE_DIVERGED", Severity: "error",
+			Detail: "online peers report different logical namespace trees", Action: "run dfs sync on the affected peers and repeat dfs health --mesh"})
+	} else if len(result.Reports) < len(result.Peers) || missingTree {
+		result.NamespaceStatus = "unknown"
+		result.Complete = false
 	}
 	return result
 }

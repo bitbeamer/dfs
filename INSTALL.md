@@ -252,9 +252,18 @@ Verify the peer:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository health
+dfs --repo ~/.local/share/dfs/repository health --mesh
 dfs --repo ~/.local/share/dfs/repository peer list
 dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
+
+`health` reports the managed mount plus filesystem identity, logical size and
+file count, instance port, role, repository and metadata size, cache and disk
+use, content holdings, pins, reconciliation, and timestamped peer observations.
+`health --mesh` actively collects those details from all responding members,
+compares namespace convergence, and verifies every directed peer edge. Use
+`--json` with either form for complete machine-readable diagnostics; the normal
+terminal view shortens transport errors and avoids repeating them per peer.
 
 `doctor --mesh` verifies managed QUIC, the repository-restricted SSH fallback,
 and ordinary passwordless, non-interactive SSH for every directed peer pair. A

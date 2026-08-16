@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/peer"
+	"github.com/bitbeamer/dfs/internal/repository"
 )
 
 const (
@@ -25,17 +28,19 @@ const (
 )
 
 type HealthReport struct {
-	Version    int       `json:"version"`
-	State      string    `json:"state"`
-	Healthy    bool      `json:"healthy"`
-	PID        int       `json:"pid"`
-	Hostname   string    `json:"hostname"`
-	Peer       string    `json:"peer"`
-	Repository string    `json:"repository"`
-	Mountpoint string    `json:"mountpoint"`
-	StartedAt  time.Time `json:"started_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	Error      string    `json:"error,omitempty"`
+	Version          int                    `json:"version"`
+	State            string                 `json:"state"`
+	Healthy          bool                   `json:"healthy"`
+	PID              int                    `json:"pid"`
+	Hostname         string                 `json:"hostname"`
+	Peer             string                 `json:"peer"`
+	Repository       string                 `json:"repository"`
+	Mountpoint       string                 `json:"mountpoint"`
+	StartedAt        time.Time              `json:"started_at"`
+	UpdatedAt        time.Time              `json:"updated_at"`
+	Error            string                 `json:"error,omitempty"`
+	Operational      *peer.DiagnosticReport `json:"operational,omitempty"`
+	OperationalError string                 `json:"operational_error,omitempty"`
 }
 
 type healthReporter struct {
@@ -85,6 +90,52 @@ func (r *healthReporter) heartbeat(stop <-chan struct{}) {
 		case <-ticker.C:
 			r.update("ready", true, nil)
 			notifySystemd("WATCHDOG=1")
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (r *healthReporter) observe(stop <-chan struct{}, repo *repository.Repository, interval time.Duration) {
+	if interval < 30*time.Second {
+		interval = 30 * time.Second
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+			type observation struct {
+				report peer.DiagnosticReport
+				err    error
+			}
+			result := make(chan observation, 1)
+			go func() {
+				report, err := peer.Diagnose(ctx, repo, 10*time.Second)
+				result <- observation{report: report, err: err}
+			}()
+			var observed observation
+			select {
+			case observed = <-result:
+				cancel()
+			case <-stop:
+				cancel()
+				return
+			}
+			r.mu.Lock()
+			if observed.err != nil {
+				r.report.OperationalError = observed.err.Error()
+			} else {
+				r.report.Operational = &observed.report
+				r.report.OperationalError = ""
+			}
+			snapshot := r.report
+			r.mu.Unlock()
+			if writeErr := writeHealth(r.path, snapshot); writeErr != nil {
+				r.logger.Warn("operational health update failed", "error", writeErr)
+			}
+			timer.Reset(interval)
 		case <-stop:
 			return
 		}

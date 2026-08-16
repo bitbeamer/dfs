@@ -48,6 +48,9 @@ content to be present locally.
   mutually authenticated QUIC, with repository-restricted SSH as a fallback.
 - Diagnose every directed peer-to-peer path, including ordinary passwordless
   SSH, with `doctor --mesh`.
+- Inspect service, namespace, repository, cache, disk, content-policy,
+  membership, and peer health with `dfs health`; add `--mesh` for an active
+  whole-cluster check and namespace-convergence comparison.
 - Run more than one active DFS filesystem on the same host. Each repository has
   independent state, mountpoint, service, logs, and TCP/UDP transport port.
 
@@ -286,13 +289,27 @@ dropped.
 ```sh
 dfs --repo ~/.local/share/dfs/repository health
 dfs --repo ~/.local/share/dfs/repository health --json
+dfs --repo ~/.local/share/dfs/repository health --mesh
+dfs --repo ~/.local/share/dfs/repository health --mesh --json
 dfs --repo ~/.local/share/dfs/repository doctor
 dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
 
 `health` validates the private `.git/dfs/health.json` heartbeat, owner process,
-and mountpoint. `doctor` checks local dependencies. `doctor --mesh` additionally
-asks every known mounted peer to test every configured peer in both directions:
+and mountpoint, then displays the daemon's timestamped operational observation.
+That observation includes network identity and role, instance port, logical file
+count and size, repository/metadata/private-state sizes, cache and disk use,
+local content holdings, pins, reconciliation state, outgoing reachability, and
+actionable degraded-state guidance. The daemon refreshes it periodically without
+hydrating missing content. `health --mesh` actively queries every configured or
+discovered member in parallel, reports the same metrics for each responding
+peer, checks every directed connection, and compares online namespace tree IDs.
+The human-readable view is a compact peer and connection summary with shortened,
+deduplicated errors; `--json` retains complete diagnostic details. The command
+exits unsuccessfully when the cluster is incomplete or inconsistent.
+
+`doctor` remains the dependency and low-level transport diagnostic.
+`doctor --mesh` asks every known mounted peer to test every configured peer in both directions:
 `desktop -> laptop` and `laptop -> desktop` are separate rows. Each read-only
 probe tests mutually authenticated QUIC, the repository-restricted SSH
 fallback, and ordinary passwordless non-interactive SSH.
