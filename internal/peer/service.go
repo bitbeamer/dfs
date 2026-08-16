@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,18 +43,15 @@ type Service struct {
 	logger           *slog.Logger
 	filesystemID     string
 	fingerprint      string
-	identity         transportIdentity
 	membershipKey    ed25519.PrivateKey
 	membershipRecord membership.Record
+	members          []membership.Record
 	endorsements     []membership.Endorsement
-	listener         net.Listener
 	managed          *managed.Server
-	httpServer       *http.Server
 	mdnsServers      []mdnsAdvertiser
 	statePath        string
 	mu               sync.Mutex
 	attempts         map[string]attemptWindow
-	done             chan struct{}
 	cleanupStop      chan struct{}
 	cleanupDone      chan struct{}
 }
@@ -100,10 +95,6 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	if err != nil {
 		return nil, err
 	}
-	identity, err := ensureRepositoryTransport(ctx, repo)
-	if err != nil {
-		return nil, err
-	}
 	if listener == nil {
 		listener, err = net.Listen("tcp", ":0")
 		if err != nil {
@@ -111,7 +102,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		}
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	membershipKey, membershipRecord, err := ensureLocalMembership(ctx, repo, filesystemID, identity, port)
+	membershipKey, membershipRecord, err := ensureLocalMembership(ctx, repo, filesystemID, port)
 	if err != nil {
 		return nil, fmt.Errorf("prepare DFS membership: %w", err)
 	}
@@ -129,19 +120,10 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	}
 	service := &Service{
 		repo: repo, logger: logger.With("component", "peer-network"), filesystemID: filesystemID,
-		fingerprint: fingerprint, identity: identity, membershipKey: membershipKey, membershipRecord: membershipRecord, endorsements: endorsements, listener: tls.NewListener(listener, &tls.Config{
-			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
-		}),
-		statePath: filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), runtimeStateFile),
-		attempts:  make(map[string]attemptWindow), done: make(chan struct{}),
+		fingerprint: fingerprint, membershipKey: membershipKey, membershipRecord: membershipRecord, members: accepted, endorsements: endorsements,
+		statePath:   filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), runtimeStateFile),
+		attempts:    make(map[string]attemptWindow),
 		cleanupStop: make(chan struct{}), cleanupDone: make(chan struct{}),
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/pair/start", service.handlePairStart)
-	mux.HandleFunc("/v1/pair/complete", service.handlePairComplete)
-	service.httpServer = &http.Server{
-		Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
-		WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second,
 	}
 	pairHandler := func(ctx context.Context, operation string, remote net.Addr, payload json.RawMessage) (json.RawMessage, error) {
 		path := "/v1/pair/start"
@@ -149,6 +131,12 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		if operation == "pair-complete" {
 			path = "/v1/pair/complete"
 			handler = service.handlePairComplete
+		} else if operation == "join-request" {
+			path = "/v1/join/request"
+			handler = service.handleJoinRequest
+		} else if operation == "join-status" {
+			path = "/v1/join/status"
+			handler = service.handleJoinStatus
 		}
 		request := httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(payload))
 		request.RemoteAddr = remote.String()
@@ -169,12 +157,13 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 			return nil, err
 		}
 		return json.Marshal(report)
-	}, &certificate, pairHandler, changed)
+	}, &certificate, pairHandler, service.authorizePairClone, changed)
 	if err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("start DFS managed QUIC transport: %w", err)
 	}
 	service.managed = managedService
+	_ = listener.Close()
 	if advertise {
 		interfaces := interfaceProvider()
 		if len(interfaces) == 0 {
@@ -208,13 +197,6 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		_ = listener.Close()
 		return nil, err
 	}
-	go func() {
-		err := service.httpServer.Serve(service.listener)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			service.logger.Error("pairing service stopped unexpectedly", "error", err)
-		}
-		close(service.done)
-	}()
 	go service.cleanupInvitations()
 	service.logger.Info("peer discovery ready", "filesystem_id", filesystemID, "endpoint", endpoint)
 	return service, nil
@@ -226,17 +208,11 @@ func (s *Service) Close() error {
 	}
 	close(s.cleanupStop)
 	<-s.cleanupDone
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	err := s.httpServer.Shutdown(ctx)
+	var err error
 	if s.managed != nil {
 		if managedErr := s.managed.Close(); err == nil {
 			err = managedErr
 		}
-	}
-	select {
-	case <-s.done:
-	case <-ctx.Done():
 	}
 	if state, stateErr := readRuntimeState(s.repo.Config.Repository); stateErr == nil && state.PID == os.Getpid() {
 		_ = os.Remove(s.statePath)
@@ -257,11 +233,7 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		writeProtocolError(response, http.StatusBadRequest, "valid peer ID and name are required")
 		return
 	}
-	if _, err := normalizePublicKey(input.SSHPublicKey); err != nil {
-		writeProtocolError(response, http.StatusBadRequest, "valid peer SSH public key is required")
-		return
-	}
-	if err := validatePairingMembership(input.Membership, s.filesystemID, input.PeerID, input.PeerName, input.SSHPublicKey, input.ReversePath); err != nil {
+	if err := validatePairingMembership(input.Membership, s.filesystemID, input.PeerID, input.PeerName); err != nil {
 		writeProtocolError(response, http.StatusBadRequest, "valid signed peer membership is required")
 		return
 	}
@@ -274,7 +246,8 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 	}
 	record, err := loadInvitation(s.repo.Config.Repository, input.InvitationID)
 	if err != nil || record.FileSystemID != s.filesystemID || !record.ExpiresAt.After(time.Now()) ||
-		subtle.ConstantTimeCompare([]byte(record.SecretHash), []byte(secretHash(input.Secret))) != 1 {
+		subtle.ConstantTimeCompare([]byte(record.SecretHash), []byte(secretHash(input.Secret))) != 1 ||
+		(record.BoundPeerID != "" && record.BoundPeerID != input.PeerID) {
 		s.recordPairingFailure(remote, time.Now())
 		s.logger.Warn("pairing request rejected", "remote", remote)
 		writeProtocolError(response, http.StatusUnauthorized, "invalid or expired pairing invitation")
@@ -312,18 +285,6 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		return
 	}
 	cloneURL := record.CloneURL
-	if cloneURL == "" {
-		account, userErr := user.Current()
-		if userErr != nil {
-			writeProtocolError(response, http.StatusInternalServerError, "cannot determine DFS account")
-			return
-		}
-		cloneURL, err = sshURL(account.Username, localAddress(request), s.repo.Config.Repository)
-		if err != nil {
-			writeProtocolError(response, http.StatusInternalServerError, "cannot build peer URL")
-			return
-		}
-	}
 	completionSecret, err := randomString(32)
 	if err != nil {
 		writeProtocolError(response, http.StatusInternalServerError, "cannot create pairing session")
@@ -339,37 +300,13 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		writeProtocolError(response, http.StatusInternalServerError, "cannot create pairing session")
 		return
 	}
-	var reverseURL string
-	if input.ReverseUser != "" && input.ReversePath != "" {
-		reverseURL, err = sshURL(input.ReverseUser, remoteAddress(request), input.ReversePath)
-		if err != nil {
-			writeProtocolError(response, http.StatusBadRequest, "invalid reverse peer details")
-			return
-		}
-		knownHosts := filepath.Join(s.repo.Config.Repository, filepath.FromSlash(config.Directory), "known_hosts")
-		if err := installKnownHosts(knownHosts, reverseURL, input.SSHHostKeys); err != nil {
-			writeProtocolError(response, http.StatusBadRequest, "cannot pin reverse peer SSH host keys")
-			return
-		}
-		if err := s.repo.ConfigureSSHCommand(request.Context(), transportSSHCommand(s.identity.PrivateKey, knownHosts)); err != nil {
-			writeProtocolError(response, http.StatusInternalServerError, "cannot configure reverse peer SSH transport")
-			return
-		}
-	}
-	authorizedMarker, err := authorizePeer(input.SSHPublicKey, s.repo.Config.Repository, s.filesystemID, input.PeerID)
-	if err != nil {
-		writeProtocolError(response, http.StatusInternalServerError, "cannot authorize paired peer transport")
-		return
-	}
 	record.Pending = &pendingPair{
 		SessionID: sessionID, CompletionHash: secretHash(completionSecret), PeerID: input.PeerID,
-		PeerName: strings.TrimSpace(input.PeerName), ReverseURL: reverseURL, CloneURL: cloneURL,
-		AuthorizedMarker: authorizedMarker,
-		ExpiresAt:        minTime(record.ExpiresAt, time.Now().UTC().Add(pairingLease)),
-		Membership:       approvedMembership,
+		PeerName: strings.TrimSpace(input.PeerName), CloneURL: cloneURL,
+		ExpiresAt:  minTime(record.ExpiresAt, time.Now().UTC().Add(pairingLease)),
+		Membership: approvedMembership,
 	}
 	if err := saveInvitation(s.repo.Config.Repository, record); err != nil {
-		_ = removeAuthorizedMarker(authorizedMarker)
 		writeProtocolError(response, http.StatusInternalServerError, "cannot persist pairing session")
 		return
 	}
@@ -380,9 +317,8 @@ func (s *Service) startResponse(pending *pendingPair, completionSecret string) P
 	return PairStartResponse{
 		Version: ProtocolVersion, FileSystemID: s.filesystemID, NetworkName: s.repo.Config.NetworkName,
 		PeerName: s.repo.Config.Name, PeerID: s.repo.Config.PeerID, CloneURL: pending.CloneURL,
-		SSHPublicKey: s.identity.PublicKey, SSHHostKeys: localSSHHostKeys(), SessionID: pending.SessionID,
-		CompletionSecret: completionSecret, ExpiresAt: pending.ExpiresAt,
-		Membership: pending.Membership, Approver: s.membershipRecord, Endorsements: s.endorsements,
+		SessionID: pending.SessionID, CompletionSecret: completionSecret, ExpiresAt: pending.ExpiresAt,
+		Membership: pending.Membership, Approver: s.membershipRecord, Members: s.members, Endorsements: s.endorsements,
 	}
 }
 
@@ -400,6 +336,7 @@ func (s *Service) refreshEndorsements(ctx context.Context) error {
 		endorsements = append(endorsements, endorsement)
 	}
 	s.endorsements = endorsements
+	s.members = accepted
 	return nil
 }
 
@@ -441,14 +378,17 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 			writeProtocolError(response, http.StatusInternalServerError, "cannot trust approved peer membership")
 			return
 		}
-		if pending.ReverseURL != "" {
-			ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
-			remoteName, err = s.repo.AddPairedRemote(ctx, pending.PeerID, pending.ReverseURL)
-			cancel()
-			if err != nil {
-				writeProtocolError(response, http.StatusInternalServerError, "cannot configure reverse peer")
-				return
-			}
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "cannot locate DFS executable")
+			return
+		}
+		ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
+		remoteName, err = s.repo.AddManagedRemote(ctx, pending.PeerID, executable)
+		cancel()
+		if err != nil {
+			writeProtocolError(response, http.StatusInternalServerError, "cannot configure reverse peer")
+			return
 		}
 		if err := os.Remove(invitationPath(s.repo.Config.Repository, record.ID)); err != nil {
 			writeProtocolError(response, http.StatusInternalServerError, "cannot finalize pairing invitation")
@@ -459,6 +399,26 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 		return
 	}
 	writeProtocolError(response, http.StatusUnauthorized, "invalid or expired pairing session")
+}
+
+func (s *Service) authorizePairClone(_ context.Context, sessionID, completionSecret string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	infos, err := ListInvitations(s.repo.Config.Repository, time.Now())
+	if err != nil {
+		return errors.New("cannot inspect pairing sessions")
+	}
+	for _, info := range infos {
+		record, loadErr := loadInvitation(s.repo.Config.Repository, info.ID)
+		if loadErr != nil || record.Pending == nil || record.Pending.SessionID != sessionID {
+			continue
+		}
+		pending := record.Pending
+		if pending.ExpiresAt.After(time.Now()) && subtle.ConstantTimeCompare([]byte(pending.CompletionHash), []byte(secretHash(completionSecret))) == 1 {
+			return nil
+		}
+	}
+	return errors.New("invalid or expired pairing session")
 }
 
 func (s *Service) cleanupInvitations() {
@@ -612,7 +572,7 @@ func mdnsHostname(host string) string {
 }
 
 func runtimeEndpoint(port int) string {
-	return "https://" + net.JoinHostPort(strings.TrimSuffix(localMDNSHostname(), "."), strconv.Itoa(port))
+	return "quic://" + net.JoinHostPort(strings.TrimSuffix(localMDNSHostname(), "."), strconv.Itoa(port))
 }
 
 func writeRuntimeState(path string, state runtimeState) error {

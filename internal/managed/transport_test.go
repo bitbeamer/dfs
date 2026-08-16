@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -82,7 +83,7 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	received := make(chan string, 16)
-	server, err := Start(serverRepo, "127.0.0.1:0", func(context.Context) ([]byte, error) { return []byte(`{"peer":"server"}`), nil }, nil, nil, func(reason string, _ []string) {
+	server, err := Start(serverRepo, "127.0.0.1:0", func(context.Context) ([]byte, error) { return []byte(`{"peer":"server"}`), nil }, nil, nil, nil, func(reason string, _ []string) {
 		received <- reason
 	})
 	if err != nil {
@@ -113,7 +114,7 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if _, err := clientRepo.AdoptClonedPeer(ctx, serverRepo.Config.PeerID); err != nil {
 		t.Fatalf("adopt cloned peer: %v", err)
 	}
-	remoteName, err := clientRepo.AddManagedRemote(ctx, serverRepo.Config.PeerID, binary, serverRecord.Payload.SSH.Endpoint)
+	remoteName, err := clientRepo.AddManagedRemote(ctx, serverRepo.Config.PeerID, binary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,11 +143,13 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "ssh"), []byte("#!/bin/sh\nfor last do :; done\nexec sh -c \"$last\"\n"), 0o755); err != nil {
+	sshMarker := filepath.Join(home, "ssh-invoked")
+	if err := os.WriteFile(filepath.Join(fakeBin, "ssh"), []byte("#!/bin/sh\ntouch \"$DFS_SSH_MARKER\"\nexit 99\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	originalPath := os.Getenv("PATH")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+originalPath)
+	t.Setenv("DFS_SSH_MARKER", sshMarker)
 	offlineRecord := serverRecord
 	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -167,8 +170,14 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if err := membership.Save(clientRepo.Config.Repository, offlineRecord); err != nil {
 		t.Fatal(err)
 	}
-	if err := clientRepo.ProbeRemote(ctx, remoteName); err != nil {
-		t.Fatalf("Git metadata over SSH fallback: %v", err)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 3*time.Second)
+	if err := clientRepo.ProbeRemote(probeCtx, remoteName); err == nil {
+		cancelProbe()
+		t.Fatal("offline QUIC remote unexpectedly succeeded")
+	}
+	cancelProbe()
+	if _, err := os.Stat(sshMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("offline QUIC probe invoked SSH: %v", err)
 	}
 	if err := membership.Save(clientRepo.Config.Repository, serverRecord); err != nil {
 		t.Fatal(err)
@@ -269,18 +278,20 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 		t.Fatalf("managed repository fetch = %q, %v", materialized, err)
 	}
 	if output, err := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "annex", "drop", "--force", "--", "payload.txt").CombinedOutput(); err != nil {
-		t.Fatalf("drop content before SSH fallback: %v\n%s", err, output)
+		t.Fatalf("drop content before offline QUIC test: %v\n%s", err, output)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+originalPath)
 	if err := membership.Save(clientRepo.Config.Repository, offlineRecord); err != nil {
 		t.Fatal(err)
 	}
-	if err := clientRepo.Fetch(ctx, "payload.txt", remoteName); err != nil {
-		t.Fatalf("repository content over SSH fallback: %v", err)
+	fetchCtx, cancelFetch := context.WithTimeout(ctx, 3*time.Second)
+	if err := clientRepo.Fetch(fetchCtx, "payload.txt", remoteName); err == nil {
+		cancelFetch()
+		t.Fatal("content fetch from offline QUIC peer unexpectedly succeeded")
 	}
-	materialized, err = os.ReadFile(filepath.Join(clientRepo.Config.Repository, "payload.txt"))
-	if err != nil || string(materialized) != string(payload) {
-		t.Fatalf("SSH fallback repository fetch = %q, %v", materialized, err)
+	cancelFetch()
+	if _, err := os.Stat(sshMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("offline QUIC content fetch invoked SSH: %v", err)
 	}
 }
 

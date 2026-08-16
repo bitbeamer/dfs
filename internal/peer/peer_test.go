@@ -3,15 +3,9 @@ package peer
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
-	"log"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -21,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/wakeup"
@@ -30,7 +25,7 @@ import (
 func TestInvitationRoundTripAndValidation(t *testing.T) {
 	invitation := Invitation{
 		Version: ProtocolVersion, FileSystemID: strings.Repeat("a", 40), InvitationID: "invite",
-		Secret: "secret", CertificateSHA256: strings.Repeat("b", 64), Endpoint: "https://desktop.local:1234",
+		Secret: "secret", CertificateSHA256: strings.Repeat("b", 64), QUICEndpoint: "quic://desktop.local:1234",
 	}
 	encoded, err := invitation.Encode()
 	if err != nil {
@@ -60,7 +55,7 @@ func TestOfferFromEvent(t *testing.T) {
 	if !found {
 		t.Fatal("valid event did not produce an offer")
 	}
-	if offer.NetworkName != "Home Files" || offer.PeerName != "Desktop" || offer.Endpoint != "https://192.0.2.10:44123" {
+	if offer.NetworkName != "Home Files" || offer.PeerName != "Desktop" || offer.Endpoint != "quic://192.0.2.10:44123" {
 		t.Fatalf("offer = %#v", offer)
 	}
 
@@ -100,7 +95,7 @@ func TestServiceAdvertisesWithMDNS(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, command := range []string{"git-annex", "ssh", "rsync"} {
+	for _, command := range []string{"git-annex"} {
 		if err := os.WriteFile(filepath.Join(bin, command), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -235,7 +230,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 	var foundReverse bool
 	for _, remote := range remotes {
-		if remote.Name == result.ReverseRemoteName && strings.Contains(remote.URL, destination) {
+		if remote.Name == result.ReverseRemoteName && strings.HasPrefix(remote.URL, "ext::") {
 			foundReverse = true
 		}
 	}
@@ -250,23 +245,16 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	if len(joinedRemotes) != 1 || joinedRemotes[0].Name != expectedSource {
 		t.Fatalf("joined remotes = %#v, want paired source %q", joinedRemotes, expectedSource)
 	}
-	authorized, err := os.ReadFile(filepath.Join(home, ".ssh", "authorized_keys"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{"restrict,command=", " peer serve", existing.Config.Repository, destination, "dfs-peer-"} {
-		if !strings.Contains(string(authorized), expected) {
-			t.Fatalf("authorized_keys does not contain %q:\n%s", expected, authorized)
-		}
+	if _, err := os.Stat(filepath.Join(home, ".ssh", "authorized_keys")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("QUIC pairing modified authorized_keys: %v", err)
 	}
 	for _, repo := range []*repository.Repository{existing, result.Repository} {
-		output := gitOutput(t, repo.Config.Repository, "config", "--get", "core.sshCommand")
-		if !strings.Contains(output, transportKeyFile) || !strings.Contains(output, "BatchMode=yes") {
-			t.Fatalf("paired SSH command = %q", output)
+		command := exec.Command("git", "-C", repo.Config.Repository, "config", "--get", "core.sshCommand")
+		if output, err := command.CombinedOutput(); err == nil {
+			t.Fatalf("QUIC pairing configured core.sshCommand = %q", output)
 		}
-		info, err := os.Stat(filepath.Join(repo.Config.Repository, ".git", "dfs", transportKeyFile))
-		if err != nil || info.Mode().Perm() != 0o600 {
-			t.Fatalf("transport key mode = %v, %v", info, err)
+		if _, err := os.Stat(filepath.Join(repo.Config.Repository, ".git", "dfs", transportKeyFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("QUIC pairing created an SSH transport key: %v", err)
 		}
 		records, err := membership.LoadAll(repo.Config.Repository)
 		if err != nil || len(records) != 2 {
@@ -301,6 +289,87 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 	if len(active) != 0 {
 		t.Fatalf("completed invitation remains active: %#v", active)
+	}
+}
+
+func TestDiscoveredJoinRequestRequiresExplicitBoundApproval(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git-annex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Join Test\nemail = join@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repo, err := repository.Init(ctx, filepath.Join(home, "source"), "source", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := startService(repo, nil, listener, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	filesystemID, err := repo.FileSystemID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network := Network{FileSystemID: filesystemID, NetworkName: "Join Test", Offers: []Offer{{
+		FileSystemID: filesystemID, NetworkName: "Join Test", PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
+		Endpoint: "quic://" + listener.Addr().String(), ProtocolVersion: ProtocolVersion, CertificateSHA256: service.fingerprint,
+	}}}
+	joiningID := "abcdef0123456789"
+	stateDirectory := filepath.Join(home, "join-state")
+	credentials, err := SubmitJoinRequest(ctx, network, joiningID, "joining", stateDirectory, 7844, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(joinRequestPath(repo.Config.Repository, credentials.RequestID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), credentials.Secret) {
+		t.Fatal("persisted join request contains its bearer secret")
+	}
+	if invitation, approved, err := PollJoinApproval(ctx, network, credentials); err != nil || approved {
+		t.Fatalf("unapproved request = %#v, %v, %v", invitation, approved, err)
+	}
+	invitation, err := ApproveJoinRequest(repo, credentials.RequestID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvedInvitation, approved, err := PollJoinApproval(ctx, network, credentials)
+	if err != nil || !approved || approvedInvitation.InvitationID != invitation.InvitationID {
+		t.Fatalf("approved request = %#v, %v, %v", approvedInvitation, approved, err)
+	}
+	_, wrongMembership, err := newMembershipDraft(filepath.Join(home, "wrong-state"), filesystemID, "fedcba9876543210", "wrong", 7845)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start PairStartResponse
+	err = managed.PairCall(ctx, network.Offers[0].Endpoint, invitation.CertificateSHA256, "pair-start", PairStartRequest{
+		InvitationID: invitation.InvitationID, Secret: invitation.Secret, PeerID: "fedcba9876543210", PeerName: "wrong", Membership: wrongMembership,
+	}, &start)
+	if err == nil {
+		t.Fatalf("approval was not bound to requested peer: %v", err)
+	}
+	var ignored JoinStatusResponse
+	if err := managed.PairCall(ctx, network.Offers[0].Endpoint, strings.Repeat("0", 64), "join-status", JoinStatusRequest{
+		RequestID: credentials.RequestID, Secret: credentials.Secret,
+	}, &ignored); err == nil {
+		t.Fatal("join status accepted the wrong certificate pin")
 	}
 }
 
@@ -654,7 +723,7 @@ func TestRequestDiagnosticUsesPinnedRestrictedSSH(t *testing.T) {
 	}
 }
 
-func TestPairingRejectsWrongCertificatePin(t *testing.T) {
+func TestPairingCertificatePersists(t *testing.T) {
 	home := t.TempDir()
 	certificate, fingerprint, err := loadOrCreateCertificate(home)
 	if err != nil {
@@ -663,18 +732,8 @@ func TestPairingRejectsWrongCertificatePin(t *testing.T) {
 	if len(certificate.Certificate) == 0 || len(fingerprint) != 64 {
 		t.Fatalf("generated certificate fingerprint = %q", fingerprint)
 	}
-	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		response.WriteHeader(http.StatusNoContent)
-	}))
-	server.Config.ErrorLog = log.New(io.Discard, "", 0)
-	defer server.Close()
-	client := pinnedHTTPClient(strings.Repeat("0", 64))
-	defer client.CloseIdleConnections()
-	if _, err := client.Get(server.URL); err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("wrong certificate pin error = %v", err)
-	}
-	// The full pairing test exercises the accepted pin. Also guard the
-	// persisted certificate from changing on reload.
+	// Pairing tests exercise certificate pin acceptance. Guard the persisted
+	// certificate from changing on reload.
 	_, reloaded, err := loadOrCreateCertificate(home)
 	if err != nil {
 		t.Fatal(err)
@@ -685,24 +744,57 @@ func TestPairingRejectsWrongCertificatePin(t *testing.T) {
 }
 
 func TestCompletePairingResumesAndRemovesState(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		var input PairCompleteRequest
-		if err := json.NewDecoder(request.Body).Decode(&input); err != nil || input.SessionID != "session" || input.CompletionSecret != "completion" {
-			http.Error(response, "bad completion", http.StatusBadRequest)
-			return
-		}
-		writeJSON(response, http.StatusOK, PairCompleteResponse{RemoteName: "dfs-peer-123456789abc"})
-	}))
-	server.Config.ErrorLog = log.New(io.Discard, "", 0)
-	defer server.Close()
-	digest := sha256.Sum256(server.Certificate().Raw)
-	repositoryPath := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git-annex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Resume Test\nemail = resume@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	repo, err := repository.Init(ctx, filepath.Join(home, "source"), "source", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := startService(repo, nil, listener, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	invitation, err := CreateInvitation(repo, time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invitation.QUICEndpoint = "quic://" + listener.Addr().String()
+	peerID := "123456789abcdef0"
+	_, draft, err := newMembershipDraft(filepath.Join(home, "draft"), invitation.FileSystemID, peerID, "resuming", 7844)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start PairStartResponse
+	if err := managed.PairCall(ctx, invitation.QUICEndpoint, invitation.CertificateSHA256, "pair-start", PairStartRequest{
+		InvitationID: invitation.InvitationID, Secret: invitation.Secret, PeerID: peerID, PeerName: "resuming", Membership: draft,
+	}, &start); err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(home, "resume")
 	if err := os.MkdirAll(filepath.Join(repositoryPath, ".git", "dfs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := savePairingResume(repositoryPath, pairingResume{
-		Version: ProtocolVersion, Endpoint: server.URL, CertificateSHA256: hex.EncodeToString(digest[:]),
-		SessionID: "session", CompletionSecret: "completion",
+		Version: ProtocolVersion, Endpoint: invitation.QUICEndpoint, CertificateSHA256: invitation.CertificateSHA256,
+		SessionID: start.SessionID, CompletionSecret: start.CompletionSecret,
 	}); err != nil {
 		t.Fatal(err)
 	}

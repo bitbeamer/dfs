@@ -1,18 +1,13 @@
 package peer
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,6 +49,7 @@ func PairAndJoin(ctx context.Context, encodedInvitation, destination, name strin
 }
 
 func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination, name string, cacheLimit int64, discoveryTimeout time.Duration, configureReverse bool, options PairOptions) (*JoinResult, error) {
+	_ = configureReverse // Reciprocal registration is intrinsic to QUIC pairing.
 	invitation, err := DecodeInvitation(encodedInvitation)
 	if err != nil {
 		return nil, err
@@ -98,31 +94,17 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if removeTemporary {
 		defer os.RemoveAll(temporary)
 	}
-	identity, err := ensureTransportIdentity(ctx, temporary, peerID)
-	if err != nil {
-		return nil, err
-	}
-	request.SSHPublicKey = identity.PublicKey
-	request.SSHHostKeys = localSSHHostKeys()
-	if configureReverse {
-		account, userErr := user.Current()
-		if userErr != nil {
-			return nil, fmt.Errorf("determine local account for reverse peer: %w", userErr)
-		}
-		request.ReverseUser = account.Username
-		request.ReversePath = destination
-	}
 	pairingPort := options.PairingPort
 	if pairingPort == 0 {
 		pairingPort = DefaultPairingPort
 	}
-	_, membershipDraft, err := newMembershipDraft(temporary, destination, invitation.FileSystemID, peerID, name, identity.PublicKey, request.SSHHostKeys, pairingPort)
+	_, membershipDraft, err := newMembershipDraft(temporary, invitation.FileSystemID, peerID, name, pairingPort)
 	if err != nil {
 		return nil, fmt.Errorf("create signed DFS membership: %w", err)
 	}
 	request.Membership = membershipDraft
 
-	var quicEndpoints, endpoints []string
+	var quicEndpoints []string
 	discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout+time.Second)
 	offers, discoverErr := Discover(discoveryCtx, discoveryTimeout)
 	cancel()
@@ -134,34 +116,27 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 			if offer.CertificateSHA256 != "" && !strings.EqualFold(offer.CertificateSHA256, invitation.CertificateSHA256) {
 				continue
 			}
-			endpoints = append(endpoints, offer.Endpoint)
-			quicEndpoints = append(quicEndpoints, "quic://"+strings.TrimPrefix(offer.Endpoint, "https://"))
+			quicEndpoints = append(quicEndpoints, offer.Endpoint)
 		}
-	}
-	if invitation.Endpoint != "" {
-		endpoints = append(endpoints, invitation.Endpoint)
 	}
 	if invitation.QUICEndpoint != "" {
 		quicEndpoints = append(quicEndpoints, invitation.QUICEndpoint)
 	}
 	quicEndpoints = uniqueStrings(quicEndpoints)
-	endpoints = uniqueStrings(endpoints)
-	if len(endpoints) == 0 && len(quicEndpoints) == 0 {
+	if len(quicEndpoints) == 0 {
 		if discoverErr != nil {
 			return nil, discoverErr
 		}
 		return nil, errors.New("the invited DFS network was not discovered; ensure an existing peer is mounted and multicast is allowed")
 	}
 
-	client := pinnedHTTPClient(invitation.CertificateSHA256)
-	defer client.CloseIdleConnections()
 	var (
 		start    PairStartResponse
 		endpoint string
 		startErr error
 	)
-	for _, candidate := range append(quicEndpoints, endpoints...) {
-		startErr = postPair(ctx, client, candidate, invitation.CertificateSHA256, "pair-start", request, &start)
+	for _, candidate := range quicEndpoints {
+		startErr = postPair(ctx, candidate, invitation.CertificateSHA256, "pair-start", request, &start)
 		if startErr == nil {
 			endpoint = candidate
 			break
@@ -185,25 +160,14 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := membership.VerifyApproval(start.Membership, start.Approver); err != nil {
 		return nil, fmt.Errorf("verify approved DFS membership: %w", err)
 	}
-	knownHosts := filepath.Join(temporary, "known_hosts")
-	if err := installKnownHosts(knownHosts, start.CloneURL, start.SSHHostKeys); err != nil {
-		return nil, fmt.Errorf("configure paired SSH host verification: %w", err)
+	if !strings.HasPrefix(endpoint, "quic://") {
+		return nil, errors.New("pairing peer did not provide a QUIC bootstrap endpoint")
 	}
-	if _, err := os.Stat(knownHosts); errors.Is(err, os.ErrNotExist) {
-		knownHosts = ""
+	bundlePath := filepath.Join(temporary, "repository.bundle")
+	if err := managed.PairClone(ctx, endpoint, invitation.CertificateSHA256, start.SessionID, start.CompletionSecret, bundlePath); err != nil {
+		return nil, fmt.Errorf("clone paired DFS repository over QUIC: %w", err)
 	}
-	localAuthorization, err := authorizePeer(start.SSHPublicKey, destination, invitation.FileSystemID, start.PeerID)
-	if err != nil {
-		return nil, fmt.Errorf("authorize offering DFS peer: %w", err)
-	}
-	pairCompleted := false
-	defer func() {
-		if !pairCompleted {
-			_ = removeAuthorizedMarker(localAuthorization)
-		}
-	}()
-
-	repo, err := repository.JoinWithSSH(ctx, start.CloneURL, destination, name, cacheLimit, transportSSHCommand(identity.PrivateKey, knownHosts))
+	repo, err := repository.Join(ctx, bundlePath, destination, name, cacheLimit)
 	if err != nil {
 		return nil, fmt.Errorf("clone paired DFS repository: %w", err)
 	}
@@ -225,30 +189,8 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := repo.SaveConfig(); err != nil {
 		return nil, fmt.Errorf("save paired DFS identity: %w", err)
 	}
-	stateDirectory := filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory))
-	installedPrivate := filepath.Join(stateDirectory, transportKeyFile)
-	installedPublic := installedPrivate + ".pub"
-	if err := os.Rename(identity.PrivateKey, installedPrivate); err != nil {
-		return nil, fmt.Errorf("install paired SSH private key: %w", err)
-	}
-	if err := os.Rename(identity.PrivateKey+".pub", installedPublic); err != nil {
-		return nil, fmt.Errorf("install paired SSH public key: %w", err)
-	}
 	if err := os.Rename(membership.KeyPath(temporary), membership.KeyPath(repo.Config.Repository)); err != nil {
 		return nil, fmt.Errorf("install DFS membership private key: %w", err)
-	}
-	installedKnownHosts := ""
-	if knownHosts != "" {
-		installedKnownHosts = filepath.Join(stateDirectory, "known_hosts")
-		if err := os.Rename(knownHosts, installedKnownHosts); err != nil {
-			return nil, fmt.Errorf("install paired SSH host keys: %w", err)
-		}
-	}
-	if err := repo.ConfigureSSHCommand(ctx, transportSSHCommand(installedPrivate, installedKnownHosts)); err != nil {
-		return nil, fmt.Errorf("activate paired SSH transport: %w", err)
-	}
-	if _, err := repo.AdoptClonedPeer(ctx, start.PeerID); err != nil {
-		return nil, fmt.Errorf("name paired source remote: %w", err)
 	}
 	if err := membership.MigrateLegacySharedState(repo.Config.Repository); err != nil {
 		return nil, fmt.Errorf("migrate DFS membership metadata: %w", err)
@@ -259,6 +201,28 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := membership.Save(repo.Config.Repository, start.Membership); err != nil {
 		return nil, fmt.Errorf("save local DFS membership: %w", err)
 	}
+	memberKeys := make(map[string]string, len(start.Endorsements))
+	for _, endorsement := range start.Endorsements {
+		if err := membership.VerifyEndorsement(endorsement, start.Approver); err != nil {
+			return nil, fmt.Errorf("verify DFS membership endorsement: %w", err)
+		}
+		memberKeys[endorsement.PeerID] = endorsement.SigningPublicKey
+	}
+	for _, member := range start.Members {
+		key, endorsed := memberKeys[member.Payload.PeerID]
+		if !endorsed || key != member.Payload.SigningPublicKey {
+			return nil, fmt.Errorf("DFS member %s is not endorsed by the approving peer", member.Payload.PeerID)
+		}
+		if err := membership.VerifySelf(member); err != nil {
+			return nil, fmt.Errorf("verify endorsed DFS member %s: %w", member.Payload.PeerID, err)
+		}
+		if member.Payload.FileSystemID != invitation.FileSystemID {
+			return nil, fmt.Errorf("endorsed DFS member %s belongs to another filesystem", member.Payload.PeerID)
+		}
+		if err := membership.Save(repo.Config.Repository, member); err != nil {
+			return nil, fmt.Errorf("save endorsed DFS member %s: %w", member.Payload.PeerID, err)
+		}
+	}
 	if err := membership.Trust(repo.Config.Repository, start.PeerID, start.Approver.Payload.SigningPublicKey); err != nil {
 		return nil, fmt.Errorf("trust approving DFS member: %w", err)
 	}
@@ -266,12 +230,19 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		return nil, fmt.Errorf("trust local DFS membership: %w", err)
 	}
 	for _, endorsement := range start.Endorsements {
-		if err := membership.VerifyEndorsement(endorsement, start.Approver); err != nil {
-			return nil, fmt.Errorf("verify DFS membership endorsement: %w", err)
-		}
 		if err := membership.Trust(repo.Config.Repository, endorsement.PeerID, endorsement.SigningPublicKey); err != nil {
 			return nil, fmt.Errorf("trust endorsed DFS member: %w", err)
 		}
+	}
+	if err := repo.RemoveRemote(ctx, "origin"); err != nil {
+		return nil, fmt.Errorf("remove temporary bundle remote: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("locate DFS executable: %w", err)
+	}
+	if _, err := repo.AddManagedRemote(ctx, start.PeerID, executable); err != nil {
+		return nil, fmt.Errorf("configure approving QUIC peer: %w", err)
 	}
 	resume := pairingResume{
 		Version: ProtocolVersion, Endpoint: endpoint, CertificateSHA256: invitation.CertificateSHA256,
@@ -280,9 +251,8 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := savePairingResume(repo.Config.Repository, resume); err != nil {
 		return nil, err
 	}
-	pairCompleted = true
 	var complete PairCompleteResponse
-	if err := postPair(ctx, client, endpoint, invitation.CertificateSHA256, "pair-complete", PairCompleteRequest{
+	if err := postPair(ctx, endpoint, invitation.CertificateSHA256, "pair-complete", PairCompleteRequest{
 		SessionID: start.SessionID, CompletionSecret: start.CompletionSecret,
 	}, &complete); err != nil {
 		return nil, fmt.Errorf("repository joined but reciprocal pairing is incomplete: %w; retry with dfs --repo %s network complete", err, repo.Config.Repository)
@@ -311,10 +281,8 @@ func CompletePairing(ctx context.Context, repositoryPath string) (PairCompleteRe
 	if resume.Version != ProtocolVersion || resume.Endpoint == "" || resume.CertificateSHA256 == "" || resume.SessionID == "" || resume.CompletionSecret == "" {
 		return PairCompleteResponse{}, errors.New("incomplete DFS pairing record is invalid")
 	}
-	client := pinnedHTTPClient(resume.CertificateSHA256)
-	defer client.CloseIdleConnections()
 	var complete PairCompleteResponse
-	if err := postPair(ctx, client, resume.Endpoint, resume.CertificateSHA256, "pair-complete", PairCompleteRequest{
+	if err := postPair(ctx, resume.Endpoint, resume.CertificateSHA256, "pair-complete", PairCompleteRequest{
 		SessionID: resume.SessionID, CompletionSecret: resume.CompletionSecret,
 	}, &complete); err != nil {
 		return PairCompleteResponse{}, err
@@ -325,16 +293,12 @@ func CompletePairing(ctx context.Context, repositoryPath string) (PairCompleteRe
 	return complete, nil
 }
 
-func postPair(ctx context.Context, client *http.Client, endpoint, certificateSHA256, operation string, input, output any) error {
+func postPair(ctx context.Context, endpoint, certificateSHA256, operation string, input, output any) error {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	if strings.HasPrefix(endpoint, "quic://") {
-		return managed.PairCall(ctx, endpoint, certificateSHA256, operation, input, output)
+	if !strings.HasPrefix(endpoint, "quic://") {
+		return errors.New("DFS pairing requires a QUIC endpoint")
 	}
-	path := "/v1/pair/start"
-	if operation == "pair-complete" {
-		path = "/v1/pair/complete"
-	}
-	return postJSON(ctx, client, endpoint+path, input, output)
+	return managed.PairCall(ctx, endpoint, certificateSHA256, operation, input, output)
 }
 
 func savePairingResume(repositoryPath string, resume pairingResume) error {
@@ -387,52 +351,6 @@ func removePairingResume(repositoryPath string) error {
 	// An unlink failure leaves only an empty, non-sensitive marker. Pairing is
 	// already complete and should not be reported as failed for cleanup alone.
 	_ = os.Remove(path)
-	return nil
-}
-
-func pinnedHTTPClient(fingerprint string) *http.Client {
-	transport := &http.Transport{TLSClientConfig: &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: true, // The out-of-band invitation pins the exact certificate below.
-		VerifyConnection: func(state tls.ConnectionState) error {
-			if len(state.PeerCertificates) == 0 {
-				return errors.New("pairing peer supplied no TLS certificate")
-			}
-			digest := sha256.Sum256(state.PeerCertificates[0].Raw)
-			if !strings.EqualFold(hex.EncodeToString(digest[:]), fingerprint) {
-				return errors.New("pairing peer TLS certificate does not match the invitation")
-			}
-			return nil
-		},
-	}}
-	return &http.Client{Transport: transport, Timeout: 15 * time.Second}
-}
-
-func postJSON(ctx context.Context, client *http.Client, endpoint string, input, output any) error {
-	payload, err := json.Marshal(input)
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		var failure protocolError
-		if decodeErr := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&failure); decodeErr == nil && failure.Error != "" {
-			return errors.New(failure.Error)
-		}
-		return fmt.Errorf("pairing peer returned HTTP %s", response.Status)
-	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(output); err != nil {
-		return fmt.Errorf("decode pairing response: %w", err)
-	}
 	return nil
 }
 

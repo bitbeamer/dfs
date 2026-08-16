@@ -56,6 +56,7 @@ type PairStartResponse struct {
 	ExpiresAt        time.Time                `json:"expires_at"`
 	Membership       membership.Record        `json:"membership"`
 	Approver         membership.Record        `json:"approver"`
+	Members          []membership.Record      `json:"members,omitempty"`
 	Endorsements     []membership.Endorsement `json:"endorsements,omitempty"`
 }
 
@@ -66,6 +67,32 @@ type PairCompleteRequest struct {
 
 type PairCompleteResponse struct {
 	RemoteName string `json:"remote_name,omitempty"`
+}
+
+type JoinRequest struct {
+	Version      int               `json:"version"`
+	RequestID    string            `json:"request_id"`
+	Secret       string            `json:"secret"`
+	FileSystemID string            `json:"filesystem_id"`
+	PeerID       string            `json:"peer_id"`
+	PeerName     string            `json:"peer_name"`
+	ExpiresAt    time.Time         `json:"expires_at"`
+	Membership   membership.Record `json:"membership"`
+}
+
+type JoinRequestResponse struct {
+	RequestID string    `json:"request_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type JoinStatusRequest struct {
+	RequestID string `json:"request_id"`
+	Secret    string `json:"secret"`
+}
+
+type JoinStatusResponse struct {
+	Status     string      `json:"status"`
+	Invitation *Invitation `json:"invitation,omitempty"`
 }
 
 type protocolError struct {

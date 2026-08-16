@@ -58,13 +58,14 @@ type Server struct {
 	listener   *quic.Listener
 	diagnostic func(context.Context) ([]byte, error)
 	pair       func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error)
+	pairClone  func(context.Context, string, string) error
 	changed    func(string, []string)
 	stop       context.CancelFunc
 	done       chan struct{}
 	once       sync.Once
 }
 
-func Start(repo *repository.Repository, address string, diagnostic func(context.Context) ([]byte, error), pairingCertificate *tls.Certificate, pair func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error), changed func(string, []string)) (*Server, error) {
+func Start(repo *repository.Repository, address string, diagnostic func(context.Context) ([]byte, error), pairingCertificate *tls.Certificate, pair func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error), pairClone func(context.Context, string, string) error, changed func(string, []string)) (*Server, error) {
 	private, _, err := membership.EnsureKey(repo.Config.Repository)
 	if err != nil {
 		return nil, err
@@ -110,7 +111,7 @@ func Start(repo *repository.Repository, address string, diagnostic func(context.
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &Server{repo: repo, listener: listener, diagnostic: diagnostic, pair: pair, changed: changed, stop: cancel, done: make(chan struct{})}
+	server := &Server{repo: repo, listener: listener, diagnostic: diagnostic, pair: pair, pairClone: pairClone, changed: changed, stop: cancel, done: make(chan struct{})}
 	go server.serve(ctx)
 	return server, nil
 }
@@ -163,7 +164,12 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 		return
 	}
 	if protocol == PairALPN {
-		if s.pair == nil || (request.Operation != "pair-start" && request.Operation != "pair-complete") {
+		if request.Operation == "pair-clone" && s.pairClone != nil {
+			s.servePairClone(stream, request.Payload)
+			return
+		}
+		if s.pair == nil || (request.Operation != "pair-start" && request.Operation != "pair-complete" &&
+			request.Operation != "join-request" && request.Operation != "join-status") {
 			writeResponse(stream, Response{Error: "unsupported pairing operation"})
 			return
 		}
@@ -203,6 +209,59 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
+}
+
+type pairCloneRequest struct {
+	SessionID        string `json:"session_id"`
+	CompletionSecret string `json:"completion_secret"`
+}
+
+func (s *Server) servePairClone(stream *quic.Stream, payload json.RawMessage) {
+	var request pairCloneRequest
+	if json.Unmarshal(payload, &request) != nil || request.SessionID == "" || request.CompletionSecret == "" {
+		writeResponse(stream, Response{Error: "invalid pairing clone request"})
+		return
+	}
+	if err := s.pairClone(stream.Context(), request.SessionID, request.CompletionSecret); err != nil {
+		writeResponse(stream, Response{Error: err.Error()})
+		return
+	}
+	stateDirectory := filepath.Join(s.repo.Config.Repository, ".git", "dfs")
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		writeResponse(stream, Response{Error: "prepare pairing bundle"})
+		return
+	}
+	bundle, err := os.CreateTemp(stateDirectory, "pair-clone-*.bundle")
+	if err != nil {
+		writeResponse(stream, Response{Error: "create pairing bundle"})
+		return
+	}
+	bundlePath := bundle.Name()
+	_ = bundle.Close()
+	defer os.Remove(bundlePath)
+	if err := s.repo.WithWorkTreeLock(func() error {
+		command := exec.CommandContext(stream.Context(), "git", "bundle", "create", bundlePath, "--all")
+		command.Dir = s.repo.Config.Repository
+		return command.Run()
+	}); err != nil {
+		writeResponse(stream, Response{Error: "create pairing bundle"})
+		return
+	}
+	file, err := os.Open(bundlePath)
+	if err != nil {
+		writeResponse(stream, Response{Error: "open pairing bundle"})
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		writeResponse(stream, Response{Error: "inspect pairing bundle"})
+		return
+	}
+	if err := writeResponse(stream, Response{OK: true, Size: info.Size()}); err != nil {
+		return
+	}
+	_, _ = io.Copy(stream, file)
 }
 
 func PairCall(ctx context.Context, address, certificateSHA256, operation string, input, output any) error {
@@ -251,6 +310,72 @@ func PairCall(ctx context.Context, address, certificateSHA256, operation string,
 		return errors.New(response.Error)
 	}
 	return json.Unmarshal(response.Payload, output)
+}
+
+func PairClone(ctx context.Context, address, certificateSHA256, sessionID, completionSecret, destination string) error {
+	address = strings.TrimPrefix(strings.TrimSpace(address), "quic://")
+	if address == "" {
+		return errors.New("pairing QUIC endpoint is empty")
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{PairALPN}, InsecureSkipVerify: true}
+	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) != 1 {
+			return errors.New("pairing certificate is missing")
+		}
+		digest := sha256.Sum256(rawCerts[0])
+		if !strings.EqualFold(hex.EncodeToString(digest[:]), certificateSHA256) {
+			return errors.New("pairing certificate does not match invitation")
+		}
+		return nil
+	}
+	connection, err := quic.DialAddr(ctx, address, tlsConfig, &quic.Config{HandshakeIdleTimeout: 10 * time.Second})
+	if err != nil {
+		return err
+	}
+	defer connection.CloseWithError(0, "")
+	stream, err := connection.OpenStreamSync(ctx)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(pairCloneRequest{SessionID: sessionID, CompletionSecret: completionSecret})
+	request, _ := json.Marshal(Request{Operation: "pair-clone", Payload: payload})
+	if _, err := stream.Write(append(request, '\n')); err != nil {
+		return err
+	}
+	_ = stream.Close()
+	reader := bufio.NewReader(stream)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return err
+	}
+	var response Response
+	if err := json.Unmarshal(line, &response); err != nil {
+		return err
+	}
+	if !response.OK {
+		return errors.New(response.Error)
+	}
+	temporary := destination + ".new"
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.CopyN(file, reader, response.Size)
+	if syncErr := file.Sync(); copyErr == nil {
+		copyErr = syncErr
+	}
+	if closeErr := file.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		_ = os.Remove(temporary)
+		return copyErr
+	}
+	if err := os.Rename(temporary, destination); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
 }
 
 func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) {
@@ -486,16 +611,11 @@ func Open(ctx context.Context, repo *repository.Repository, peerID string, reque
 	return connection, stream, reader, response, nil
 }
 
-// GitProxy connects Git's remote-ext protocol to a managed QUIC stream. If
-// QUIC cannot be established before any Git input is consumed, the same
-// repository-restricted operation is retried over SSH.
+// GitProxy connects Git's remote-ext protocol to an authenticated QUIC stream.
 func GitProxy(ctx context.Context, repo *repository.Repository, peerID, service string, input io.Reader, output, errorOutput io.Writer) (string, error) {
 	connection, stream, reader, _, err := Open(ctx, repo, peerID, Request{Operation: "git", Service: service})
 	if err != nil {
-		if fallbackErr := sshGitProxy(ctx, repo, peerID, service, input, output, errorOutput); fallbackErr != nil {
-			return "", fmt.Errorf("managed QUIC transport failed: %v; SSH fallback failed: %w", err, fallbackErr)
-		}
-		return "ssh", nil
+		return "quic", err
 	}
 	defer connection.CloseWithError(0, "")
 	copyDone := make(chan error, 1)
@@ -647,40 +767,6 @@ func Probe(ctx context.Context, repo *repository.Repository, peerID string) erro
 	}
 	_ = stream.Close()
 	return connection.CloseWithError(0, "")
-}
-
-func sshGitProxy(ctx context.Context, repo *repository.Repository, peerID, service string, input io.Reader, output, errorOutput io.Writer) error {
-	target, err := trustedMember(repo.Config.Repository, peerID)
-	if err != nil {
-		return err
-	}
-	endpoint, err := url.Parse(target.Payload.SSH.Endpoint)
-	if err != nil || endpoint.User == nil || endpoint.Hostname() == "" || endpoint.Path == "" {
-		return errors.New("invalid SSH fallback endpoint")
-	}
-	if service != "git-upload-pack" && service != "git-receive-pack" && service != "git-upload-archive" {
-		return errors.New("unsupported Git service")
-	}
-	stateDirectory := filepath.Join(repo.Config.Repository, ".git", "dfs")
-	args := []string{"-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
-		"-o", "ConnectTimeout=2", "-o", "ConnectionAttempts=1", "-i", filepath.Join(stateDirectory, "peer-ssh-key"), "-o", "UserKnownHostsFile=" + filepath.Join(stateDirectory, "known_hosts")}
-	if endpoint.Port() != "" {
-		args = append(args, "-p", endpoint.Port())
-	}
-	connectHost := endpoint.Hostname()
-	if ipv4, ok := localIPv4(ctx, connectHost); ok {
-		args = append(args, "-o", "HostKeyAlias="+connectHost)
-		connectHost = ipv4
-	}
-	destination := endpoint.User.Username() + "@" + connectHost
-	args = append(args, destination, service+" "+shellQuote(endpoint.Path))
-	command := exec.CommandContext(ctx, "ssh", args...)
-	command.Stdin, command.Stdout, command.Stderr = input, output, errorOutput
-	return command.Run()
-}
-
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func writeResponse(writer io.Writer, response Response) error {

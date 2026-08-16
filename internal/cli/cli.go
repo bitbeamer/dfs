@@ -92,7 +92,7 @@ func (a *App) transportCommand() *cobra.Command {
 }
 
 func (a *App) setupCommand() *cobra.Command {
-	var repositoryPath, mountpoint, name, limit, installer string
+	var repositoryPath, mountpoint, name, limit, installer, filesystem string
 	var pairingPort int
 	var discoveryTimeout time.Duration
 	var resume, abort, yes bool
@@ -113,17 +113,12 @@ func (a *App) setupCommand() *cobra.Command {
 				fmt.Fprintln(a.Out, "Aborted DFS setup and removed its managed state")
 				return nil
 			}
-			invitation := ""
 			reader := bufio.NewReader(cmd.InOrStdin())
+			selectedFilesystem := strings.TrimSpace(filesystem)
 			if !resume {
-				fmt.Fprint(a.Out, "Paste DFS invitation: ")
-				invitation, err = reader.ReadString('\n')
-				if err != nil && !errors.Is(err, io.EOF) {
-					return fmt.Errorf("read DFS invitation: %w", err)
-				}
-				invitation = strings.TrimSpace(invitation)
-				if invitation == "" {
-					return errors.New("DFS invitation is empty")
+				selectedFilesystem, err = selectDiscoveredFilesystem(cmd.Context(), reader, a.Out, selectedFilesystem, discoveryTimeout)
+				if err != nil {
+					return err
 				}
 			}
 			approve := func(state *dfssetup.State) error {
@@ -146,7 +141,7 @@ func (a *App) setupCommand() *cobra.Command {
 				}
 				return nil
 			}
-			state, err := dfssetup.Run(ctx, dfssetup.Options{Invitation: invitation, Repository: repositoryPath, Mountpoint: mountpoint,
+			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Repository: repositoryPath, Mountpoint: mountpoint,
 				Name: name, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
 				PairingPort: pairingPort, Out: a.Out, Approve: approve})
 			if err != nil {
@@ -168,8 +163,56 @@ func (a *App) setupCommand() *cobra.Command {
 	command.Flags().BoolVar(&resume, "resume", false, "resume the recorded setup transaction")
 	command.Flags().BoolVar(&abort, "abort", false, "roll back the recorded setup transaction")
 	command.Flags().BoolVarP(&yes, "yes", "y", false, "approve setup without an interactive confirmation")
+	command.Flags().StringVar(&filesystem, "filesystem", "", "discovered filesystem ID or unambiguous name")
 	command.MarkFlagsMutuallyExclusive("resume", "abort")
 	return command
+}
+
+func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out io.Writer, wanted string, timeout time.Duration) (string, error) {
+	discoveryCtx, cancel := context.WithTimeout(ctx, timeout+2*time.Second)
+	defer cancel()
+	offers, err := peer.Discover(discoveryCtx, timeout)
+	if err != nil {
+		return "", err
+	}
+	networks := peer.GroupOffers(offers)
+	if len(networks) == 0 {
+		return "", errors.New("no DFS filesystems discovered")
+	}
+	if wanted != "" {
+		var matches []peer.Network
+		for _, network := range networks {
+			if network.FileSystemID == wanted || strings.EqualFold(network.NetworkName, wanted) || strings.HasPrefix(network.FileSystemID, wanted) {
+				matches = append(matches, network)
+			}
+		}
+		if len(matches) != 1 {
+			return "", fmt.Errorf("filesystem %q does not identify exactly one discovered DFS filesystem", wanted)
+		}
+		return matches[0].FileSystemID, nil
+	}
+	fmt.Fprintln(out, "Discovered DFS filesystems:")
+	for index, network := range networks {
+		id := network.FileSystemID
+		if len(id) > 12 {
+			id = id[:12]
+		}
+		fmt.Fprintf(out, "  %d) %s (%s, %d online peer(s))\n", index+1, network.NetworkName, id, len(network.Offers))
+	}
+	if len(networks) == 1 {
+		fmt.Fprintln(out, "Selected the only discovered filesystem")
+		return networks[0].FileSystemID, nil
+	}
+	fmt.Fprintf(out, "Select filesystem [1-%d]: ", len(networks))
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	var selected int
+	if _, err := fmt.Sscanf(strings.TrimSpace(answer), "%d", &selected); err != nil || selected < 1 || selected > len(networks) {
+		return "", errors.New("invalid DFS filesystem selection")
+	}
+	return networks[selected-1].FileSystemID, nil
 }
 
 func (a *App) networkCommand() *cobra.Command {
@@ -277,7 +320,7 @@ func (a *App) networkCommand() *cobra.Command {
 }
 
 func (a *App) pairCommand() *cobra.Command {
-	pairing := &cobra.Command{Use: "pair", Short: "Manage secure peer-pairing invitations"}
+	pairing := &cobra.Command{Use: "pair", Short: "Review and approve secure peer join requests"}
 	var expires time.Duration
 	var cloneURL string
 	invite := &cobra.Command{
@@ -338,7 +381,56 @@ func (a *App) pairCommand() *cobra.Command {
 			return peer.RevokeInvitation(repositoryPath, args[0])
 		},
 	}
-	pairing.AddCommand(invite, list, revoke)
+	requests := &cobra.Command{Use: "requests", Args: cobra.NoArgs, Short: "List pending peer join requests",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			pending, err := peer.ListJoinRequests(repositoryPath, time.Now())
+			if err != nil {
+				return err
+			}
+			if len(pending) == 0 {
+				fmt.Fprintln(a.Out, "No pending DFS join requests")
+				return nil
+			}
+			fmt.Fprintln(a.Out, "REQUEST\tPEER\tPEER ID\tSTATUS\tEXPIRES")
+			for _, request := range pending {
+				status := "pending"
+				if request.Approved {
+					status = "approved"
+				}
+				fmt.Fprintf(a.Out, "%s\t%s\t%s\t%s\t%s\n", request.ID, request.PeerName, request.PeerID, status, request.ExpiresAt.Format(time.RFC3339))
+			}
+			return nil
+		}}
+	approve := &cobra.Command{Use: "approve <request-id>", Args: cobra.ExactArgs(1), Short: "Approve an authenticated pending peer",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			if _, err := peer.ApproveJoinRequest(repo, args[0], 10*time.Minute); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Approved DFS join request %s\n", args[0])
+			return nil
+		}}
+	reject := &cobra.Command{Use: "reject <request-id>", Args: cobra.ExactArgs(1), Short: "Reject a pending peer join request",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repositoryPath, err := config.ResolveRepository(a.repo)
+			if err != nil {
+				return err
+			}
+			if err := peer.RejectJoinRequest(repositoryPath, args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Rejected DFS join request %s\n", args[0])
+			return nil
+		}}
+	pairing.AddCommand(requests, approve, reject, invite, list, revoke)
 	return pairing
 }
 

@@ -35,38 +35,40 @@ const (
 )
 
 type State struct {
-	Version        int       `json:"version"`
-	Phase          Phase     `json:"phase"`
-	Invitation     string    `json:"invitation,omitempty"`
-	FileSystemID   string    `json:"filesystem_id"`
-	PeerID         string    `json:"peer_id"`
-	Name           string    `json:"name"`
-	Repository     string    `json:"repository"`
-	Mountpoint     string    `json:"mountpoint"`
-	CacheLimit     int64     `json:"cache_limit_bytes"`
-	Timeout        int64     `json:"discovery_timeout_nanoseconds"`
-	NetworkName    string    `json:"network_name,omitempty"`
-	OfferingPeer   string    `json:"offering_peer,omitempty"`
-	Installer      string    `json:"installer,omitempty"`
-	Binary         string    `json:"binary,omitempty"`
-	PairingPort    int       `json:"pairing_port"`
-	OwnsRepository bool      `json:"owns_repository"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	Version        int                         `json:"version"`
+	Phase          Phase                       `json:"phase"`
+	Invitation     string                      `json:"invitation,omitempty"`
+	Approval       peer.JoinRequestCredentials `json:"approval,omitempty"`
+	FileSystemID   string                      `json:"filesystem_id"`
+	PeerID         string                      `json:"peer_id"`
+	Name           string                      `json:"name"`
+	Repository     string                      `json:"repository"`
+	Mountpoint     string                      `json:"mountpoint"`
+	CacheLimit     int64                       `json:"cache_limit_bytes"`
+	Timeout        int64                       `json:"discovery_timeout_nanoseconds"`
+	NetworkName    string                      `json:"network_name,omitempty"`
+	OfferingPeer   string                      `json:"offering_peer,omitempty"`
+	Installer      string                      `json:"installer,omitempty"`
+	Binary         string                      `json:"binary,omitempty"`
+	PairingPort    int                         `json:"pairing_port"`
+	OwnsRepository bool                        `json:"owns_repository"`
+	UpdatedAt      time.Time                   `json:"updated_at"`
 }
 
 type Options struct {
-	Invitation  string
-	Repository  string
-	Mountpoint  string
-	Name        string
-	CacheLimit  int64
-	Timeout     time.Duration
-	Resume      bool
-	Installer   string
-	Binary      string
-	PairingPort int
-	Out         io.Writer
-	Approve     func(*State) error
+	Invitation   string
+	FileSystemID string
+	Repository   string
+	Mountpoint   string
+	Name         string
+	CacheLimit   int64
+	Timeout      time.Duration
+	Resume       bool
+	Installer    string
+	Binary       string
+	PairingPort  int
+	Out          io.Writer
+	Approve      func(*State) error
 }
 
 func StatePath(repositoryPath string) (string, error) {
@@ -120,6 +122,11 @@ func Run(ctx context.Context, options Options) (*State, error) {
 	if before(state.Phase, PhaseApproved) {
 		if options.Approve != nil {
 			if err := options.Approve(state); err != nil {
+				return nil, err
+			}
+		}
+		if state.Invitation == "" {
+			if err := awaitApproval(ctx, path, state, options.Out); err != nil {
 				return nil, err
 			}
 		}
@@ -295,9 +302,16 @@ func loadOrCreate(options Options) (*State, string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
 	}
-	invitation, err := peer.DecodeInvitation(options.Invitation)
-	if err != nil {
-		return nil, "", err
+	filesystemID := strings.TrimSpace(options.FileSystemID)
+	if strings.TrimSpace(options.Invitation) != "" {
+		invitation, decodeErr := peer.DecodeInvitation(options.Invitation)
+		if decodeErr != nil {
+			return nil, "", decodeErr
+		}
+		filesystemID = invitation.FileSystemID
+	}
+	if len(filesystemID) < 16 {
+		return nil, "", errors.New("a discovered DFS filesystem must be selected")
 	}
 	if _, err := os.Stat(repositoryPath); err == nil {
 		return nil, "", fmt.Errorf("repository destination already exists: %s", repositoryPath)
@@ -319,7 +333,7 @@ func loadOrCreate(options Options) (*State, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	state := &State{Version: 1, Phase: PhaseDiscovered, Invitation: strings.TrimSpace(options.Invitation), FileSystemID: invitation.FileSystemID,
+	state := &State{Version: 1, Phase: PhaseDiscovered, Invitation: strings.TrimSpace(options.Invitation), FileSystemID: filesystemID,
 		PeerID: peerID, Name: name, Repository: repositoryPath, Mountpoint: mountpoint, CacheLimit: options.CacheLimit,
 		Timeout: int64(options.Timeout), PairingPort: pairingPort, OwnsRepository: true, UpdatedAt: time.Now().UTC()}
 	if err := save(path, state); err != nil {
@@ -328,6 +342,63 @@ func loadOrCreate(options Options) (*State, string, error) {
 	state.Phase = PhaseApprovalRequested
 	state.UpdatedAt = time.Now().UTC()
 	return state, path, save(path, state)
+}
+
+func awaitApproval(ctx context.Context, statePath string, state *State, out io.Writer) error {
+	for {
+		if !state.Approval.ExpiresAt.IsZero() && !state.Approval.ExpiresAt.After(time.Now()) {
+			return errors.New("DFS join request expired; abort setup and start a new request")
+		}
+		discoveryTimeout := time.Duration(state.Timeout)
+		if discoveryTimeout <= 0 {
+			discoveryTimeout = 3 * time.Second
+		}
+		discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout+time.Second)
+		offers, err := peer.Discover(discoveryCtx, discoveryTimeout)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("discover selected DFS filesystem: %w", err)
+		}
+		var selected peer.Network
+		for _, network := range peer.GroupOffers(offers) {
+			if network.FileSystemID == state.FileSystemID {
+				selected = network
+				break
+			}
+		}
+		if len(selected.Offers) == 0 {
+			return errors.New("selected DFS filesystem is no longer discoverable")
+		}
+		if state.Approval.RequestID == "" {
+			credentials, err := peer.SubmitJoinRequest(ctx, selected, state.PeerID, state.Name, pairingPath(statePath), state.PairingPort, 15*time.Minute)
+			if err != nil {
+				return err
+			}
+			state.Approval = credentials
+			state.UpdatedAt = time.Now().UTC()
+			if err := save(statePath, state); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "Join request %s is pending. On any existing peer run: dfs pair approve %s\n", credentials.RequestID, credentials.RequestID)
+		}
+		invitation, approved, err := peer.PollJoinApproval(ctx, selected, state.Approval)
+		if err == nil && approved {
+			encoded, encodeErr := invitation.Encode()
+			if encodeErr != nil {
+				return encodeErr
+			}
+			state.Invitation = encoded
+			return save(statePath, state)
+		}
+		if err != nil {
+			fmt.Fprintf(out, "Waiting for DFS join approval: %v\n", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func save(path string, state *State) error {

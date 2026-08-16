@@ -82,7 +82,7 @@ type CachedFile struct {
 
 func CheckDependencies() error {
 	var missing []string
-	for _, name := range []string{"git", "git-annex", "ssh", "rsync"} {
+	for _, name := range []string{"git", "git-annex"} {
 		if !command.Exists(name) {
 			missing = append(missing, name)
 		}
@@ -620,37 +620,6 @@ func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 		}
 	}
 	r.mu.Lock()
-	var failures []string
-	remotes, _ := r.remotesLocked(ctx)
-	for _, remote := range remotes {
-		if from != "" && from != remote.Name {
-			continue
-		}
-		sshURL, sshErr := r.runner.Run(ctx, "git", "config", "--get", "remote."+remote.Name+".dfs-ssh-url")
-		if sshErr != nil || strings.TrimSpace(sshURL) == "" {
-			continue
-		}
-		uuid, uuidErr := r.runner.Run(ctx, "git", "config", "--get", "remote."+remote.Name+".annex-uuid")
-		if uuidErr != nil || strings.TrimSpace(uuid) == "" {
-			continue
-		}
-		// Defining a separate remote on the command line prevents Git's
-		// multi-valued URL rules from selecting the managed ext:: URL again.
-		// It is intentionally ephemeral so sync never treats it as another peer.
-		alias := "dfs-ssh-fallback-" + strings.TrimPrefix(remote.Name, "dfs-peer-")
-		fallbackArgs := []string{
-			"-c", "remote." + alias + ".url=" + strings.TrimSpace(sshURL),
-			"-c", "remote." + alias + ".annex-uuid=" + strings.TrimSpace(uuid),
-			"annex", "get", "--from=" + alias, "--", filepath.ToSlash(path),
-		}
-		if _, err := r.runner.Run(ctx, "git", fallbackArgs...); err == nil {
-			r.mu.Unlock()
-			r.discardRangeCache(key)
-			return r.Store.Touch(path)
-		} else {
-			failures = append(failures, remote.Name+": "+err.Error())
-		}
-	}
 	args := []string{"annex", "get"}
 	if from != "" {
 		args = append(args, "--from="+from)
@@ -658,9 +627,6 @@ func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 	args = append(args, "--", filepath.ToSlash(path))
 	if _, err := r.runner.Run(ctx, "git", args...); err != nil {
 		r.mu.Unlock()
-		if len(failures) > 0 {
-			return fmt.Errorf("SSH content fallback failed: %s; regular annex retrieval failed: %w", strings.Join(failures, "; "), err)
-		}
 		return err
 	}
 	r.mu.Unlock()
@@ -791,7 +757,7 @@ func (r *Repository) AddPairedRemote(ctx context.Context, peerID, url string) (s
 	return name, nil
 }
 
-func (r *Repository) AddManagedRemote(ctx context.Context, peerID, executable, sshFallback string) (string, error) {
+func (r *Repository) AddManagedRemote(ctx context.Context, peerID, executable string) (string, error) {
 	executable, err := filepath.Abs(executable)
 	if err != nil {
 		return "", err
@@ -811,9 +777,6 @@ func (r *Repository) AddManagedRemote(ctx context.Context, peerID, executable, s
 		return "", err
 	}
 	if _, err := r.runner.Run(ctx, "git", "config", "remote."+name+".dfs-transport", "quic"); err != nil {
-		return "", err
-	}
-	if _, err := r.runner.Run(ctx, "git", "config", "remote."+name+".dfs-ssh-url", sshFallback); err != nil {
 		return "", err
 	}
 	return name, nil

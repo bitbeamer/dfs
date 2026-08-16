@@ -5,24 +5,16 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
-	"os/user"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
-func ensureLocalMembership(ctx context.Context, repo *repository.Repository, filesystemID string, identity transportIdentity, port int) (ed25519.PrivateKey, membership.Record, error) {
+func ensureLocalMembership(ctx context.Context, repo *repository.Repository, filesystemID string, port int) (ed25519.PrivateKey, membership.Record, error) {
 	private, public, err := membership.EnsureKey(repo.Config.Repository)
-	if err != nil {
-		return nil, membership.Record{}, err
-	}
-	account, err := user.Current()
 	if err != nil {
 		return nil, membership.Record{}, err
 	}
@@ -32,17 +24,12 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 		endpointHost += ".local"
 	}
 	quicEndpoint := fmt.Sprintf("quic://%s:%d", endpointHost, port)
-	endpoint, err := sshURL(account.Username, endpointHost, repo.Config.Repository)
-	if err != nil {
-		return nil, membership.Record{}, err
-	}
 	for _, existing := range mustLoadMembership(repo.Config.Repository) {
 		payload := existing.Payload
 		if payload.PeerID != repo.Config.PeerID || payload.SigningPublicKey != public {
 			continue
 		}
 		if payload.FileSystemID == filesystemID && payload.Name == repo.Config.Name && payload.Hostname == hostname &&
-			payload.SSH.Endpoint == endpoint && payload.SSH.PublicKey == identity.PublicKey &&
 			payload.QUICEndpoint == quicEndpoint && membership.VerifySelf(existing) == nil {
 			if err := membership.Trust(repo.Config.Repository, payload.PeerID, payload.SigningPublicKey); err != nil {
 				return nil, membership.Record{}, err
@@ -53,8 +40,8 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	}
 	record, err := membership.Sign(membership.Payload{Version: membership.Version, FileSystemID: filesystemID,
 		PeerID: repo.Config.PeerID, Name: repo.Config.Name, Hostname: hostname, Role: "admin", SigningPublicKey: public,
-		SSH: membership.SSHTransport{Endpoint: endpoint, PublicKey: identity.PublicKey, HostKeys: localSSHHostKeys()}, QUICEndpoint: quicEndpoint,
-		Generation: 1, UpdatedAt: time.Now().UTC()}, private)
+		QUICEndpoint: quicEndpoint,
+		Generation:   1, UpdatedAt: time.Now().UTC()}, private)
 	if err != nil {
 		return nil, membership.Record{}, err
 	}
@@ -71,12 +58,8 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	return private, record, nil
 }
 
-func newMembershipDraft(keyRepositoryPath, endpointRepositoryPath, filesystemID, peerID, name, sshPublicKey string, sshHostKeys []string, quicPort int) (ed25519.PrivateKey, membership.Record, error) {
+func newMembershipDraft(keyRepositoryPath, filesystemID, peerID, name string, quicPort int) (ed25519.PrivateKey, membership.Record, error) {
 	private, public, err := membership.EnsureKey(keyRepositoryPath)
-	if err != nil {
-		return nil, membership.Record{}, err
-	}
-	account, err := user.Current()
 	if err != nil {
 		return nil, membership.Record{}, err
 	}
@@ -89,28 +72,23 @@ func newMembershipDraft(keyRepositoryPath, endpointRepositoryPath, filesystemID,
 	if !strings.Contains(endpointHost, ".") {
 		endpointHost += ".local"
 	}
-	endpoint, err := sshURL(account.Username, endpointHost, endpointRepositoryPath)
-	if err != nil {
-		return nil, membership.Record{}, err
-	}
 	record, err := membership.Sign(membership.Payload{Version: membership.Version, FileSystemID: filesystemID,
 		PeerID: peerID, Name: name, Hostname: strings.TrimSuffix(hostname, ".local"), Role: "member", SigningPublicKey: public,
-		SSH: membership.SSHTransport{Endpoint: endpoint, PublicKey: sshPublicKey, HostKeys: sshHostKeys}, QUICEndpoint: fmt.Sprintf("quic://%s:%d", endpointHost, quicPort),
-		Generation: 1, UpdatedAt: time.Now().UTC()}, private)
+		QUICEndpoint: fmt.Sprintf("quic://%s:%d", endpointHost, quicPort),
+		Generation:   1, UpdatedAt: time.Now().UTC()}, private)
 	return private, record, err
 }
 
-func validatePairingMembership(record membership.Record, filesystemID, peerID, name, sshPublicKey, reversePath string) error {
+func validatePairingMembership(record membership.Record, filesystemID, peerID, name string) error {
 	if err := membership.VerifySelf(record); err != nil {
 		return err
 	}
 	payload := record.Payload
-	if payload.FileSystemID != filesystemID || payload.PeerID != peerID || payload.Name != strings.TrimSpace(name) || payload.SSH.PublicKey != sshPublicKey {
+	if payload.FileSystemID != filesystemID || payload.PeerID != peerID || payload.Name != strings.TrimSpace(name) {
 		return errors.New("pairing membership does not match the authenticated peer")
 	}
-	endpoint, err := url.Parse(payload.SSH.Endpoint)
-	if err != nil || endpoint.Scheme != "ssh" || endpoint.User == nil || endpoint.Host == "" || (reversePath != "" && filepath.Clean(endpoint.Path) != filepath.Clean(reversePath)) {
-		return errors.New("pairing membership has an invalid SSH endpoint")
+	if !strings.HasPrefix(payload.QUICEndpoint, "quic://") {
+		return errors.New("pairing membership has an invalid QUIC endpoint")
 	}
 	return nil
 }
@@ -151,11 +129,7 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 				}
 			}
 		}
-		if err := RevokePeerAuthorization(name); err != nil {
-			return err
-		}
 	}
-	knownHosts := filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), "known_hosts")
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -164,24 +138,9 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 		if record.Payload.PeerID == repo.Config.PeerID {
 			continue
 		}
-		if err := installKnownHosts(knownHosts, record.Payload.SSH.Endpoint, record.Payload.SSH.HostKeys); err != nil {
-			return fmt.Errorf("pin membership host keys for %s: %w", record.Payload.Name, err)
-		}
-		if _, err := authorizePeer(record.Payload.SSH.PublicKey, repo.Config.Repository, filesystemID, record.Payload.PeerID); err != nil {
-			return fmt.Errorf("authorize member %s: %w", record.Payload.Name, err)
-		}
-		if _, err := repo.AddManagedRemote(ctx, record.Payload.PeerID, executable, record.Payload.SSH.Endpoint); err != nil {
+		if _, err := repo.AddManagedRemote(ctx, record.Payload.PeerID, executable); err != nil {
 			return fmt.Errorf("configure member %s: %w", record.Payload.Name, err)
 		}
-	}
-	configuredKnownHosts := knownHosts
-	if _, err := os.Stat(knownHosts); errors.Is(err, os.ErrNotExist) {
-		configuredKnownHosts = ""
-	} else if err != nil {
-		return err
-	}
-	if err := repo.ConfigureSSHCommand(ctx, transportSSHCommand(filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), transportKeyFile), configuredKnownHosts)); err != nil {
-		return err
 	}
 	clusterPins, err := membership.ActivePinPaths(repo.Config.Repository, filesystemID)
 	if err != nil {

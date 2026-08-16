@@ -30,6 +30,7 @@ type invitationRecord struct {
 	FileSystemID string       `json:"filesystem_id"`
 	ExpiresAt    time.Time    `json:"expires_at"`
 	CloneURL     string       `json:"clone_url,omitempty"`
+	BoundPeerID  string       `json:"bound_peer_id,omitempty"`
 	Pending      *pendingPair `json:"pending,omitempty"`
 }
 
@@ -52,6 +53,10 @@ type InvitationInfo struct {
 }
 
 func CreateInvitation(repo *repository.Repository, lifetime time.Duration, cloneURL string) (Invitation, error) {
+	return createInvitation(repo, lifetime, cloneURL, "")
+}
+
+func createInvitation(repo *repository.Repository, lifetime time.Duration, cloneURL, boundPeerID string) (Invitation, error) {
 	if lifetime <= 0 || lifetime > 24*time.Hour {
 		return Invitation{}, errors.New("invitation lifetime must be greater than zero and at most 24 hours")
 	}
@@ -76,7 +81,7 @@ func CreateInvitation(repo *repository.Repository, lifetime time.Duration, clone
 	record := invitationRecord{
 		Version: ProtocolVersion, ID: id, SecretHash: secretHash(secret),
 		FileSystemID: filesystemID, ExpiresAt: time.Now().UTC().Add(lifetime),
-		CloneURL: strings.TrimSpace(cloneURL),
+		CloneURL: strings.TrimSpace(cloneURL), BoundPeerID: strings.TrimSpace(boundPeerID),
 	}
 	if err := saveInvitation(repo.Config.Repository, record); err != nil {
 		return Invitation{}, err
@@ -86,8 +91,7 @@ func CreateInvitation(repo *repository.Repository, lifetime time.Duration, clone
 		Secret: secret, CertificateSHA256: fingerprint,
 	}
 	if state, err := readRuntimeState(repo.Config.Repository); err == nil && state.FileSystemID == filesystemID {
-		invitation.Endpoint = state.Endpoint
-		invitation.QUICEndpoint = "quic://" + strings.TrimPrefix(state.Endpoint, "https://")
+		invitation.QUICEndpoint = state.Endpoint
 	}
 	return invitation, nil
 }

@@ -155,7 +155,7 @@ func offerFromEvent(event mdns.ServiceEvent) (Offer, bool) {
 	if !event.Addr.IsValid() {
 		return Offer{}, false
 	}
-	offer.Endpoint = "https://" + net.JoinHostPort(offer.Address, strconv.Itoa(offer.Port))
+	offer.Endpoint = "quic://" + net.JoinHostPort(offer.Address, strconv.Itoa(offer.Port))
 	return offer, true
 }
 
@@ -173,7 +173,7 @@ func decodeTXT(value string) (string, error) {
 
 func endpointHost(endpoint string) (string, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+	if err != nil || parsed.Scheme != "quic" || parsed.Hostname() == "" {
 		return "", errors.New("invalid DFS pairing endpoint")
 	}
 	return parsed.Hostname(), nil

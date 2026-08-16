@@ -731,8 +731,10 @@ func validatePayload(payload Payload) error {
 	if _, err := decodePublicKey(payload.SigningPublicKey); err != nil {
 		return err
 	}
-	if strings.TrimSpace(payload.SSH.Endpoint) == "" || strings.TrimSpace(payload.SSH.PublicKey) == "" {
-		return errors.New("membership SSH transport is incomplete")
+	sshEndpoint := strings.TrimSpace(payload.SSH.Endpoint)
+	sshPublicKey := strings.TrimSpace(payload.SSH.PublicKey)
+	if (sshEndpoint == "") != (sshPublicKey == "") {
+		return errors.New("membership legacy SSH transport is incomplete")
 	}
 	if !strings.HasPrefix(payload.QUICEndpoint, "quic://") {
 		return errors.New("membership QUIC transport is incomplete")
