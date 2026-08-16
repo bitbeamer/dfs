@@ -683,7 +683,7 @@ func (r *Repository) ProbeSSHFallback(ctx context.Context, name string) error {
 	if err != nil {
 		return r.ProbeRemote(ctx, name)
 	}
-	_, err = r.runner.Run(ctx, "git", "-c", "remote."+name+".url="+fallback, "ls-remote", "--heads", name)
+	_, err = r.runner.Run(ctx, "git", "ls-remote", "--heads", fallback)
 	return err
 }
 
