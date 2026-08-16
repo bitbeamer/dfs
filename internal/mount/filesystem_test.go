@@ -74,6 +74,40 @@ func testFileSystem(t *testing.T, root string) *FileSystem {
 	return NewFileSystem(repo, nil, logger)
 }
 
+func TestReadDoesNotWriteAccessMetadataPerRequest(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	path := "large.bin"
+	backingPath := filepath.Join(root, path)
+	if err := os.WriteFile(backingPath, make([]byte, 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	filesystem.repo.Touch(path) // Open records one cache access before reads begin.
+	openedAt := filesystem.repo.Store.LastAccess(path)
+	handle, err := os.Open(backingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracked := &trackedFile{
+		File: nodefs.NewLoopbackFile(handle), filesystem: filesystem, path: path,
+	}
+	buffer := make([]byte, 4096)
+	for offset := int64(0); offset < 1<<20; offset += int64(len(buffer)) {
+		result, code := tracked.Read(buffer, offset)
+		if code != fuse.OK {
+			t.Fatalf("read at %d = %v", offset, code)
+		}
+		data, status := result.Bytes(buffer)
+		if status != fuse.OK || len(data) != len(buffer) {
+			t.Fatalf("read result at %d = %d bytes, %v", offset, len(data), status)
+		}
+	}
+	tracked.Release()
+	if after := filesystem.repo.Store.LastAccess(path); !after.Equal(openedAt) {
+		t.Fatalf("reads rewrote cache access metadata: before=%v after=%v", openedAt, after)
+	}
+}
+
 func TestOnlyGitMetadataIsHidden(t *testing.T) {
 	tests := []struct {
 		path   string

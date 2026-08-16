@@ -432,6 +432,10 @@ handle; later writes may advance it. A no-op writable open produces no commit.
 Advisory locks, atomic rename-overwrite, open-then-unlink, and renaming an open
 writer follow POSIX behavior supported by FUSE.
 
+Opening a file updates its cache-recency record once. Sequential reads do not
+write SQLite state for every FUSE block, so large cached files stream at local
+filesystem speed instead of being limited by metadata transactions.
+
 Automatic metadata synchronization runs after completed transactions and every
 30 seconds. Each remote is probed and synchronized independently; an unavailable
 peer enters a bounded retry backoff without holding the repository lock or

@@ -354,7 +354,6 @@ func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fus
 }
 
 func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) {
-	t.filesystem.repo.Touch(t.path)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.File.Read(dest, off)
