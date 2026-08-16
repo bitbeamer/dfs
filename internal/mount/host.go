@@ -68,6 +68,7 @@ func (i nodeContentInvalidator) InvalidateEntry(path string) {
 			parent, child := i.paths.Node(directory), i.paths.Node(path)
 			if parent != nil && child != nil {
 				status = i.paths.Connector().DeleteNotify(parent, child, name)
+				parent.RmChild(name)
 			} else {
 				status = i.paths.EntryNotify(directory, name)
 			}
