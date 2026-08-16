@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -59,6 +60,19 @@ type trackedFile struct {
 	annexTarget string
 	openFlags   uint32
 	mu          sync.Mutex
+}
+
+type rangeFile struct {
+	nodefs.File
+	filesystem *FileSystem
+	path       string
+	key        string
+	size       int64
+	ctx        stdcontext.Context
+	cancel     stdcontext.CancelFunc
+	attr       fuse.Attr
+	mu         sync.Mutex
+	released   bool
 }
 
 type contentInvalidator interface {
@@ -383,11 +397,52 @@ func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, st
 		if !needsFetch {
 			return nodefs.NewLoopbackFile(handle), annexTarget, nil
 		}
+		if size, ok := annexSizeFromTarget(annexTarget); ok && f.repo.CanStreamRanges() {
+			ctx, cancel := stdcontext.WithCancel(f.lifetime)
+			attr, code := f.GetAttr(path, nil)
+			if code != fuse.OK {
+				cancel()
+				return nil, annexTarget, fmt.Errorf("inspect annex range file: %s", code)
+			}
+			return &rangeFile{File: nodefs.NewDefaultFile(), filesystem: f, path: path,
+				key: filepath.Base(filepath.FromSlash(annexTarget)), size: int64(size), ctx: ctx, cancel: cancel, attr: *attr}, annexTarget, nil
+		}
 		if err := f.hydrate(path); err != nil {
 			return nil, annexTarget, err
 		}
 	}
 	return nil, "", os.ErrNotExist
+}
+
+func (r *rangeFile) Read(destination []byte, offset int64) (fuse.ReadResult, fuse.Status) {
+	r.mu.Lock()
+	if r.released {
+		r.mu.Unlock()
+		return nil, fuse.EBADF
+	}
+	r.mu.Unlock()
+	n, err := r.filesystem.repo.ReadRange(r.ctx, r.path, r.key, r.size, offset, destination)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	if err != nil {
+		return nil, status(err)
+	}
+	return fuse.ReadResultData(destination[:n]), fuse.OK
+}
+
+func (r *rangeFile) GetAttr(out *fuse.Attr) fuse.Status {
+	*out = r.attr
+	return fuse.OK
+}
+
+func (r *rangeFile) Release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.released {
+		r.released = true
+		r.cancel()
+	}
 }
 
 func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
@@ -405,6 +460,11 @@ func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fus
 
 func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) {
 	t.mu.Lock()
+	if _, streaming := t.File.(*rangeFile); streaming {
+		file := t.File
+		t.mu.Unlock()
+		return file.Read(dest, off)
+	}
 	defer t.mu.Unlock()
 	return t.File.Read(dest, off)
 }

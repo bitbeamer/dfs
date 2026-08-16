@@ -6,9 +6,9 @@ while allowing each device to keep only a quota-limited subset of file content.
 Git stores the namespace and history, git-annex stores content, and FUSE exposes
 the result as a regular mounted drive.
 
-Missing content is downloaded when it is opened, explicitly fetched, or
-pinned. Moving, renaming, and organizing files therefore does not require their
-content to be present locally.
+Requested byte ranges of missing content are streamed when a file is opened;
+explicit fetches and pins hydrate the complete object. Moving, renaming, and
+organizing files therefore does not require their content to be present locally.
 
 > [!WARNING]
 > DFS is an MVP. Use a test dataset and keep an independent backup. Linux and
@@ -47,6 +47,9 @@ content to be present locally.
   authorizations automatically, including after an offline peer returns.
 - Transfer Git metadata, git-annex content, membership, and diagnostics over
   mutually authenticated QUIC, with repository-restricted SSH as a fallback.
+- Stream requested ranges of uncached files over authenticated QUIC, retaining
+  resumable sparse partials privately and promoting only verified complete
+  objects into git-annex.
 - Diagnose dependencies and every directed peer-to-peer path, including ordinary
   passwordless SSH, with `health` and `health --cluster`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
@@ -325,7 +328,7 @@ dependencies are missing or the cluster is incomplete or inconsistent.
 probe tests mutually authenticated QUIC, the repository-restricted SSH
 fallback, and ordinary passwordless non-interactive SSH.
 
-Important mesh statuses are:
+Important cluster statuses are:
 
 - `OK`: managed QUIC and the directed transport work.
 - `SSH_FALLBACK`: QUIC is unavailable but restricted SSH works.
@@ -446,14 +449,18 @@ handle; later writes may advance it. A no-op writable open produces no commit.
 Advisory locks, atomic rename-overwrite, open-then-unlink, and renaming an open
 writer follow POSIX behavior supported by FUSE.
 
-Opening a file updates its cache-recency record once. Sequential reads do not
-write SQLite state for every FUSE block, so large cached files stream at local
-filesystem speed instead of being limited by metadata transactions.
-Concurrent opens of names that reference the same missing git-annex object
-share one hydration transfer. This prevents Finder and Quick Look preview
-requests from queueing redundant downloads of duplicate content.
-Daemon shutdown cancels in-flight content hydration before beginning FUSE
-unmount, preventing a sleeping or unreachable peer from trapping mount teardown.
+Opening a file updates its cache-recency record once. Cached files read directly
+from local git-annex storage. For an uncached file, FUSE requests only the byte
+ranges the application reads over mutually authenticated QUIC, with bounded
+read-ahead for sequential throughput. Finder and Quick Look can therefore read
+headers, trailers, and previews without waiting for a complete large object.
+Concurrent reads of names referencing the same annex key share one transfer.
+Successful extents are retained as a resumable sparse file under
+`.git/dfs/range-cache`, never in the logical filesystem. Once all extents are
+present, DFS verifies the annex key and atomically promotes the object into
+git-annex. Old inactive partials are evicted against the peer's cache limit.
+Closing a streaming handle or stopping the daemon cancels its in-flight request,
+and a failed source peer is skipped in favor of another trusted content holder.
 
 After remote namespace changes, DFS invalidates kernel FUSE entries on every
 platform. On KDE Plasma it also emits the standard `KDirNotify` directory

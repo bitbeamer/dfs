@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -188,6 +189,94 @@ func TestConcurrentHydrationOfSameAnnexObjectIsCoalesced(t *testing.T) {
 	defer callsMu.Unlock()
 	if calls != 1 {
 		t.Fatalf("managed fetch calls = %d, want 1", calls)
+	}
+}
+
+func TestOpenUncachedAnnexStreamsRangeBeforeWholeHydration(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	const size = 8 << 20
+	key := "SHA256E-s8388608--0000000000000000000000000000000000000000000000000000000000000000.bin"
+	target := filepath.Join(root, ".git", "annex", "objects", "AA", "BB", key, key)
+	link := filepath.Join(root, "preview.bin")
+	relative, err := filepath.Rel(filepath.Dir(link), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(relative, link); err != nil {
+		t.Fatal(err)
+	}
+	var rangeCalls int
+	filesystem.repo.SetManagedRangeFetcher(func(_ context.Context, _ *repository.Repository, _ string, _, length int64, output io.Writer) (int64, error) {
+		rangeCalls++
+		_, err := output.Write(bytes.Repeat([]byte{0x5a}, int(length)))
+		return size, err
+	})
+	var hydrationCalls int
+	filesystem.repo.SetManagedFetcher(func(context.Context, *repository.Repository, string, string) error {
+		hydrationCalls++
+		return errors.New("whole hydration must not run")
+	})
+
+	handle, code := filesystem.Open("preview.bin", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatalf("open uncached annex = %v", code)
+	}
+	if rangeCalls != 0 || hydrationCalls != 0 {
+		t.Fatalf("open transferred content: ranges=%d hydration=%d", rangeCalls, hydrationCalls)
+	}
+	buffer := make([]byte, 4096)
+	result, code := handle.Read(buffer, 1024)
+	if code != fuse.OK {
+		t.Fatalf("range read = %v", code)
+	}
+	data, code := result.Bytes(buffer)
+	if code != fuse.OK || len(data) != len(buffer) || !bytes.Equal(data, bytes.Repeat([]byte{0x5a}, len(buffer))) {
+		t.Fatalf("range data = %d bytes, %v", len(data), code)
+	}
+	if rangeCalls != 1 || hydrationCalls != 0 {
+		t.Fatalf("transfers after read: ranges=%d hydration=%d", rangeCalls, hydrationCalls)
+	}
+	handle.Release()
+}
+
+func TestReleaseCancelsUncachedAnnexRange(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	key := "SHA256E-s8388608--0000000000000000000000000000000000000000000000000000000000000000.bin"
+	target := filepath.Join(root, ".git", "annex", "objects", "AA", "BB", key, key)
+	if err := os.Symlink(target, filepath.Join(root, "cancel.bin")); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	finished := make(chan error, 1)
+	filesystem.repo.SetManagedRangeFetcher(func(ctx context.Context, _ *repository.Repository, _ string, _, _ int64, _ io.Writer) (int64, error) {
+		close(started)
+		<-ctx.Done()
+		finished <- ctx.Err()
+		return 0, ctx.Err()
+	})
+	handle, code := filesystem.Open("cancel.bin", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatalf("open = %v", code)
+	}
+	readDone := make(chan fuse.Status, 1)
+	go func() {
+		_, status := handle.Read(make([]byte, 4096), 0)
+		readDone <- status
+	}()
+	<-started
+	handle.Release()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("range context error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("release did not cancel range request")
+	}
+	if code := <-readDone; code != fuse.EINTR {
+		t.Fatalf("canceled range status = %v", code)
 	}
 }
 

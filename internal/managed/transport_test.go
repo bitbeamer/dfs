@@ -208,6 +208,58 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if string(downloaded) != string(payload) {
 		t.Fatalf("downloaded content = %q", downloaded)
 	}
+	// A dead trusted peer is skipped and the same authenticated range is served
+	// by the next available peer without exposing partial output to the caller.
+	_, unavailablePrivate, unavailableErr := ed25519.GenerateKey(nil)
+	if unavailableErr != nil {
+		t.Fatal(unavailableErr)
+	}
+	unavailablePublic := unavailablePrivate.Public().(ed25519.PublicKey)
+	unavailablePayload := serverRecord.Payload
+	unavailablePayload.PeerID = "dfs-peer-000000000000"
+	unavailablePayload.Name = "unavailable"
+	unavailablePayload.Hostname = "unavailable"
+	unavailablePayload.SigningPublicKey = base64Public(unavailablePublic)
+	unavailablePayload.QUICEndpoint = "quic://" + blackhole.LocalAddr().String()
+	unavailablePayload.Generation = 1
+	unavailablePayload.UpdatedAt = time.Now().UTC()
+	unavailableRecord, err := membership.Sign(unavailablePayload, unavailablePrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableRecord, err = membership.Approve(unavailableRecord, serverRepo.Config.PeerID, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := membership.Save(clientRepo.Config.Repository, unavailableRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := membership.Trust(clientRepo.Config.Repository, unavailableRecord.Payload.PeerID, unavailableRecord.Payload.SigningPublicKey); err != nil {
+		t.Fatal(err)
+	}
+	var ranged bytes.Buffer
+	total, err := FetchRange(ctx, clientRepo, strings.TrimSpace(string(keyBytes)), 8, 7, &ranged)
+	if err != nil {
+		t.Fatalf("range fetch with failed first peer: %v", err)
+	}
+	if total != int64(len(payload)) || ranged.String() != string(payload[8:15]) {
+		t.Fatalf("range fetch = total %d, data %q", total, ranged.String())
+	}
+
+	clientRepo.SetManagedRangeFetcher(FetchRange)
+	streamed := make([]byte, len(payload))
+	if n, err := clientRepo.ReadRange(ctx, "payload.txt", strings.TrimSpace(string(keyBytes)), int64(len(payload)), 0, streamed); err != nil || n != len(payload) {
+		t.Fatalf("stream and promote complete content = %d, %v", n, err)
+	}
+	if !bytes.Equal(streamed, payload) {
+		t.Fatalf("streamed content = %q", streamed)
+	}
+	if output, err := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "annex", "find", "--in=here", "--format=${file}", "--", "payload.txt").CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "payload.txt" {
+		t.Fatalf("verified range was not promoted: %v\n%s", err, output)
+	}
+	if output, err := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "annex", "drop", "--force", "--", "payload.txt").CombinedOutput(); err != nil {
+		t.Fatalf("drop streamed content before whole-fetch compatibility test: %v\n%s", err, output)
+	}
 	clientRepo.SetManagedFetcher(FetchPath)
 	if err := clientRepo.Fetch(ctx, "payload.txt", ""); err != nil {
 		t.Fatal(err)

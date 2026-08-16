@@ -40,14 +40,17 @@ type Request struct {
 	Operation string          `json:"operation"`
 	Service   string          `json:"service,omitempty"`
 	Key       string          `json:"key,omitempty"`
+	Offset    int64           `json:"offset,omitempty"`
+	Length    int64           `json:"length,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
 type Response struct {
-	OK      bool            `json:"ok"`
-	Error   string          `json:"error,omitempty"`
-	Size    int64           `json:"size,omitempty"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	OK        bool            `json:"ok"`
+	Error     string          `json:"error,omitempty"`
+	Size      int64           `json:"size,omitempty"`
+	TotalSize int64           `json:"total_size,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
 type Server struct {
@@ -194,7 +197,9 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	case "git":
 		s.serveGit(stream, reader, request.Service)
 	case "annex-get":
-		s.serveContent(stream, request.Key)
+		s.serveContent(stream, request.Key, 0, 0)
+	case "annex-range":
+		s.serveContent(stream, request.Key, request.Offset, request.Length)
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
@@ -333,7 +338,7 @@ func userVisibleRefs(ctx context.Context, repositoryPath string) []byte {
 	return visible
 }
 
-func (s *Server) serveContent(stream *quic.Stream, key string) {
+func (s *Server) serveContent(stream *quic.Stream, key string, offset, length int64) {
 	if key == "" || strings.ContainsAny(key, "\r\n\x00") {
 		writeResponse(stream, Response{Error: "invalid annex key"})
 		return
@@ -364,10 +369,25 @@ func (s *Server) serveContent(stream *quic.Stream, key string) {
 		writeResponse(stream, Response{Error: "inspect annex content"})
 		return
 	}
-	if err := writeResponse(stream, Response{OK: true, Size: info.Size()}); err != nil {
+	if offset < 0 || length < 0 || offset > info.Size() {
+		writeResponse(stream, Response{Error: "invalid annex content range"})
 		return
 	}
-	_, _ = io.CopyN(stream, file, info.Size())
+	if length == 0 {
+		length = info.Size() - offset
+	}
+	if length > info.Size()-offset {
+		writeResponse(stream, Response{Error: "annex content range exceeds object size"})
+		return
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		writeResponse(stream, Response{Error: "seek annex content"})
+		return
+	}
+	if err := writeResponse(stream, Response{OK: true, Size: length, TotalSize: info.Size()}); err != nil {
+		return
+	}
+	_, _ = io.CopyN(stream, file, length)
 }
 
 func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*quic.Conn, membership.Record, error) {
@@ -516,6 +536,54 @@ func FetchContent(ctx context.Context, repo *repository.Repository, peerID, key 
 	defer stream.Close()
 	written, err := io.CopyN(output, reader, response.Size)
 	return written, err
+}
+
+func FetchRange(ctx context.Context, repo *repository.Repository, key string, offset, length int64, output io.Writer) (int64, error) {
+	trusted, err := membership.LoadTrusted(repo.Config.Repository)
+	if err != nil {
+		return 0, err
+	}
+	records, err := membership.LoadAll(repo.Config.Repository)
+	if err != nil {
+		return 0, err
+	}
+	var failures []string
+	for _, record := range records {
+		peerID := record.Payload.PeerID
+		if peerID == repo.Config.PeerID || trusted[peerID] != record.Payload.SigningPublicKey {
+			continue
+		}
+		connection, stream, reader, response, openErr := Open(ctx, repo, peerID, Request{
+			Operation: "annex-range", Key: key, Offset: offset, Length: length,
+		})
+		if openErr != nil {
+			failures = append(failures, peerID+": "+openErr.Error())
+			continue
+		}
+		if response.Size != length || response.TotalSize <= 0 {
+			_ = stream.Close()
+			_ = connection.CloseWithError(1, "invalid range response")
+			failures = append(failures, peerID+": invalid annex range response")
+			continue
+		}
+		var buffered bytes.Buffer
+		written, copyErr := io.CopyN(&buffered, reader, response.Size)
+		_ = stream.Close()
+		_ = connection.CloseWithError(0, "")
+		if copyErr == nil && written != length {
+			copyErr = io.ErrUnexpectedEOF
+		}
+		if copyErr == nil {
+			if _, copyErr = io.Copy(output, &buffered); copyErr == nil {
+				return response.TotalSize, nil
+			}
+		}
+		failures = append(failures, peerID+": "+copyErr.Error())
+	}
+	if len(failures) == 0 {
+		return 0, errors.New("no trusted managed content source is available")
+	}
+	return 0, fmt.Errorf("managed range fetch failed: %s", strings.Join(failures, "; "))
 }
 
 func FetchPath(ctx context.Context, repo *repository.Repository, path, from string) error {

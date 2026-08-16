@@ -7,7 +7,7 @@ DFS is experimental. Start with test data and keep an independent backup.
 Each peer needs Go 1.26+, Git, git-annex, OpenSSH, rsync, and a FUSE
 runtime. DFS-managed QUIC is the primary peer transport. OpenSSH and rsync
 provide the repository-restricted compatibility fallback and are also used by
-mesh diagnostics and the cross-peer acceptance test.
+cluster diagnostics and the cross-peer acceptance test.
 
 ### CachyOS/Arch Linux prerequisites
 
@@ -15,7 +15,7 @@ mesh diagnostics and the cross-peer acceptance test.
 sudo pacman -S --needed go git git-annex openssh rsync fuse3
 ```
 
-Enable the SSH server to make the fallback and complete mesh diagnostics
+Enable the SSH server to make the fallback and complete cluster diagnostics
 available to other peers:
 
 ```sh
@@ -66,7 +66,7 @@ test -x /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse \
   && echo "macFUSE is installed"
 ```
 
-For inbound fallback connections and complete mesh diagnostics, enable
+For inbound fallback connections and complete cluster diagnostics, enable
 **Remote Login** under **System Settings → General → Sharing** for the DFS
 account.
 
@@ -273,6 +273,13 @@ the background. Offline peers apply cluster pins after reconnecting, and
 or capacity-constrained state. Use the corresponding `unpin` command with or
 without `--cluster`; the two scopes are independent.
 
+Ordinary reads of uncached annex files do not wait for full hydration. DFS
+serves requested byte ranges over mutually authenticated QUIC and keeps
+resumable sparse partials under the repository's private
+`.git/dfs/range-cache`. Concurrent reads of duplicate annex content coalesce;
+complete content is verified before atomic git-annex promotion. Explicit fetch
+and pin operations still hydrate the entire selected content.
+
 `health --cluster` verifies managed QUIC, the repository-restricted SSH fallback,
 and ordinary passwordless, non-interactive SSH for every directed peer pair. A
 working fallback with unavailable QUIC is shown as `SSH_FALLBACK`; a missing
@@ -289,7 +296,7 @@ transfers the old identity to the renamed machine. Re-add it as a new peer:
 
 1. Uninstall its managed mount with `scripts/install-macos.sh --uninstall <repository>`
    or `scripts/install-cachyos.sh --uninstall <repository>`.
-2. On another mesh member, run
+2. On another cluster member, run
    `dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<old-id>`.
 3. Move the renamed machine's old repository aside as a backup, create a new
    invitation on an existing member, and run `network join` into the original
@@ -337,7 +344,7 @@ available, local filesystem checks can be run explicitly with
 `TEST_MOUNT_FLAGS=--local-only`; this mode reports the synchronization checks as
 skipped and must not be treated as a complete cross-peer acceptance test.
 
-Run the mesh check while all peers you expect to validate are mounted and
+Run the cluster check while all peers you expect to validate are mounted and
 advertising. Configured signed membership remains authoritative when mDNS is
 unavailable. The command exits unsuccessfully if any directed peer is missing,
 both managed transports fail, or ordinary passwordless SSH is not configured.

@@ -31,14 +31,17 @@ const (
 )
 
 type Repository struct {
-	Config         config.Config
-	Store          *store.Store
-	runner         command.Runner
-	mu             sync.Mutex
-	syncStateMu    sync.Mutex
-	remoteRetry    map[string]remoteRetry
-	remoteChecked  map[string]bool
-	managedFetcher func(context.Context, *Repository, string, string) error
+	Config              config.Config
+	Store               *store.Store
+	runner              command.Runner
+	mu                  sync.Mutex
+	syncStateMu         sync.Mutex
+	remoteRetry         map[string]remoteRetry
+	remoteChecked       map[string]bool
+	managedFetcher      func(context.Context, *Repository, string, string) error
+	managedRangeFetcher ManagedRangeFetcher
+	rangeStatesMu       sync.Mutex
+	rangeStates         map[string]*rangeState
 }
 
 type remoteRetry struct {
@@ -606,16 +609,17 @@ func (r *Repository) ChangedPaths(ctx context.Context, before, after string) ([]
 }
 
 func (r *Repository) Fetch(ctx context.Context, path, from string) error {
+	key, _ := r.LookupKey(ctx, path)
 	r.mu.Lock()
 	fetcher := r.managedFetcher
 	r.mu.Unlock()
 	if fetcher != nil {
 		if err := fetcher(ctx, r, path, from); err == nil {
+			r.discardRangeCache(key)
 			return r.Store.Touch(path)
 		}
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	var failures []string
 	remotes, _ := r.remotesLocked(ctx)
 	for _, remote := range remotes {
@@ -640,6 +644,8 @@ func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 			"annex", "get", "--from=" + alias, "--", filepath.ToSlash(path),
 		}
 		if _, err := r.runner.Run(ctx, "git", fallbackArgs...); err == nil {
+			r.mu.Unlock()
+			r.discardRangeCache(key)
 			return r.Store.Touch(path)
 		} else {
 			failures = append(failures, remote.Name+": "+err.Error())
@@ -651,11 +657,14 @@ func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 	}
 	args = append(args, "--", filepath.ToSlash(path))
 	if _, err := r.runner.Run(ctx, "git", args...); err != nil {
+		r.mu.Unlock()
 		if len(failures) > 0 {
 			return fmt.Errorf("SSH content fallback failed: %s; regular annex retrieval failed: %w", strings.Join(failures, "; "), err)
 		}
 		return err
 	}
+	r.mu.Unlock()
+	r.discardRangeCache(key)
 	return r.Store.Touch(path)
 }
 

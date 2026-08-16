@@ -1,0 +1,191 @@
+package repository
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/store"
+)
+
+func rangeTestRepository(t *testing.T, root string, limit int64) *Repository {
+	t.Helper()
+	stateDirectory := filepath.Join(root, ".git", "dfs")
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(filepath.Join(stateDirectory, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	cfg := config.Default("range-test", root)
+	cfg.CacheLimit = limit
+	return &Repository{Config: cfg, Store: state}
+}
+
+func rangeTestKey(payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return "SHA256E-s" + strconv.FormatInt(int64(len(payload)), 10) + "--" + hex.EncodeToString(digest[:]) + ".bin"
+}
+
+func payloadFetcher(payload []byte, calls *atomic.Int32) ManagedRangeFetcher {
+	return func(_ context.Context, _ *Repository, _ string, offset, length int64, output io.Writer) (int64, error) {
+		calls.Add(1)
+		_, err := output.Write(payload[offset : offset+length])
+		return int64(len(payload)), err
+	}
+}
+
+func TestSparseRangeCacheSupportsSequentialReadsAndResume(t *testing.T) {
+	root := t.TempDir()
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 768<<10) // 12 MiB
+	key := rangeTestKey(payload)
+	var calls atomic.Int32
+	repo := rangeTestRepository(t, root, 32<<20)
+	repo.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
+
+	for _, offset := range []int64{0, 4 << 20} {
+		buffer := make([]byte, 128<<10)
+		n, err := repo.ReadRange(context.Background(), "movie.bin", key, int64(len(payload)), offset, buffer)
+		if err != nil || n != len(buffer) || !bytes.Equal(buffer, payload[offset:offset+int64(n)]) {
+			t.Fatalf("sequential read at %d = %d, %v", offset, n, err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("read-ahead transfers = %d, want 2", got)
+	}
+
+	// A new Repository represents a daemon restart. Reading an already cached
+	// extent must resume from peer-private metadata without another transfer.
+	restarted := rangeTestRepository(t, root, 32<<20)
+	restarted.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
+	buffer := make([]byte, 4096)
+	if _, err := restarted.ReadRange(context.Background(), "movie.bin", key, int64(len(payload)), 6<<20, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("resumed cache transfers = %d, want 2", got)
+	}
+}
+
+func TestSparseRangeCacheSupportsFinderQuickLookAndRandomSeeks(t *testing.T) {
+	payload := bytes.Repeat([]byte("preview-content-"), 1280<<10)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	var calls atomic.Int32
+	repo.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
+	key := rangeTestKey(payload)
+	// Finder and Quick Look commonly inspect the header, trailer, then a small
+	// random media extent without consuming the entire object.
+	for _, offset := range []int64{0, int64(len(payload)) - 8192, 10<<20 + 12345} {
+		buffer := make([]byte, 4096)
+		n, err := repo.ReadRange(context.Background(), "preview.mov", key, int64(len(payload)), offset, buffer)
+		if err != nil || !bytes.Equal(buffer[:n], payload[offset:offset+int64(n)]) {
+			t.Fatalf("preview read at %d = %d, %v", offset, n, err)
+		}
+	}
+	if calls.Load() >= 4 {
+		t.Fatalf("preview issued %d transfers; sparse read-ahead was not reused", calls.Load())
+	}
+}
+
+func TestConcurrentDuplicateNamesCoalesceAnnexRange(t *testing.T) {
+	payload := bytes.Repeat([]byte("same-object"), 1<<20)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	key := rangeTestKey(payload)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	repo.SetManagedRangeFetcher(func(_ context.Context, _ *Repository, _ string, offset, length int64, output io.Writer) (int64, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		_, err := output.Write(payload[offset : offset+length])
+		return int64(len(payload)), err
+	})
+
+	var wait sync.WaitGroup
+	errorsSeen := make(chan error, 2)
+	for _, path := range []string{"first/movie.bin", "duplicate/movie.bin"} {
+		wait.Add(1)
+		go func(path string) {
+			defer wait.Done()
+			_, err := repo.ReadRange(context.Background(), path, key, int64(len(payload)), 1024, make([]byte, 4096))
+			errorsSeen <- err
+		}(path)
+	}
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("duplicate-name transfers = %d, want 1", got)
+	}
+}
+
+func TestRangeReadCancellationStopsTransfer(t *testing.T) {
+	payload := make([]byte, 8<<20)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	started := make(chan struct{})
+	repo.SetManagedRangeFetcher(func(ctx context.Context, _ *Repository, _ string, _, _ int64, _ io.Writer) (int64, error) {
+		close(started)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := repo.ReadRange(ctx, "cancel.bin", rangeTestKey(payload), int64(len(payload)), 0, make([]byte, 4096))
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled read error = %v", err)
+	}
+}
+
+func TestPartialRangeCacheEvictsOldestInactiveObject(t *testing.T) {
+	root := t.TempDir()
+	repo := rangeTestRepository(t, root, rangeReadAhead)
+	payload := make([]byte, 8<<20)
+	var calls atomic.Int32
+	repo.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
+	firstKey := rangeTestKey(append([]byte("first"), payload...))
+	secondPayload := append([]byte("second"), payload...)
+	secondKey := rangeTestKey(secondPayload)
+	// Use matching source sizes while keeping two distinct keys.
+	firstPayload := append([]byte("first"), payload...)
+	repo.SetManagedRangeFetcher(payloadFetcher(firstPayload, &calls))
+	if _, err := repo.ReadRange(context.Background(), "first.bin", firstKey, int64(len(firstPayload)), 0, make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	firstPartial, firstMetadata := repo.rangeCachePaths(firstKey)
+	repo.SetManagedRangeFetcher(payloadFetcher(secondPayload, &calls))
+	if _, err := repo.ReadRange(context.Background(), "second.bin", secondKey, int64(len(secondPayload)), 0, make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{firstPartial, firstMetadata} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("old partial cache %s still exists: %v", filepath.Base(path), err)
+		}
+	}
+}

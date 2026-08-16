@@ -154,6 +154,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	}
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
 	repo.SetManagedFetcher(managed.FetchPath)
+	repo.SetManagedRangeFetcher(managed.FetchRange)
 	scheduler.SetReconciler(func(ctx context.Context) error { return peer.ReconcileMembership(ctx, repo) })
 	eventListener, err := wakeup.Listen(repo.Config.Repository)
 	if err != nil {
