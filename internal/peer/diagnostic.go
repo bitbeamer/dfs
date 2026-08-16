@@ -58,7 +58,7 @@ type MeshReport struct {
 // refs or annex state.
 func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Duration) (DiagnosticReport, error) {
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = 10 * time.Second
 	}
 	filesystemID, err := repo.FileSystemID(ctx)
 	if err != nil {
@@ -98,7 +98,7 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 		discoveryTimeout = 2 * time.Second
 	}
 	if probeTimeout <= 0 {
-		probeTimeout = 5 * time.Second
+		probeTimeout = 10 * time.Second
 	}
 	filesystemID, err := repo.FileSystemID(ctx)
 	if err != nil {
@@ -308,7 +308,7 @@ func serveDiagnostic(repositoryPath string, output io.Writer) error {
 	defer repo.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	report, err := Diagnose(ctx, repo, 5*time.Second)
+	report, err := Diagnose(ctx, repo, 10*time.Second)
 	if err != nil {
 		return err
 	}

@@ -880,9 +880,9 @@ func (a *App) doctorCommand() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&mesh, "mesh", false, "check every directed connection between currently discovered peers")
+	cmd.Flags().BoolVar(&mesh, "mesh", false, "check every directed connection between configured mesh peers")
 	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the mesh check")
-	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 5*time.Second, "maximum time for each peer connection probe")
+	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer connection probe")
 	return cmd
 }
 
