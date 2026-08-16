@@ -14,6 +14,37 @@ import (
 	"github.com/bitbeamer/dfs/internal/config"
 )
 
+func TestJoinNormalizesGitAnnexSynchronizedHeadToMain(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\n\tname = DFS Test\n\temail = dfs@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	source, err := Init(ctx, filepath.Join(home, "source"), "source", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if _, err := source.runner.Run(ctx, "git", "checkout", "-b", "synced/main"); err != nil {
+		t.Fatal(err)
+	}
+	joined, err := Join(ctx, source.Config.Repository, filepath.Join(home, "joined"), "joined", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer joined.Close()
+	branch, err := joined.runner.Run(ctx, "git", "symbolic-ref", "--short", "HEAD")
+	if err != nil || strings.TrimSpace(branch) != "main" {
+		t.Fatalf("joined branch = %q, %v", branch, err)
+	}
+}
+
 func TestSyncIsolatesUnavailableRemoteAndReleasesRepositoryLock(t *testing.T) {
 	if _, err := exec.LookPath("git-annex"); err != nil {
 		t.Skip("git-annex is not installed")
@@ -203,13 +234,16 @@ func TestDirectionalPushPublishesThroughPeerInbox(t *testing.T) {
 	if err := source.AddRemote(ctx, "receiver", receiver.Config.Repository); err != nil {
 		t.Fatal(err)
 	}
+	// A transient startup failure must not suppress later event delivery until
+	// periodic reconciliation or the full unavailable-peer backoff expires.
+	source.recordRemoteFailure("receiver", errors.New("transient network failure"))
 
 	path := filepath.Join(source.Config.Repository, "event.txt")
 	if err := os.WriteFile(path, []byte("created\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := source.SyncDirectional(ctx, true, false, true); err != nil {
-		t.Fatal(err)
+		t.Fatalf("directional push during remembered peer failure: %v", err)
 	}
 	inbox := "refs/heads/dfs-incoming/" + source.Config.PeerID + "/main"
 	if _, err := receiver.runner.Run(ctx, "git", "rev-parse", "--verify", inbox); err != nil {

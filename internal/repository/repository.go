@@ -152,6 +152,22 @@ func Join(ctx context.Context, remote, path, name string, cacheLimit int64) (*Re
 		name, _ = os.Hostname()
 	}
 	runner.Directory = path
+	// A pairing bundle can be captured while git-annex has its synchronized
+	// branch checked out. DFS mutations and the directional fast path always
+	// publish refs/heads/main, so normalize every joined worktree back to that
+	// stable primary branch before initializing this peer.
+	if _, mainErr := runner.Run(ctx, "git", "rev-parse", "--verify", "refs/heads/main"); mainErr == nil {
+		if _, err := runner.Run(ctx, "git", "checkout", "main"); err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err := runner.Run(ctx, "git", "rev-parse", "--verify", "refs/heads/synced/main"); err != nil {
+			return nil, errors.New("joined DFS repository has neither main nor synced/main")
+		}
+		if _, err := runner.Run(ctx, "git", "checkout", "-b", "main", "refs/heads/synced/main"); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := runner.Run(ctx, "git", "annex", "init", name); err != nil {
 		return nil, err
 	}
@@ -502,7 +518,11 @@ func (r *Repository) SyncDirectional(ctx context.Context, metadataOnly, pull, pu
 	now := time.Now()
 	for _, remote := range remotes {
 		retry, waiting := r.remoteRetryState(remote.Name, now)
-		if waiting || ((!pull || !push) && retry.err != "") {
+		// Full reconciliation honors the unavailable-peer backoff. Directional
+		// event delivery deliberately does not: pushes run concurrently, so a
+		// dead peer cannot delay a healthy one, and a peer that recovered from a
+		// transient network failure receives the very next filesystem event.
+		if waiting && pull && push {
 			results <- probeResult{remote: remote, err: fmt.Errorf("retry after %s following: %s", retry.until.Format(time.RFC3339), retry.err), deferred: true}
 			continue
 		}

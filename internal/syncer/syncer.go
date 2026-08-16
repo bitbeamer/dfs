@@ -15,6 +15,11 @@ import (
 
 const eventDebounce = 300 * time.Millisecond
 
+const (
+	receiveAndPublishReason  = "filesystem change and managed Git receive"
+	maintenanceReceiveReason = "maintenance and managed Git receive"
+)
+
 type Scheduler struct {
 	repo      *repository.Repository
 	interval  time.Duration
@@ -138,7 +143,7 @@ func (s *Scheduler) loop() {
 	defer ticker.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
-	pendingReason := "filesystem change"
+	pendingReason := ""
 	for {
 		select {
 		case <-s.stop:
@@ -153,7 +158,11 @@ func (s *Scheduler) loop() {
 				s.sync("periodic")
 			}
 		case reason := <-s.events:
-			pendingReason = reason
+			if debounceC == nil {
+				pendingReason = reason
+			} else {
+				pendingReason = mergeReasons(pendingReason, reason)
+			}
 			if debounce == nil {
 				debounce = time.NewTimer(eventDebounce)
 			} else {
@@ -169,6 +178,7 @@ func (s *Scheduler) loop() {
 		case <-debounceC:
 			debounceC = nil
 			s.sync(pendingReason)
+			pendingReason = ""
 		}
 	}
 }
@@ -204,6 +214,14 @@ func (s *Scheduler) sync(reason string) {
 		switch reason {
 		case "managed Git receive":
 			err = s.repo.ApplyReceived(ctx)
+		case receiveAndPublishReason:
+			if err = s.repo.ApplyReceived(ctx); err == nil {
+				err = s.repo.SyncDirectional(ctx, true, false, true)
+			}
+		case maintenanceReceiveReason:
+			if err = s.repo.ApplyReceived(ctx); err == nil {
+				err = s.repo.Sync(ctx, true)
+			}
 		case "startup", "periodic", "shutdown":
 			err = s.repo.Sync(ctx, true)
 		default:
@@ -289,11 +307,40 @@ func (s *Scheduler) sync(reason string) {
 
 func isMaintenanceReason(reason string) bool {
 	switch reason {
-	case "startup", "periodic", "shutdown", "pin policy changed":
+	case "startup", "periodic", "shutdown", "pin policy changed", maintenanceReceiveReason:
 		return true
 	default:
 		return false
 	}
+}
+
+func mergeReasons(current, next string) string {
+	maintenance := isMaintenanceReason(current) || isMaintenanceReason(next)
+	receive := includesReceive(current) || includesReceive(next)
+	local := includesPublish(current) || includesPublish(next)
+	switch {
+	case maintenance && receive:
+		return maintenanceReceiveReason
+	case maintenance:
+		if isMaintenanceReason(next) {
+			return next
+		}
+		return current
+	case receive && local:
+		return receiveAndPublishReason
+	case receive:
+		return "managed Git receive"
+	default:
+		return next
+	}
+}
+
+func includesReceive(reason string) bool {
+	return reason == "managed Git receive" || reason == receiveAndPublishReason || reason == maintenanceReceiveReason
+}
+
+func includesPublish(reason string) bool {
+	return reason != "" && !isMaintenanceReason(reason) && reason != "managed Git receive"
 }
 
 func syncUntilConverged(

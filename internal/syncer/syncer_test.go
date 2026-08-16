@@ -56,6 +56,32 @@ func TestPinAndReceiveEventsRunMaintenance(t *testing.T) {
 	}
 }
 
+func TestMergeReasonsPreservesReceiveAndPublishWork(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"completed write", "managed Git receive"},
+		{"managed Git receive", "completed write"},
+		{receiveAndPublishReason, "rename"},
+		{receiveAndPublishReason, "managed Git receive"},
+	} {
+		if got := mergeReasons(pair[0], pair[1]); got != receiveAndPublishReason {
+			t.Errorf("mergeReasons(%q, %q) = %q, want %q", pair[0], pair[1], got, receiveAndPublishReason)
+		}
+	}
+}
+
+func TestMergeReasonsPreservesReceiveDuringMaintenance(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"periodic", "managed Git receive"},
+		{"managed Git receive", "startup"},
+		{receiveAndPublishReason, "pin policy changed"},
+		{maintenanceReceiveReason, "completed write"},
+	} {
+		if got := mergeReasons(pair[0], pair[1]); got != maintenanceReceiveReason {
+			t.Errorf("mergeReasons(%q, %q) = %q, want %q", pair[0], pair[1], got, maintenanceReceiveReason)
+		}
+	}
+}
+
 func TestSyncUntilConvergedStopsImmediatelyWhenUnchanged(t *testing.T) {
 	passes := 0
 	tree := "initial"
