@@ -433,8 +433,8 @@ dfs --repo ~/.local/share/dfs/repository storage enable archive
 
 ## Filesystem semantics
 
-Writable opens use private copy-on-write files under `.git/dfs/staging`. DFS
-publishes a verified transaction only after the final writable handle closes.
+Writable opens use private copy-on-write files under `.git/dfs/transactions`.
+DFS publishes a durable atomic transaction only after the final writable handle closes.
 `flush` preserves the transaction until that close because macOS may share one
 FUSE handle across multiple application descriptors. `fsync` durably checkpoints
 a transaction without ending the open
@@ -452,7 +452,7 @@ Successful extents are retained as a resumable sparse file under
 `.git/dfs/range-cache`, never in the logical filesystem. Once all extents are
 present, DFS verifies the annex key and atomically promotes the object into
 git-annex. Old inactive partials are evicted against the peer's cache limit.
-Closing a streaming handle or stopping the daemon cancels its in-flight request,
+Closing a streaming handle or stopping the mount frontend cancels its in-flight request,
 and a failed source peer is skipped in favor of another trusted content holder.
 
 After remote namespace changes, DFS invalidates kernel FUSE entries on every
@@ -474,21 +474,34 @@ cases; repeated synchronization converges on the same Git tree.
 applications / Finder
         |
         v
-Go FUSE mounted logical namespace
+Go FUSE protocol adapter
         |
         v
-DFS transactions, synchronization, and quota scheduler
+In-process core API (namespace, content, transactions, events, policy, health)
+        |-- direct local reads: cached git-annex objects
+        |-- range reads: cancellable authenticated QUIC streams
         |-- Git: namespace, history, signed membership and cluster-pin metadata refs
         |-- git-annex: content hashes, locations, safe copies
-        |-- SQLite: peer-local pins, applied cluster pins, access, and filesystem metadata
+        `-- SQLite: peer-local pins, access, and filesystem metadata
+
+Independent core daemon
+        |-- synchronization, reconciliation, pins, cache, and health
         |-- mDNS + pinned TLS: discovery and approval
         |-- mutually authenticated QUIC: peer transport
         `-- S3: optional durable content
 ```
 
+FUSE calls the Go core API in the mount process. Cached content therefore keeps
+its direct local file-descriptor path, and no RPC, IPC, serialization, or
+out-of-process hop sits in the mounted read path. The independently managed
+daemon owns background synchronization and peer service lifecycle; mounting or
+unmounting the adapter does not start or stop that daemon. The same core API is
+the frontend boundary for future browser and native-platform adapters.
+
 The underlying Git worktree is an implementation detail. A locked git-annex
-symlink is presented as a regular file; opening missing content runs
-`git annex get`, and opening it for writing hydrates a private transaction.
+symlink is presented as a regular file; opening missing content uses QUIC range
+streaming when available and otherwise hydrates it, while a writable open uses
+a private transaction.
 
 ## Current limitations
 
@@ -514,8 +527,8 @@ make test
 make test-integration
 ```
 
-The test suite covers repository synchronization, conflict convergence,
-transaction publication and recovery, locks, `fsync`, rename/unlink behavior,
+The test suite covers the frontend-neutral core API, repository synchronization,
+conflict convergence, transaction publication and recovery, locks, `fsync`, rename/unlink behavior,
 metadata persistence, case-only renames, Unicode normalization, and native FUSE
 operations. After any source change that can affect mounted behavior, also run
 the live cross-peer suite on each available macOS and Arch/CachyOS peer:

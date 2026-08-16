@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -313,6 +314,9 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 	}
 	for _, directory := range []string{"staging", "transactions"} {
 		entries, err := os.ReadDir(filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), directory))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			t.Fatalf("read %s directory: %v", directory, err)
 		}

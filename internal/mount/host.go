@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/core"
 	"github.com/bitbeamer/dfs/internal/daemon"
-	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -149,13 +149,13 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	if clearedStale {
 		logger.Info("stale mountpoint detached", "mountpoint", mountpoint)
 	}
-	repo.SetManagedFetcher(managed.FetchPath)
-	repo.SetManagedRangeFetcher(managed.FetchRange)
 	notifier := daemonNotifier{repository: repo.Config.Repository}
 
 	operationCtx, cancelOperations := context.WithCancel(ctx)
 	defer cancelOperations()
-	filesystem := NewFileSystemWithContext(operationCtx, repo, notifier, logger.With("component", "filesystem"))
+	coreService := core.New(repo, core.Options{ManagedContent: true})
+	defer coreService.Close()
+	filesystem := NewFileSystemWithContext(operationCtx, coreService, notifier, logger.With("component", "filesystem"))
 	// The annex working tree may replace a regular file with a symlink after a
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.

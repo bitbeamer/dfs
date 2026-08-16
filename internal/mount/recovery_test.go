@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -134,6 +135,29 @@ func TestRecoveryQuarantinesLegacyStagingFile(t *testing.T) {
 	}
 	if content, err := os.ReadFile(filepath.Join(run.batch, "writes", "legacy-write-legacy")); err != nil || string(content) != "unknown" {
 		t.Fatalf("legacy quarantine = %q, %v", content, err)
+	}
+}
+
+func TestRecoveryQuarantinesAbandonedCoreTransaction(t *testing.T) {
+	root := t.TempDir()
+	transactionDirectory := filepath.Join(root, config.Directory, "transactions")
+	if err := os.MkdirAll(transactionDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(transactionDirectory, "write-abandoned")
+	if err := os.WriteFile(staging, []byte("unpublished core payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := newRecoveryRun(t, root)
+	if err := run.recoverWrites(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(run.batch, "writes", "core-write-abandoned"))
+	if err != nil || string(content) != "unpublished core payload" {
+		t.Fatalf("core transaction quarantine = %q, %v", content, err)
+	}
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned core staging remains: %v", err)
 	}
 }
 

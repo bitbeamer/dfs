@@ -208,6 +208,23 @@ func (s *Store) FileMetadata(path string) (FileMetadata, bool, error) {
 	return metadata, err == nil, err
 }
 
+func (s *Store) FileStatePaths() ([]string, error) {
+	rows, err := s.db.Query(`SELECT path FROM file_metadata UNION SELECT path FROM xattrs ORDER BY path`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
 func (s *Store) SetXAttr(path, name string, value []byte, flags int) error {
 	path = normalize(path)
 	var exists int

@@ -174,6 +174,12 @@ starts the core first, and waits for both health and mount readiness. The core
 advertises the filesystem to nearby peers. `dfs setup` currently joins an existing filesystem;
 creation of the first peer is the explicit `init` plus installer flow above.
 
+The mount frontend is a thin FUSE adapter over DFS's in-process Go core API.
+There is no RPC or second process in the mounted read path, so cached annex
+content remains a direct local read. The separate core daemon owns background
+synchronization, QUIC service, pin hydration, cache maintenance, and health;
+unmounting the frontend does not stop those services.
+
 ## 3. Join and approve
 
 On the new peer, from the cloned DFS source directory, run the transactional

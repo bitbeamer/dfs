@@ -1,25 +1,21 @@
 package mount
 
 import (
-	stdcontext "context"
+	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/bitbeamer/dfs/internal/store"
+	"github.com/bitbeamer/dfs/internal/core"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
 	"github.com/hanwen/go-fuse/v2/fuse/pathfs"
-	"golang.org/x/text/unicode/norm"
 )
 
 type changeNotifier interface {
@@ -28,182 +24,69 @@ type changeNotifier interface {
 	EndWrite()
 }
 
-type FileSystem struct {
-	pathfs.FileSystem
-	repo             *repository.Repository
-	root             string
-	lifetime         stdcontext.Context
-	notifier         changeNotifier
-	logger           *slog.Logger
-	sizesMu          sync.Mutex
-	sizes            map[string]uint64
-	writesMu         sync.Mutex
-	writes           map[string]*writeTransaction
-	attrsMu          sync.Mutex
-	attrs            map[string]visibleState
-	annexInodesMu    sync.Mutex
-	annexInodes      map[string]uint64
-	hydrationsMu     sync.Mutex
-	hydrations       map[string]*hydrationCall
-	cacheInvalidator contentInvalidator
-}
-
-type hydrationCall struct {
-	done chan struct{}
-	err  error
-}
-
-type trackedFile struct {
-	nodefs.File
-	filesystem  *FileSystem
-	path        string
-	annexTarget string
-	openFlags   uint32
-	mu          sync.Mutex
-}
-
-type rangeFile struct {
-	nodefs.File
-	filesystem *FileSystem
-	path       string
-	key        string
-	size       int64
-	ctx        stdcontext.Context
-	cancel     stdcontext.CancelFunc
-	attr       fuse.Attr
-	mu         sync.Mutex
-	released   bool
-}
-
 type contentInvalidator interface {
 	InvalidateContent(path string)
 }
 
-func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
-	return NewFileSystemWithContext(stdcontext.Background(), repo, notifier, logger)
+// FileSystem is only a protocol adapter. All namespace, metadata, content,
+// mutation, and private-state decisions belong to core.API.
+type FileSystem struct {
+	pathfs.FileSystem
+	core             core.API
+	lifetime         context.Context
+	notifier         changeNotifier
+	logger           *slog.Logger
+	writesMu         sync.Mutex
+	writes           map[string]*writeSession
+	cacheInvalidator contentInvalidator
 }
 
-func NewFileSystemWithContext(ctx stdcontext.Context, repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
+type writeSession struct {
+	mu          sync.Mutex
+	transaction core.WriteTransaction
+	path        string
+	attributes  core.Attributes
+	refs        int
+	dirty       bool
+	created     bool
+	removed     bool
+	failure     error
+}
+
+type adapterFile struct {
+	nodefs.File
+	filesystem *FileSystem
+	session    *writeSession
+	writable   bool
+	release    sync.Once
+}
+
+type readFile struct {
+	nodefs.File
+	handle     core.ReadHandle
+	filesystem *FileSystem
+	path       string
+	closed     atomic.Bool
+}
+
+type versionedReadFile struct {
+	*readFile
+	mu sync.Mutex
+}
+
+func NewFileSystem(api core.API, notifier changeNotifier, logger *slog.Logger) *FileSystem {
+	return NewFileSystemWithContext(context.Background(), api, notifier, logger)
+}
+
+func NewFileSystemWithContext(ctx context.Context, api core.API, notifier changeNotifier, logger *slog.Logger) *FileSystem {
 	if ctx == nil {
-		ctx = stdcontext.Background()
+		ctx = context.Background()
 	}
-	return &FileSystem{
-		FileSystem: pathfs.NewLoopbackFileSystem(repo.Config.Repository),
-		repo:       repo, root: repo.Config.Repository, lifetime: ctx, notifier: notifier, logger: logger,
-		sizes: make(map[string]uint64), writes: make(map[string]*writeTransaction),
-		attrs:       make(map[string]visibleState),
-		annexInodes: make(map[string]uint64),
-		hydrations:  make(map[string]*hydrationCall),
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-}
-
-func clean(name string) string {
-	name = filepath.ToSlash(filepath.Clean(filepath.FromSlash(name)))
-	if name == "." {
-		return ""
-	}
-	return norm.NFC.String(strings.TrimPrefix(name, "/"))
-}
-
-func hidden(name string) bool {
-	name = clean(name)
-	for _, component := range strings.Split(name, "/") {
-		if component == ".git" {
-			return true
-		}
-	}
-	return false
-}
-
-func (f *FileSystem) full(name string) string {
-	return filepath.Join(f.root, filepath.FromSlash(clean(name)))
-}
-
-func annexSymlink(path string) bool {
-	_, ok := annexLinkTarget(path)
-	return ok
-}
-
-func annexLinkTarget(path string) (string, bool) {
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink == 0 {
-		return "", false
-	}
-	target, err := os.Readlink(path)
-	if err != nil {
-		return "", false
-	}
-	normalized := filepath.ToSlash(target)
-	if !strings.Contains(normalized, "/.git/annex/objects/") && !strings.HasPrefix(normalized, ".git/annex/objects/") {
-		return "", false
-	}
-	return normalized, true
-}
-
-func (f *FileSystem) hydrate(name string) error {
-	path := clean(name)
-	key := "path:" + path
-	if target, annexed := annexLinkTarget(f.full(path)); annexed {
-		// Different names can reference the same annex object. Finder and Quick
-		// Look commonly open several related files concurrently for previews;
-		// one transfer should satisfy every waiter for that object.
-		targetPath := filepath.FromSlash(target)
-		if !filepath.IsAbs(targetPath) {
-			targetPath = filepath.Join(filepath.Dir(f.full(path)), targetPath)
-		}
-		key = "annex:" + filepath.Clean(targetPath)
-	}
-	f.hydrationsMu.Lock()
-	if active := f.hydrations[key]; active != nil {
-		f.hydrationsMu.Unlock()
-		select {
-		case <-active.done:
-			return active.err
-		case <-f.lifetime.Done():
-			return f.lifetime.Err()
-		}
-	}
-	active := &hydrationCall{done: make(chan struct{})}
-	f.hydrations[key] = active
-	f.hydrationsMu.Unlock()
-
-	active.err = f.hydrateOnce(path)
-	f.hydrationsMu.Lock()
-	delete(f.hydrations, key)
-	close(active.done)
-	f.hydrationsMu.Unlock()
-	return active.err
-}
-
-func (f *FileSystem) hydrateOnce(path string) error {
-	started := time.Now()
-	f.logger.Info("content hydration started", "path", path)
-	// Interactive reads take priority over outbound and maintenance syncs. The
-	// repository lock protects git-annex, while BeginWrite asks the scheduler to
-	// release that lock before Fetch waits for it.
-	if f.notifier != nil {
-		f.notifier.BeginWrite()
-		defer f.notifier.EndWrite()
-	}
-	ctx, cancel := stdcontext.WithTimeout(f.lifetime, 24*time.Hour)
-	defer cancel()
-	err := f.repo.Fetch(ctx, path, "")
-	if err != nil {
-		f.logger.Error("content hydration failed", "path", path, "duration", time.Since(started), "error", err)
-		return err
-	}
-	f.logger.Info("content hydration completed", "path", path, "duration", time.Since(started))
-	return nil
-}
-
-func (f *FileSystem) changed(reason string, attrs ...any) {
-	f.sizesMu.Lock()
-	clear(f.sizes)
-	f.sizesMu.Unlock()
-	f.logger.Info("filesystem changed", append([]any{"operation", reason}, attrs...)...)
-	if f.notifier != nil {
-		f.notifier.Notify(reason)
-	}
+	return &FileSystem{FileSystem: pathfs.NewDefaultFileSystem(), core: api, lifetime: ctx,
+		notifier: notifier, logger: logger, writes: make(map[string]*writeSession)}
 }
 
 func status(err error) fuse.Status {
@@ -214,214 +97,278 @@ func status(err error) fuse.Status {
 	if errors.As(err, &errno) {
 		return fuse.ToStatus(errno)
 	}
-	switch {
-	case errors.Is(err, stdcontext.DeadlineExceeded):
+	var coreError *core.Error
+	if errors.As(err, &coreError) {
+		switch coreError.Code {
+		case core.CodeCanceled:
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fuse.ToStatus(syscall.ETIMEDOUT)
+			}
+			return fuse.EINTR
+		case core.CodeNotFound:
+			return fuse.ENOENT
+		case core.CodeAlreadyExists:
+			return fuse.ToStatus(syscall.EEXIST)
+		case core.CodePermission:
+			return fuse.EACCES
+		case core.CodeInvalid:
+			return fuse.EINVAL
+		case core.CodeConflict:
+			return fuse.EBUSY
+		case core.CodeNoSpace:
+			return fuse.ToStatus(syscall.ENOSPC)
+		case core.CodeNotSupported:
+			return fuse.ENOSYS
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return fuse.ToStatus(syscall.ETIMEDOUT)
-	case errors.Is(err, stdcontext.Canceled):
+	}
+	if errors.Is(err, context.Canceled) {
 		return fuse.EINTR
-	case errors.Is(err, os.ErrNotExist):
-		return fuse.ENOENT
-	case errors.Is(err, os.ErrPermission):
-		return fuse.EACCES
-	default:
-		// go-fuse maps an arbitrary Go error to ENOSYS, which incorrectly tells
-		// applications that DFS does not implement ordinary reads. Command and
-		// transport failures are I/O errors instead.
-		return fuse.EIO
+	}
+	return fuse.EIO
+}
+
+func (f *FileSystem) changed(reason string, attributes ...any) {
+	f.logger.Info("filesystem changed", append([]any{"operation", reason}, attributes...)...)
+	if f.notifier != nil {
+		f.notifier.Notify(reason)
 	}
 }
 
-func (f *FileSystem) mutateWorkTree(operation func() fuse.Status) fuse.Status {
+func (f *FileSystem) withMutation(operation func() error) fuse.Status {
 	if f.notifier != nil {
 		f.notifier.BeginWrite()
 		defer f.notifier.EndWrite()
 	}
-	code := fuse.EIO
-	if err := f.repo.WithWorkTreeLock(func() error {
-		code = operation()
-		return nil
-	}); err != nil {
-		return status(err)
-	}
-	return code
+	return status(operation())
 }
 
-func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
-	if hidden(name) {
+func fuseAttr(attributes core.Attributes) *fuse.Attr {
+	return &fuse.Attr{Mode: attributes.Mode, Owner: fuse.Owner{Uid: attributes.UID, Gid: attributes.GID},
+		Size: uint64(max(attributes.Size, 0)), Ino: attributes.Inode, Blocks: uint64(max(attributes.Blocks, 0)),
+		Atime: uint64(attributes.Accessed.Unix()), Atimensec: uint32(attributes.Accessed.Nanosecond()),
+		Mtime: uint64(attributes.Modified.Unix()), Mtimensec: uint32(attributes.Modified.Nanosecond()),
+		Ctime: uint64(attributes.Changed.Unix()), Ctimensec: uint32(attributes.Changed.Nanosecond())}
+}
+
+func dirMode(kind core.Kind, mode uint32) uint32 {
+	if mode != 0 {
+		return mode
+	}
+	switch kind {
+	case core.KindDirectory:
+		return syscall.S_IFDIR
+	case core.KindSymlink:
+		return syscall.S_IFLNK
+	default:
+		return syscall.S_IFREG
+	}
+}
+
+func (f *FileSystem) session(path string) *writeSession {
+	f.writesMu.Lock()
+	defer f.writesMu.Unlock()
+	return f.writes[path]
+}
+
+func (f *FileSystem) GetAttr(name string, _ *fuse.Context) (*fuse.Attr, fuse.Status) {
+	if hiddenPath(name) {
 		return nil, fuse.ENOENT
 	}
-	path := clean(name)
-	if attr, ok := f.stagedAttr(path); ok {
-		return attr, fuse.OK
-	}
-	attr, code := f.FileSystem.GetAttr(path, context)
-	if code != fuse.OK {
-		return attr, code
-	}
-	annexTarget, locked := annexLinkTarget(f.full(name))
-	if locked {
-		// Loopback GetAttr describes the git-annex symlink here. Symlink modes
-		// differ by platform (typically 0777 on Linux and 0755 on macOS), so
-		// carrying those bits into a regular-file attribute makes every file
-		// appear executable and may make it appear world-writable. Use the annex
-		// object's permissions and add owner-write for the writable DFS view.
-		attr.Mode = syscall.S_IFREG | 0o644
-		if info, err := os.Stat(f.full(name)); err == nil {
-			attr.Mode = syscall.S_IFREG | uint32(info.Mode().Perm()|0o200)
-			attr.Size = uint64(info.Size())
-			// Loopback GetAttr uses lstat, but Open follows the annex link and
-			// returns a descriptor for its object. Report that object's inode so
-			// stat(path) and fstat(a freshly opened path) agree. Name-following
-			// readers use this equality to accept the replacement descriptor.
-			if targetAttr := attrFromInfo(info); targetAttr != nil {
-				attr.Ino = targetAttr.Ino
-			}
-		} else if size, ok := annexSizeFromTarget(annexTarget); ok {
-			attr.Size = size
-		} else {
-			f.sizesMu.Lock()
-			size, ok := f.sizes[path]
-			f.sizesMu.Unlock()
-			if !ok {
-				ctx, cancel := stdcontext.WithTimeout(f.lifetime, 30*time.Second)
-				value, sizeErr := f.repo.AnnexFileSize(ctx, path)
-				cancel()
-				if sizeErr == nil {
-					size = uint64(value)
-					f.sizesMu.Lock()
-					f.sizes[path] = size
-					f.sizesMu.Unlock()
-				}
-			}
-			attr.Size = size
-		}
-		attr.Blocks = (attr.Size + 511) / 512
-	}
-	f.applyVisibleAttr(path, attr, locked)
-	if locked {
-		f.applyStableAnnexInode(path, attr)
-	}
-	return attr, code
-}
-
-func annexSizeFromTarget(target string) (uint64, bool) {
-	key := filepath.Base(filepath.FromSlash(target))
-	start := strings.Index(key, "-s")
-	if start < 0 {
-		return 0, false
-	}
-	rest := key[start+2:]
-	end := strings.Index(rest, "--")
-	if end <= 0 {
-		return 0, false
-	}
-	size, err := strconv.ParseUint(rest[:end], 10, 64)
-	return size, err == nil
-}
-
-func (f *FileSystem) applyStableAnnexInode(path string, attr *fuse.Attr) {
-	if attr.Ino == 0 {
-		return
-	}
-	f.annexInodesMu.Lock()
-	defer f.annexInodesMu.Unlock()
-	inode := f.annexInodes[path]
-	if inode == 0 {
-		inode = attr.Ino
-		f.annexInodes[path] = inode
-	}
-	attr.Ino = inode
-}
-
-func (f *FileSystem) Open(name string, flags uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
-	if hidden(name) {
-		return nil, fuse.ENOENT
-	}
-	path := clean(name)
-	writable := flags&syscall.O_ACCMODE != syscall.O_RDONLY
-	if writable {
-		file, err := f.openStaged(path, flags, 0, false)
-		return file, status(err)
-	}
-	if staged, ok, err := f.openStagedRead(path); ok {
-		if err != nil {
-			return nil, status(err)
-		}
-		f.repo.Touch(path)
-		return &trackedFile{File: staged, filesystem: f, path: path}, fuse.OK
-	}
-	file, annexTarget, err := f.openBackingRead(path, flags)
+	path, err := logicalPath(name)
 	if err != nil {
 		return nil, status(err)
 	}
-	f.repo.Touch(path)
-	f.logger.Debug("file opened", "path", path, "writable", false, "flags", flags)
-	tracked := &trackedFile{
-		File: file, filesystem: f, path: path, annexTarget: annexTarget, openFlags: flags,
+	if session := f.session(path); session != nil {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		if !session.removed {
+			return fuseAttr(session.attributes), fuse.OK
+		}
 	}
-	if annexTarget != "" {
-		// Git-annex publishes a new version by replacing the symlink in the
-		// worktree. Stable FUSE inode identities can otherwise retain pages from
-		// the previous target, so every fresh annex open must bypass that cache.
-		return &nodefs.WithFlags{File: tracked, FuseFlags: fuse.FOPEN_DIRECT_IO}, fuse.OK
+	entry, err := f.core.Lookup(f.lifetime, path)
+	if err != nil {
+		return nil, status(err)
 	}
-	return tracked, fuse.OK
+	return fuseAttr(entry.Attributes), fuse.OK
 }
 
-// openBackingRead pins one worktree version to an open file descriptor. Git
-// and git-annex publish path changes with atomic renames, so an opened
-// descriptor remains valid without holding the repository lock across
-// read-only opens. A broken annex link is hydrated and then opened again.
-func (f *FileSystem) openBackingRead(path string, flags uint32) (nodefs.File, string, error) {
-	// Match go-fuse's loopback behavior: the kernel translates append writes to
-	// explicit offsets before they reach a file handle.
-	flags &^= syscall.O_APPEND
-	for attempt := 0; attempt < 2; attempt++ {
-		var (
-			handle      *os.File
-			annexTarget string
-			needsFetch  bool
-		)
-		fullPath := f.full(path)
-		var annexed bool
-		annexTarget, annexed = annexLinkTarget(fullPath)
-		err := error(nil)
-		handle, err = os.OpenFile(fullPath, int(flags), 0)
-		if err != nil && annexed && errors.Is(err, os.ErrNotExist) {
-			needsFetch = true
-			err = nil
+func logicalPath(name string) (string, error) {
+	name = filepath.ToSlash(filepath.Clean(filepath.FromSlash(name)))
+	if name == "." {
+		return "", nil
+	}
+	name = filepath.ToSlash(name)
+	if filepath.IsAbs(filepath.FromSlash(name)) {
+		name = name[1:]
+	}
+	return name, nil
+}
+
+func hiddenPath(name string) bool {
+	name = strings.Trim(filepath.ToSlash(name), "/")
+	for name != "" {
+		component := name
+		if index := strings.IndexByte(name, '/'); index >= 0 {
+			component, name = name[:index], name[index+1:]
+		} else {
+			name = ""
 		}
-		if err != nil {
-			return nil, annexTarget, err
+		if component == ".git" {
+			return true
 		}
-		if !needsFetch {
-			return nodefs.NewLoopbackFile(handle), annexTarget, nil
+	}
+	return false
+}
+
+func (f *FileSystem) OpenDir(name string, _ *fuse.Context) ([]fuse.DirEntry, fuse.Status) {
+	if hiddenPath(name) {
+		return nil, fuse.ENOENT
+	}
+	path, err := logicalPath(name)
+	if err != nil {
+		return nil, status(err)
+	}
+	page, err := f.core.ReadDirectory(f.lifetime, path, core.PageRequest{})
+	if err != nil {
+		return nil, status(err)
+	}
+	f.writesMu.Lock()
+	if len(f.writes) == 0 {
+		f.writesMu.Unlock()
+		result := make([]fuse.DirEntry, len(page.Entries))
+		for index, entry := range page.Entries {
+			result[index] = fuse.DirEntry{Name: entry.Name, Mode: dirMode(entry.Kind, entry.Mode), Ino: entry.Inode}
 		}
-		if size, ok := annexSizeFromTarget(annexTarget); ok && f.repo.CanStreamRanges() {
-			ctx, cancel := stdcontext.WithCancel(f.lifetime)
-			attr, code := f.GetAttr(path, nil)
-			if code != fuse.OK {
-				cancel()
-				return nil, annexTarget, fmt.Errorf("inspect annex range file: %s", code)
+		return result, fuse.OK
+	}
+	byName := make(map[string]fuse.DirEntry, len(page.Entries))
+	for _, entry := range page.Entries {
+		byName[entry.Name] = fuse.DirEntry{Name: entry.Name, Mode: dirMode(entry.Kind, entry.Mode), Ino: entry.Inode}
+	}
+	for candidate, session := range f.writes {
+		if filepath.ToSlash(filepath.Dir(candidate)) != emptyAsDot(path) {
+			continue
+		}
+		session.mu.Lock()
+		if !session.removed {
+			name := filepath.Base(candidate)
+			byName[name] = fuse.DirEntry{Name: name, Mode: dirMode(session.attributes.Kind, session.attributes.Mode), Ino: session.attributes.Inode}
+		}
+		session.mu.Unlock()
+	}
+	f.writesMu.Unlock()
+	result := make([]fuse.DirEntry, 0, len(byName))
+	for _, entry := range byName {
+		result = append(result, entry)
+	}
+	sortDirEntries(result)
+	return result, fuse.OK
+}
+
+func emptyAsDot(path string) string {
+	if path == "" {
+		return "."
+	}
+	return path
+}
+
+func sortDirEntries(entries []fuse.DirEntry) {
+	for i := 1; i < len(entries); i++ {
+		for j := i; j > 0 && entries[j].Name < entries[j-1].Name; j-- {
+			entries[j], entries[j-1] = entries[j-1], entries[j]
+		}
+	}
+}
+
+func (f *FileSystem) Open(name string, flags uint32, _ *fuse.Context) (nodefs.File, fuse.Status) {
+	if hiddenPath(name) {
+		return nil, fuse.ENOENT
+	}
+	path, err := logicalPath(name)
+	if err != nil {
+		return nil, status(err)
+	}
+	writable := flags&syscall.O_ACCMODE != syscall.O_RDONLY
+	if writable || f.session(path) != nil {
+		return f.openWrite(path, flags, false)
+	}
+	handle, err := f.core.OpenRead(f.lifetime, path)
+	if err != nil {
+		return nil, status(err)
+	}
+	file := &readFile{File: nodefs.NewDefaultFile(), handle: handle, filesystem: f, path: path}
+	if handle.DirectIO() {
+		return &nodefs.WithFlags{File: &versionedReadFile{readFile: file}, FuseFlags: fuse.FOPEN_DIRECT_IO}, fuse.OK
+	}
+	return file, fuse.OK
+}
+
+func (f *FileSystem) Create(name string, flags, mode uint32, _ *fuse.Context) (nodefs.File, fuse.Status) {
+	path, err := logicalPath(name)
+	if err != nil {
+		return nil, status(err)
+	}
+	file, code := f.openWrite(path, flags, true, mode)
+	if code == fuse.OK {
+		f.logger.Info("file created", "path", path)
+	}
+	return file, code
+}
+
+func (f *FileSystem) openWrite(path string, flags uint32, create bool, modes ...uint32) (nodefs.File, fuse.Status) {
+	f.writesMu.Lock()
+	if session := f.writes[path]; session != nil {
+		session.mu.Lock()
+		session.refs++
+		writable := flags&syscall.O_ACCMODE != syscall.O_RDONLY
+		if writable && flags&syscall.O_TRUNC != 0 {
+			size := int64(0)
+			err := session.transaction.Truncate(0)
+			if err == nil {
+				session.attributes.Size = size
+				session.dirty = true
 			}
-			return &rangeFile{File: nodefs.NewDefaultFile(), filesystem: f, path: path,
-				key: filepath.Base(filepath.FromSlash(annexTarget)), size: int64(size), ctx: ctx, cancel: cancel, attr: *attr}, annexTarget, nil
+			session.mu.Unlock()
+			f.writesMu.Unlock()
+			return &adapterFile{File: nodefs.NewDefaultFile(), filesystem: f, session: session, writable: writable}, status(err)
 		}
-		if err := f.hydrate(path); err != nil {
-			return nil, annexTarget, err
+		session.mu.Unlock()
+		f.writesMu.Unlock()
+		return &adapterFile{File: nodefs.NewDefaultFile(), filesystem: f, session: session, writable: writable}, fuse.OK
+	}
+	mode := uint32(0o644)
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
+	request := core.WriteRequest{Path: path, Mode: mode, Create: create, Exclusive: create && flags&syscall.O_EXCL != 0, Truncate: flags&syscall.O_TRUNC != 0}
+	transaction, err := f.core.BeginWrite(f.lifetime, request)
+	if err != nil {
+		f.writesMu.Unlock()
+		return nil, status(err)
+	}
+	attributes := core.Attributes{Kind: core.KindFile, Mode: syscall.S_IFREG | mode&0o7777, Modified: time.Now(), Changed: time.Now(), Accessed: time.Now()}
+	if !create {
+		if entry, lookupErr := f.core.Lookup(f.lifetime, path); lookupErr == nil {
+			attributes = entry.Attributes
 		}
 	}
-	return nil, "", os.ErrNotExist
+	if request.Truncate {
+		attributes.Size = 0
+	}
+	session := &writeSession{transaction: transaction, path: path, attributes: attributes, refs: 1, dirty: create || request.Truncate, created: create}
+	f.writes[path] = session
+	f.writesMu.Unlock()
+	if f.notifier != nil {
+		f.notifier.BeginWrite()
+	}
+	return &adapterFile{File: nodefs.NewDefaultFile(), filesystem: f, session: session, writable: true}, fuse.OK
 }
 
-func (r *rangeFile) Read(destination []byte, offset int64) (fuse.ReadResult, fuse.Status) {
-	r.mu.Lock()
-	if r.released {
-		r.mu.Unlock()
-		return nil, fuse.EBADF
-	}
-	r.mu.Unlock()
-	n, err := r.filesystem.repo.ReadRange(r.ctx, r.path, r.key, r.size, offset, destination)
+func (r *readFile) Read(destination []byte, offset int64) (fuse.ReadResult, fuse.Status) {
+	n, err := r.handle.ReadAt(destination, offset)
 	if errors.Is(err, io.EOF) {
 		err = nil
 	}
@@ -431,469 +378,577 @@ func (r *rangeFile) Read(destination []byte, offset int64) (fuse.ReadResult, fus
 	return fuse.ReadResultData(destination[:n]), fuse.OK
 }
 
-func (r *rangeFile) GetAttr(out *fuse.Attr) fuse.Status {
-	*out = r.attr
+func (r *readFile) GetAttr(out *fuse.Attr) fuse.Status {
+	attributes := core.Attributes{Kind: core.KindFile, Mode: syscall.S_IFREG | 0o644, Size: r.handle.Size()}
+	if entry, err := r.filesystem.core.Lookup(r.filesystem.lifetime, r.path); err == nil {
+		attributes = entry.Attributes
+	} else if !core.IsErrorCode(err, core.CodeNotFound) {
+		return status(err)
+	}
+	attributes.Size = r.handle.Size()
+	*out = *fuseAttr(attributes)
 	return fuse.OK
 }
-
-func (r *rangeFile) Release() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.released {
-		r.released = true
-		r.cancel()
+func (r *readFile) Release() {
+	if r.closed.CompareAndSwap(false, true) {
+		_ = r.handle.Close()
 	}
 }
 
-func (f *FileSystem) Create(name string, flags uint32, mode uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
-	if hidden(name) {
-		return nil, fuse.EACCES
+func (r *versionedReadFile) Read(destination []byte, offset int64) (fuse.ReadResult, fuse.Status) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.readFile.Read(destination, offset)
+}
+
+func (r *versionedReadFile) GetAttr(out *fuse.Attr) fuse.Status {
+	version, err := r.filesystem.core.ContentVersion(r.filesystem.lifetime, r.path)
+	if err != nil && !core.IsErrorCode(err, core.CodeNotFound) {
+		return status(err)
 	}
-	path := clean(name)
-	file, err := f.openStaged(path, flags, os.FileMode(mode), true)
+	changed := false
+	r.mu.Lock()
+	if err == nil && version != r.handle.Version() {
+		replacement, openErr := r.filesystem.core.OpenRead(r.filesystem.lifetime, r.path)
+		if openErr != nil {
+			r.mu.Unlock()
+			return status(openErr)
+		}
+		previous := r.handle
+		r.handle = replacement
+		_ = previous.Close()
+		changed = true
+	}
+	r.mu.Unlock()
+	if changed && r.filesystem.cacheInvalidator != nil {
+		r.filesystem.cacheInvalidator.InvalidateContent(r.path)
+	}
+	return r.readFile.GetAttr(out)
+}
+
+func (r *versionedReadFile) Release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readFile.Release()
+}
+
+func fuseToCoreLock(lock *fuse.FileLock) core.FileLock {
+	kind := core.LockUnlocked
+	switch lock.Typ {
+	case syscall.F_RDLCK:
+		kind = core.LockRead
+	case syscall.F_WRLCK:
+		kind = core.LockWrite
+	}
+	return core.FileLock{Start: lock.Start, End: lock.End, Kind: kind, PID: lock.Pid}
+}
+
+func coreToFuseLock(lock core.FileLock, output *fuse.FileLock) {
+	typeValue := uint32(syscall.F_UNLCK)
+	if lock.Kind == core.LockRead {
+		typeValue = syscall.F_RDLCK
+	} else if lock.Kind == core.LockWrite {
+		typeValue = syscall.F_WRLCK
+	}
+	*output = fuse.FileLock{Start: lock.Start, End: lock.End, Typ: typeValue, Pid: lock.PID}
+}
+
+func getFileLock(api core.API, ctx context.Context, path string, owner uint64, lock, output *fuse.FileLock) fuse.Status {
+	result, err := api.GetLock(ctx, path, owner, fuseToCoreLock(lock))
+	if err == nil {
+		coreToFuseLock(result, output)
+	}
+	return status(err)
+}
+
+func setFileLock(api core.API, ctx context.Context, path string, owner uint64, lock *fuse.FileLock, wait bool) fuse.Status {
+	err := api.SetLock(ctx, path, owner, fuseToCoreLock(lock), wait)
+	if core.IsErrorCode(err, core.CodeConflict) {
+		return fuse.ToStatus(syscall.EAGAIN)
+	}
+	return status(err)
+}
+
+func (r *readFile) GetLk(owner uint64, lock *fuse.FileLock, _ uint32, output *fuse.FileLock) fuse.Status {
+	return getFileLock(r.filesystem.core, r.filesystem.lifetime, r.path, owner, lock, output)
+}
+
+func (r *readFile) SetLk(owner uint64, lock *fuse.FileLock, _ uint32) fuse.Status {
+	return setFileLock(r.filesystem.core, r.filesystem.lifetime, r.path, owner, lock, false)
+}
+
+func (r *readFile) SetLkw(owner uint64, lock *fuse.FileLock, _ uint32) fuse.Status {
+	return setFileLock(r.filesystem.core, r.filesystem.lifetime, r.path, owner, lock, true)
+}
+
+func (a *adapterFile) Read(destination []byte, offset int64) (fuse.ReadResult, fuse.Status) {
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	n, err := a.session.transaction.ReadAt(destination, offset)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
 	if err != nil {
 		return nil, status(err)
 	}
-	f.logger.Info("file created", "path", path)
-	return file, fuse.OK
+	return fuse.ReadResultData(destination[:n]), fuse.OK
 }
 
-func (t *trackedFile) Read(dest []byte, off int64) (fuse.ReadResult, fuse.Status) {
-	t.mu.Lock()
-	if _, streaming := t.File.(*rangeFile); streaming {
-		file := t.File
-		t.mu.Unlock()
-		return file.Read(dest, off)
+func (a *adapterFile) GetLk(owner uint64, lock *fuse.FileLock, _ uint32, output *fuse.FileLock) fuse.Status {
+	return getFileLock(a.filesystem.core, a.filesystem.lifetime, a.session.path, owner, lock, output)
+}
+
+func (a *adapterFile) SetLk(owner uint64, lock *fuse.FileLock, _ uint32) fuse.Status {
+	return setFileLock(a.filesystem.core, a.filesystem.lifetime, a.session.path, owner, lock, false)
+}
+
+func (a *adapterFile) SetLkw(owner uint64, lock *fuse.FileLock, _ uint32) fuse.Status {
+	return setFileLock(a.filesystem.core, a.filesystem.lifetime, a.session.path, owner, lock, true)
+}
+
+func (a *adapterFile) Write(data []byte, offset int64) (uint32, fuse.Status) {
+	if !a.writable {
+		return 0, fuse.EBADF
 	}
-	defer t.mu.Unlock()
-	return t.File.Read(dest, off)
-}
-
-func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
-	refreshed := false
-	if t.annexTarget != "" {
-		var code fuse.Status
-		refreshed, code = t.refreshAnnexTarget()
-		if code != fuse.OK {
-			return code
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	n, err := a.session.transaction.WriteAt(data, offset)
+	if n > 0 {
+		a.session.dirty = true
+		if end := offset + int64(n); end > a.session.attributes.Size {
+			a.session.attributes.Size = end
+			a.session.attributes.Blocks = (end + 511) / 512
 		}
+		a.session.attributes.Modified, a.session.attributes.Changed = time.Now(), time.Now()
 	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	code := t.File.GetAttr(out)
-	if code != fuse.OK {
-		return code
+	if err != nil && a.session.failure == nil {
+		a.session.failure = err
 	}
-	if attr, ok := t.filesystem.stagedAttr(t.path); ok {
-		if attr.Ino != 0 {
-			out.Ino = attr.Ino
-		}
-		return fuse.OK
-	}
-	if t.annexTarget != "" {
-		// A cached git-annex object is deliberately read-only. Do not leak that
-		// private storage mode through fstat: applications such as Dolphin cache
-		// open-handle attributes and otherwise treat the user-visible file as
-		// undeletable when peer-local visible metadata has not been recorded yet.
-		out.Mode = syscall.S_IFREG | out.Mode&0o777 | 0o200
-	}
-	// FileSystem.GetAttr presents the inode and metadata captured when a write
-	// was published. Apply the same view to open handles: git-annex may replace
-	// the worktree file with a symlink to an object, but that internal
-	// representation change must not make fstat disagree with stat.
-	t.filesystem.applyVisibleAttr(t.path, out, annexSymlink(t.filesystem.full(t.path)))
-	t.filesystem.applyStableAnnexInode(t.path, out)
-	if refreshed && t.filesystem.cacheInvalidator != nil {
-		t.filesystem.cacheInvalidator.InvalidateContent(t.path)
-	}
-	return code
+	return uint32(n), status(err)
 }
 
-func (t *trackedFile) refreshAnnexTarget() (bool, fuse.Status) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (a *adapterFile) Truncate(size uint64) fuse.Status {
+	value := int64(size)
+	return a.changeAttributes(core.AttributeChanges{Size: &value})
+}
 
-	current, _ := annexLinkTarget(t.filesystem.full(t.path))
-	if current == "" || current == t.annexTarget {
-		return false, fuse.OK
+func (a *adapterFile) Chmod(mode uint32) fuse.Status {
+	return a.changeAttributes(core.AttributeChanges{Mode: &mode})
+}
+
+func (a *adapterFile) Chown(uid, gid uint32) fuse.Status {
+	changes := core.AttributeChanges{}
+	if uid != ^uint32(0) {
+		changes.UID = &uid
 	}
+	if gid != ^uint32(0) {
+		changes.GID = &gid
+	}
+	return a.changeAttributes(changes)
+}
 
-	replacement, target, err := t.filesystem.openBackingRead(t.path, t.openFlags)
+func (a *adapterFile) Utimens(accessed, modified *time.Time) fuse.Status {
+	return a.changeAttributes(core.AttributeChanges{Accessed: accessed, Modified: modified})
+}
+
+func (a *adapterFile) changeAttributes(changes core.AttributeChanges) fuse.Status {
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	err := a.session.transaction.SetAttributes(changes)
+	if err == nil {
+		a.session.dirty = true
+		applyAttributeChanges(&a.session.attributes, changes)
+	} else if a.session.failure == nil {
+		a.session.failure = err
+	}
+	return status(err)
+}
+
+func applyAttributeChanges(attributes *core.Attributes, changes core.AttributeChanges) {
+	if changes.Mode != nil {
+		attributes.Mode = attributes.Mode&syscall.S_IFMT | *changes.Mode&0o7777
+	}
+	if changes.UID != nil {
+		attributes.UID = *changes.UID
+	}
+	if changes.GID != nil {
+		attributes.GID = *changes.GID
+	}
+	if changes.Size != nil {
+		attributes.Size = *changes.Size
+		attributes.Blocks = (*changes.Size + 511) / 512
+	}
+	if changes.Accessed != nil {
+		attributes.Accessed = *changes.Accessed
+	}
+	if changes.Modified != nil {
+		attributes.Modified = *changes.Modified
+	}
+	attributes.Changed = time.Now()
+}
+
+func (a *adapterFile) Allocate(offset, size uint64, mode uint32) fuse.Status {
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	err := a.session.transaction.Allocate(int64(offset), int64(size), mode)
+	if err == nil {
+		a.session.dirty = true
+		if end := int64(offset + size); end > a.session.attributes.Size {
+			a.session.attributes.Size, a.session.attributes.Blocks = end, (end+511)/512
+		}
+	} else if a.session.failure == nil {
+		a.session.failure = err
+	}
+	return status(err)
+}
+
+func (a *adapterFile) GetAttr(out *fuse.Attr) fuse.Status {
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	*out = *fuseAttr(a.session.attributes)
+	return fuse.OK
+}
+
+func (a *adapterFile) Flush() fuse.Status {
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	return status(a.session.failure)
+}
+
+func (a *adapterFile) Fsync(int) fuse.Status {
+	a.session.mu.Lock()
+	defer a.session.mu.Unlock()
+	if a.session.failure != nil || !a.session.dirty {
+		return status(a.session.failure)
+	}
+	if err := a.session.transaction.Commit(a.filesystem.lifetime); err != nil {
+		a.session.failure = err
+		return status(err)
+	}
+	a.filesystem.changed("fsync", "path", a.session.path)
+	replacement, err := a.filesystem.core.BeginWrite(a.filesystem.lifetime, core.WriteRequest{Path: a.session.path})
 	if err != nil {
-		return false, status(err)
+		a.session.failure = err
+		return status(err)
 	}
-	if target == t.annexTarget {
-		replacement.Release()
-		return false, fuse.OK
-	}
-	previous := t.File
-	t.File = replacement
-	t.annexTarget = target
-	previous.Release()
-	return true, fuse.OK
+	a.session.transaction = replacement
+	a.session.created, a.session.dirty = false, false
+	return fuse.OK
 }
 
-func (t *trackedFile) Release() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.File.Release()
+func (a *adapterFile) Release() { a.release.Do(func() { a.filesystem.releaseWrite(a.session) }) }
+
+func (f *FileSystem) releaseWrite(session *writeSession) {
+	f.writesMu.Lock()
+	session.mu.Lock()
+	session.refs--
+	final := session.refs == 0
+	if !final {
+		session.mu.Unlock()
+		f.writesMu.Unlock()
+		return
+	}
+	var err error
+	if session.removed || session.failure != nil || !session.dirty {
+		err = session.transaction.Abort(context.Background())
+	} else {
+		commitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = session.transaction.Commit(commitCtx)
+		cancel()
+	}
+	path, changed := session.path, err == nil && session.dirty && !session.removed
+	if f.writes[session.path] == session {
+		delete(f.writes, session.path)
+	}
+	session.mu.Unlock()
+	f.writesMu.Unlock()
+	if f.notifier != nil {
+		f.notifier.EndWrite()
+	}
+	if err != nil {
+		f.logger.Error("write transaction failed", "path", path, "error", err)
+	} else if changed {
+		f.logger.Info("write transaction committed", "path", path)
+		f.changed("completed write", "path", path)
+	}
 }
 
-func (f *FileSystem) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntry, fuse.Status) {
-	if hidden(name) {
-		return nil, fuse.ENOENT
-	}
-	entries, code := f.FileSystem.OpenDir(clean(name), context)
-	if code != fuse.OK {
-		return nil, code
-	}
-	result := entries[:0]
-	for _, entry := range entries {
-		if entry.Name != ".git" {
-			entry.Name = norm.NFC.String(entry.Name)
-			result = append(result, entry)
-		}
-	}
-	return result, fuse.OK
-}
-
-func (f *FileSystem) Truncate(name string, size uint64, context *fuse.Context) fuse.Status {
-	file, err := f.openStaged(clean(name), syscall.O_WRONLY, 0, false)
+func (f *FileSystem) Truncate(name string, size uint64, _ *fuse.Context) fuse.Status {
+	path, err := logicalPath(name)
 	if err != nil {
 		return status(err)
 	}
-	code := file.Truncate(size)
-	if code == fuse.OK {
-		code = file.Flush()
+	if session := f.session(path); session != nil {
+		session.mu.Lock()
+		value := int64(size)
+		err = session.transaction.SetAttributes(core.AttributeChanges{Size: &value})
+		if err == nil {
+			session.dirty = true
+			applyAttributeChanges(&session.attributes, core.AttributeChanges{Size: &value})
+		}
+		session.mu.Unlock()
+		return status(err)
 	}
-	file.Release()
+	return f.withMutation(func() error {
+		transaction, err := f.core.BeginWrite(f.lifetime, core.WriteRequest{Path: path})
+		if err != nil {
+			return err
+		}
+		if err = transaction.Truncate(int64(size)); err != nil {
+			_ = transaction.Abort(context.Background())
+			return err
+		}
+		if err = transaction.Commit(f.lifetime); err == nil {
+			f.changed("truncate", "path", path)
+		}
+		return err
+	})
+}
+
+func (f *FileSystem) Mkdir(name string, mode uint32, _ *fuse.Context) fuse.Status {
+	path, err := logicalPath(name)
+	if err != nil {
+		return status(err)
+	}
+	code := f.withMutation(func() error { return f.core.MakeDirectory(f.lifetime, path, mode, "") })
+	if code == fuse.OK {
+		f.changed("mkdir", "path", path)
+	}
 	return code
 }
 
-func (f *FileSystem) Mkdir(name string, mode uint32, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
+func (f *FileSystem) Mknod(name string, mode, device uint32, _ *fuse.Context) fuse.Status {
+	path, err := logicalPath(name)
+	if err != nil {
+		return status(err)
 	}
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Mkdir(clean(name), mode, context) })
+	code := f.withMutation(func() error { return f.core.MakeNode(f.lifetime, path, mode, device, "") })
 	if code == fuse.OK {
-		f.changed("mkdir", "path", clean(name))
+		f.changed("mknod", "path", path)
 	}
 	return code
 }
 
-func (f *FileSystem) Mknod(name string, mode uint32, dev uint32, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
+func (f *FileSystem) Rename(oldName, newName string, _ *fuse.Context) fuse.Status {
+	oldPath, err := logicalPath(oldName)
+	if err != nil {
+		return status(err)
 	}
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Mknod(clean(name), mode, dev, context) })
-	if code == fuse.OK {
-		f.changed("mknod", "path", clean(name))
+	newPath, err := logicalPath(newName)
+	if err != nil {
+		return status(err)
 	}
-	return code
-}
-
-func (f *FileSystem) Rename(oldName, newName string, context *fuse.Context) fuse.Status {
-	if hidden(oldName) || hidden(newName) {
-		return fuse.EACCES
-	}
-	oldPath, newPath := clean(oldName), clean(newName)
 	if oldPath == newPath {
 		return fuse.OK
 	}
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Rename(oldPath, newPath, context) })
-	if code == fuse.OK {
-		if err := f.renameWrite(oldPath, newPath); err != nil {
-			return status(err)
-		}
-		if f.repo.Store != nil {
-			if err := f.repo.Store.RenameFileState(oldPath, newPath); err != nil {
-				return status(err)
+	code := f.withMutation(func() error {
+		f.writesMu.Lock()
+		defer f.writesMu.Unlock()
+		var moved []*writeSession
+		for path, session := range f.writes {
+			if path == oldPath || stringsHasPathPrefix(path, oldPath) {
+				moved = append(moved, session)
 			}
 		}
-		f.renameVisible(oldPath, newPath)
+		for _, session := range moved {
+			target := newPath + session.path[len(oldPath):]
+			if existing := f.writes[target]; existing != nil && existing != session {
+				return syscall.EBUSY
+			}
+		}
+		renameErr := f.core.Rename(f.lifetime, oldPath, newPath, "")
+		if renameErr != nil && !(core.IsErrorCode(renameErr, core.CodeNotFound) && len(moved) > 0) {
+			return renameErr
+		}
+		for _, session := range moved {
+			session.mu.Lock()
+			oldSessionPath := session.path
+			newSessionPath := newPath + oldSessionPath[len(oldPath):]
+			if err := session.transaction.Rename(newSessionPath); err != nil {
+				session.mu.Unlock()
+				return err
+			}
+			delete(f.writes, oldSessionPath)
+			session.path = newSessionPath
+			f.writes[newSessionPath] = session
+			session.mu.Unlock()
+		}
+		return nil
+	})
+	if code == fuse.OK {
 		f.changed("rename", "old_path", oldPath, "new_path", newPath)
 	}
 	return code
 }
 
-func (f *FileSystem) Rmdir(name string, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
+func stringsHasPathPrefix(path, prefix string) bool {
+	return len(path) > len(prefix) && path[:len(prefix)] == prefix && path[len(prefix)] == '/'
+}
+
+func (f *FileSystem) remove(name string, directory bool) fuse.Status {
+	path, err := logicalPath(name)
+	if err != nil {
+		return status(err)
 	}
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Rmdir(clean(name), context) })
-	if code == fuse.OK {
-		if f.repo.Store != nil {
-			if err := f.repo.Store.RemoveFileState(clean(name)); err != nil {
-				return status(err)
+	code := f.withMutation(func() error {
+		f.writesMu.Lock()
+		defer f.writesMu.Unlock()
+		if directory {
+			for candidate := range f.writes {
+				if stringsHasPathPrefix(candidate, path) {
+					return syscall.ENOTEMPTY
+				}
 			}
 		}
-		f.removeVisible(clean(name))
-		f.changed("rmdir", "path", clean(name))
-	}
-	return code
-}
-
-func (f *FileSystem) Unlink(name string, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
-	}
-	path := clean(name)
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Unlink(path, context) })
-	if code == fuse.OK {
-		f.unlinkWrite(path)
-		if f.repo.Store != nil {
-			if err := f.repo.Store.RemoveFileState(path); err != nil {
-				return status(err)
+		if session := f.writes[path]; session != nil {
+			session.mu.Lock()
+			session.removed = true
+			session.mu.Unlock()
+			delete(f.writes, path)
+			err := f.core.Remove(f.lifetime, path, directory, "")
+			if core.IsErrorCode(err, core.CodeNotFound) && session.created {
+				return nil
 			}
+			return err
 		}
-		f.removeVisible(path)
-		f.changed("unlink", "path", path)
-	}
-	return code
-}
-
-func (f *FileSystem) Link(oldName, newName string, context *fuse.Context) fuse.Status {
-	if hidden(oldName) || hidden(newName) {
-		return fuse.EACCES
-	}
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Link(clean(oldName), clean(newName), context) })
+		return f.core.Remove(f.lifetime, path, directory, "")
+	})
 	if code == fuse.OK {
-		f.changed("link", "old_path", clean(oldName), "new_path", clean(newName))
+		f.changed("remove", "path", path)
 	}
 	return code
 }
 
-func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse.Status {
-	if hidden(linkName) {
-		return fuse.EACCES
+func (f *FileSystem) Unlink(name string, _ *fuse.Context) fuse.Status { return f.remove(name, false) }
+func (f *FileSystem) Rmdir(name string, _ *fuse.Context) fuse.Status  { return f.remove(name, true) }
+
+func (f *FileSystem) Link(oldName, newName string, _ *fuse.Context) fuse.Status {
+	oldPath, err := logicalPath(oldName)
+	if err != nil {
+		return status(err)
 	}
-	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Symlink(value, clean(linkName), context) })
+	newPath, err := logicalPath(newName)
+	if err != nil {
+		return status(err)
+	}
+	code := f.withMutation(func() error { return f.core.Link(f.lifetime, oldPath, newPath, "") })
 	if code == fuse.OK {
-		f.changed("symlink", "path", clean(linkName))
+		f.changed("link", "old_path", oldPath, "new_path", newPath)
 	}
 	return code
 }
 
-func (f *FileSystem) Chmod(name string, mode uint32, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
+func (f *FileSystem) Symlink(value, linkName string, _ *fuse.Context) fuse.Status {
+	path, err := logicalPath(linkName)
+	if err != nil {
+		return status(err)
 	}
-	path := clean(name)
-	if transaction := f.writeAt(path); transaction != nil {
-		if err := os.Chmod(transaction.stagingPath, os.FileMode(mode)); err != nil {
-			return status(err)
-		}
-		f.markDirty(transaction)
-		return status(f.captureVisible(path))
-	}
-	if annexSymlink(f.full(path)) {
-		attr, code := f.GetAttr(path, context)
-		if code != fuse.OK {
-			return code
-		}
-		attr.Mode = attr.Mode&syscall.S_IFMT | mode&0o7777
-		attr.Ctime, attr.Ctimensec = splitTime(time.Now())
-		if err := f.saveVisible(path, attr, f.visibleSignature(path)); err != nil {
-			return status(err)
-		}
-		f.changed("chmod", "path", path, "mode", mode)
-		return fuse.OK
-	}
-	code := f.FileSystem.Chmod(path, mode, context)
+	code := f.withMutation(func() error { return f.core.Symlink(f.lifetime, value, path, "") })
 	if code == fuse.OK {
-		if err := f.captureVisible(path); err != nil {
-			return status(err)
-		}
-		f.changed("chmod", "path", path, "mode", mode)
+		f.changed("symlink", "path", path)
 	}
 	return code
 }
 
-func (f *FileSystem) Chown(name string, uid, gid uint32, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
+func (f *FileSystem) Readlink(name string, _ *fuse.Context) (string, fuse.Status) {
+	path, err := logicalPath(name)
+	if err != nil {
+		return "", status(err)
 	}
-	path := clean(name)
-	if transaction := f.writeAt(path); transaction != nil {
-		if err := os.Chown(transaction.stagingPath, chownID(uid), chownID(gid)); err != nil {
-			return status(err)
-		}
-		f.markDirty(transaction)
-		return status(f.captureVisible(path))
+	value, err := f.core.ReadLink(f.lifetime, path)
+	return value, status(err)
+}
+
+func (f *FileSystem) setAttributes(name string, changes core.AttributeChanges, reason string) fuse.Status {
+	path, err := logicalPath(name)
+	if err != nil {
+		return status(err)
 	}
-	if annexSymlink(f.full(path)) {
-		attr, code := f.GetAttr(path, context)
-		if code != fuse.OK {
-			return code
+	if session := f.session(path); session != nil {
+		session.mu.Lock()
+		err = session.transaction.SetAttributes(changes)
+		if err == nil {
+			session.dirty = true
+			applyAttributeChanges(&session.attributes, changes)
 		}
-		if uid != ^uint32(0) {
-			attr.Uid = uid
-		}
-		if gid != ^uint32(0) {
-			attr.Gid = gid
-		}
-		attr.Ctime, attr.Ctimensec = splitTime(time.Now())
-		if err := f.saveVisible(path, attr, f.visibleSignature(path)); err != nil {
-			return status(err)
-		}
-		f.changed("chown", "path", path, "uid", uid, "gid", gid)
-		return fuse.OK
+		session.mu.Unlock()
+		return status(err)
 	}
-	code := f.FileSystem.Chown(path, uid, gid, context)
+	code := f.withMutation(func() error { _, err := f.core.SetAttributes(f.lifetime, path, changes, ""); return err })
 	if code == fuse.OK {
-		if err := f.captureVisible(path); err != nil {
-			return status(err)
-		}
-		f.changed("chown", "path", path, "uid", uid, "gid", gid)
+		f.changed(reason, "path", path)
 	}
 	return code
 }
 
-func (f *FileSystem) Utimens(name string, atime, mtime *time.Time, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
-	}
-	path := clean(name)
-	if transaction := f.writeAt(path); transaction != nil {
-		if err := setStagedTimes(transaction.stagingPath, atime, mtime); err != nil {
-			return status(err)
-		}
-		f.markDirty(transaction)
-		return status(f.captureVisible(path))
-	}
-	if annexSymlink(f.full(path)) {
-		attr, code := f.GetAttr(path, context)
-		if code != fuse.OK {
-			return code
-		}
-		if atime != nil {
-			attr.Atime, attr.Atimensec = splitTime(*atime)
-		}
-		if mtime != nil {
-			attr.Mtime, attr.Mtimensec = splitTime(*mtime)
-		}
-		attr.Ctime, attr.Ctimensec = splitTime(time.Now())
-		if err := f.saveVisible(path, attr, f.visibleSignature(path)); err != nil {
-			return status(err)
-		}
-		f.changed("utimens", "path", path)
-		return fuse.OK
-	}
-	code := f.FileSystem.Utimens(path, atime, mtime, context)
-	if code == fuse.OK {
-		if err := f.captureVisible(path); err != nil {
-			return status(err)
-		}
-		f.changed("utimens", "path", path)
-	}
-	return code
+func (f *FileSystem) Chmod(name string, mode uint32, _ *fuse.Context) fuse.Status {
+	return f.setAttributes(name, core.AttributeChanges{Mode: &mode}, "chmod")
 }
 
-func (f *FileSystem) GetXAttr(name, attr string, context *fuse.Context) ([]byte, fuse.Status) {
-	if hidden(name) {
+func (f *FileSystem) Chown(name string, uid, gid uint32, _ *fuse.Context) fuse.Status {
+	changes := core.AttributeChanges{}
+	if uid != ^uint32(0) {
+		changes.UID = &uid
+	}
+	if gid != ^uint32(0) {
+		changes.GID = &gid
+	}
+	return f.setAttributes(name, changes, "chown")
+}
+
+func (f *FileSystem) Utimens(name string, accessed, modified *time.Time, _ *fuse.Context) fuse.Status {
+	return f.setAttributes(name, core.AttributeChanges{Accessed: accessed, Modified: modified}, "utimens")
+}
+
+func (f *FileSystem) GetXAttr(name, attribute string, _ *fuse.Context) ([]byte, fuse.Status) {
+	if hiddenPath(name) {
 		return nil, fuse.ENOENT
 	}
-	if _, code := f.GetAttr(clean(name), context); code != fuse.OK {
-		return nil, code
+	path, err := logicalPath(name)
+	if err != nil {
+		return nil, status(err)
 	}
-	if f.repo.Store == nil {
-		return nil, fuse.ENOSYS
-	}
-	value, err := f.repo.Store.XAttr(clean(name), attr)
-	if errors.Is(err, store.ErrXAttrNotFound) {
+	value, err := f.core.GetXattr(f.lifetime, path, attribute)
+	if core.IsErrorCode(err, core.CodeNotFound) {
 		return nil, fuse.ENOATTR
 	}
 	return value, status(err)
 }
 
-func (f *FileSystem) SetXAttr(name, attr string, data []byte, flags int, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
-	}
-	path := clean(name)
-	if _, code := f.GetAttr(path, context); code != fuse.OK {
-		return code
-	}
-	if f.repo.Store == nil {
-		return fuse.ENOSYS
-	}
-	err := f.repo.Store.SetXAttr(path, attr, append([]byte(nil), data...), flags)
-	switch {
-	case errors.Is(err, store.ErrXAttrExists):
-		return status(syscall.EEXIST)
-	case errors.Is(err, store.ErrXAttrNotFound):
-		return fuse.ENOATTR
-	case err != nil:
-		return status(err)
-	}
-	f.changed("setxattr", "path", path, "attribute", attr)
-	return fuse.OK
-}
-
-func (f *FileSystem) ListXAttr(name string, context *fuse.Context) ([]string, fuse.Status) {
-	if hidden(name) {
+func (f *FileSystem) ListXAttr(name string, _ *fuse.Context) ([]string, fuse.Status) {
+	if hiddenPath(name) {
 		return nil, fuse.ENOENT
 	}
-	if _, code := f.GetAttr(clean(name), context); code != fuse.OK {
-		return nil, code
+	path, err := logicalPath(name)
+	if err != nil {
+		return nil, status(err)
 	}
-	if f.repo.Store == nil {
-		return nil, fuse.ENOSYS
-	}
-	names, err := f.repo.Store.ListXAttrs(clean(name))
+	names, err := f.core.ListXattrs(f.lifetime, path)
 	return names, status(err)
 }
 
-func (f *FileSystem) RemoveXAttr(name, attr string, context *fuse.Context) fuse.Status {
-	if hidden(name) {
-		return fuse.EACCES
-	}
-	path := clean(name)
-	if _, code := f.GetAttr(path, context); code != fuse.OK {
-		return code
-	}
-	if f.repo.Store == nil {
-		return fuse.ENOSYS
-	}
-	err := f.repo.Store.RemoveXAttr(path, attr)
-	if errors.Is(err, store.ErrXAttrNotFound) {
-		return fuse.ENOATTR
-	}
+func (f *FileSystem) SetXAttr(name, attribute string, data []byte, flags int, _ *fuse.Context) fuse.Status {
+	path, err := logicalPath(name)
 	if err != nil {
 		return status(err)
 	}
-	f.changed("removexattr", "path", path, "attribute", attr)
-	return fuse.OK
-}
-
-func splitTime(value time.Time) (uint64, uint32) {
-	return uint64(value.Unix()), uint32(value.Nanosecond())
-}
-
-func chownID(value uint32) int {
-	if value == ^uint32(0) {
-		return -1
+	code := f.withMutation(func() error {
+		return f.core.SetXattr(f.lifetime, path, attribute, append([]byte(nil), data...), core.XattrFlags(flags), "")
+	})
+	if code == fuse.OK {
+		f.changed("setxattr", "path", path)
 	}
-	return int(value)
+	return code
 }
 
-func setStagedTimes(path string, atime, mtime *time.Time) error {
-	info, err := os.Stat(path)
+func (f *FileSystem) RemoveXAttr(name, attribute string, _ *fuse.Context) fuse.Status {
+	path, err := logicalPath(name)
 	if err != nil {
-		return err
+		return status(err)
 	}
-	attr := attrFromInfo(info)
-	if attr == nil {
-		return fmt.Errorf("read staged timestamps for %s", path)
+	code := f.withMutation(func() error { return f.core.RemoveXattr(f.lifetime, path, attribute, "") })
+	if code == fuse.OK {
+		f.changed("removexattr", "path", path)
 	}
-	access := time.Unix(int64(attr.Atime), int64(attr.Atimensec))
-	modified := time.Unix(int64(attr.Mtime), int64(attr.Mtimensec))
-	if atime != nil {
-		access = *atime
-	}
-	if mtime != nil {
-		modified = *mtime
-	}
-	return os.Chtimes(path, access, modified)
+	return code
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	dfsapi "github.com/bitbeamer/dfs/internal/core"
 	dfscore "github.com/bitbeamer/dfs/internal/daemon"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/repository"
@@ -190,7 +191,9 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 			t.Fatalf("mtime after annex sync = %v, want %v", info.ModTime(), stamp)
 		}
 		relative := strings.TrimPrefix(path, mountpoint+string(os.PathSeparator))
-		fresh := dfsmount.NewFileSystem(repo, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		api := dfsapi.New(repo, dfsapi.Options{})
+		defer api.Close()
+		fresh := dfsmount.NewFileSystem(api, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		attr, code := fresh.GetAttr(relative, nil)
 		if !code.Ok() {
 			t.Fatalf("fresh filesystem getattr: %v", code)

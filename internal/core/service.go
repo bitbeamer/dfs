@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/store"
 	"golang.org/x/text/unicode/norm"
@@ -20,6 +21,7 @@ import (
 
 type Options struct {
 	EventRetention int
+	ManagedContent bool
 }
 
 type operationResult struct {
@@ -37,14 +39,30 @@ type Service struct {
 	operations        sync.Map
 	operationMu       sync.Mutex
 	pendingOperations map[string]string
+	metadataMu        sync.RWMutex
+	metadata          map[string]metadataCacheEntry
+	stateMu           sync.Mutex
+	stateLoaded       bool
+	statePaths        map[string]bool
+	locks             *lockTable
+}
+
+type metadataCacheEntry struct {
+	value store.FileMetadata
+	found bool
 }
 
 func New(repo *repository.Repository, options Options) *Service {
-	return &Service{repo: repo, root: repo.Config.Repository, events: newEventLog(options.EventRetention), pendingOperations: make(map[string]string)}
+	if options.ManagedContent {
+		repo.SetManagedFetcher(managed.FetchPath)
+		repo.SetManagedRangeFetcher(managed.FetchRange)
+	}
+	return &Service{repo: repo, root: repo.Config.Repository, events: newEventLog(options.EventRetention), pendingOperations: make(map[string]string), metadata: make(map[string]metadataCacheEntry), statePaths: make(map[string]bool), locks: newLockTable()}
 }
 
 func (s *Service) Close() error {
 	s.events.close()
+	s.locks.close()
 	return nil
 }
 
@@ -89,31 +107,31 @@ func (s *Service) Lookup(ctx context.Context, path string) (Entry, error) {
 }
 
 func (s *Service) attributes(full, logical string) (Attributes, error) {
-	info, err := os.Stat(full)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	annexTarget, annexed, linkInfo, err := inspectAnnexLink(full)
+	if err != nil {
 		return Attributes{}, err
 	}
-	annexTarget, annexed := annexLinkTarget(full)
-	if err != nil && !annexed {
-		return Attributes{}, err
-	}
-	if annexed && err != nil {
-		info, err = os.Lstat(full)
+	info := linkInfo
+	if linkInfo.Mode()&os.ModeSymlink == 0 || annexed {
+		info, err = os.Stat(full)
 		if err != nil {
-			return Attributes{}, err
+			if !annexed || !errors.Is(err, os.ErrNotExist) {
+				return Attributes{}, err
+			}
+			info = linkInfo
 		}
 	}
 	attributes := attributesFromInfo(info)
 	if annexed {
 		attributes.Kind = KindFile
-		attributes.Mode = attributes.Mode&^uint32(os.ModeType) | 0o644
+		attributes.Mode = attributes.Mode&^syscall.S_IFMT | syscall.S_IFREG | 0o644
 		if size, ok := annexSize(annexTarget); ok {
 			attributes.Size = size
 			attributes.Blocks = (size + 511) / 512
 		}
 	}
 	if s.repo.Store != nil {
-		if metadata, found, metadataErr := s.repo.Store.FileMetadata(logical); metadataErr != nil {
+		if metadata, found, metadataErr := s.fileMetadata(logical); metadataErr != nil {
 			return Attributes{}, metadataErr
 		} else if found {
 			attributes.Mode = attributes.Mode&^0o7777 | metadata.Mode&0o7777
@@ -124,6 +142,80 @@ func (s *Service) attributes(full, logical string) (Attributes, error) {
 		}
 	}
 	return attributes, nil
+}
+
+func (s *Service) fileMetadata(path string) (store.FileMetadata, bool, error) {
+	s.metadataMu.RLock()
+	cached, ok := s.metadata[path]
+	s.metadataMu.RUnlock()
+	if ok {
+		return cached.value, cached.found, nil
+	}
+	value, found, err := s.repo.Store.FileMetadata(path)
+	if err == nil {
+		s.metadataMu.Lock()
+		s.metadata[path] = metadataCacheEntry{value: value, found: found}
+		s.metadataMu.Unlock()
+	}
+	return value, found, err
+}
+
+func (s *Service) clearMetadataCache() {
+	s.metadataMu.Lock()
+	clear(s.metadata)
+	s.metadataMu.Unlock()
+}
+
+func (s *Service) hasFileState(path string) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if !s.stateLoaded {
+		paths, err := s.repo.Store.FileStatePaths()
+		if err != nil {
+			return true
+		}
+		for _, candidate := range paths {
+			s.statePaths[candidate] = true
+		}
+		s.stateLoaded = true
+	}
+	for candidate := range s.statePaths {
+		if candidate == path || strings.HasPrefix(candidate, path+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) markFileState(path string) {
+	s.stateMu.Lock()
+	s.statePaths[path] = true
+	s.stateMu.Unlock()
+}
+
+func (s *Service) removeFileState(path string) {
+	s.stateMu.Lock()
+	for candidate := range s.statePaths {
+		if candidate == path || strings.HasPrefix(candidate, path+"/") {
+			delete(s.statePaths, candidate)
+		}
+	}
+	s.stateMu.Unlock()
+}
+
+func (s *Service) renameFileState(oldPath, newPath string) {
+	s.stateMu.Lock()
+	updates := make(map[string]bool)
+	for candidate := range s.statePaths {
+		if candidate == oldPath || strings.HasPrefix(candidate, oldPath+"/") {
+			delete(s.statePaths, candidate)
+			updates[newPath+strings.TrimPrefix(candidate, oldPath)] = true
+		}
+	}
+	for candidate := range updates {
+		s.statePaths[candidate] = true
+	}
+	s.stateMu.Unlock()
 }
 
 func attributesFromInfo(info os.FileInfo) Attributes {
@@ -161,7 +253,7 @@ func (s *Service) ReadDirectory(ctx context.Context, path string, request PageRe
 	if err != nil {
 		return EntryPage{}, classify("read directory", cleaned, err)
 	}
-	page := EntryPage{Entries: make([]Entry, 0, len(entries))}
+	page := EntryPage{Entries: make([]DirectoryEntry, 0, len(entries))}
 	for _, directoryEntry := range entries {
 		if directoryEntry.Name() == ".git" || directoryEntry.Name() <= request.After {
 			continue
@@ -169,11 +261,22 @@ func (s *Service) ReadDirectory(ctx context.Context, path string, request PageRe
 		if err := ctx.Err(); err != nil {
 			return EntryPage{}, classify("read directory", cleaned, err)
 		}
-		child := filepath.ToSlash(filepath.Join(cleaned, norm.NFC.String(directoryEntry.Name())))
-		entry, lookupErr := s.Lookup(ctx, child)
-		if lookupErr != nil {
-			return EntryPage{}, lookupErr
+		name := norm.NFC.String(directoryEntry.Name())
+		child := filepath.ToSlash(filepath.Join(cleaned, name))
+		kind := KindFile
+		mode := uint32(syscall.S_IFREG)
+		entryType := directoryEntry.Type()
+		switch {
+		case entryType.IsDir():
+			kind, mode = KindDirectory, syscall.S_IFDIR
+		case entryType&os.ModeSymlink != 0:
+			if _, annexed := annexLinkTarget(filepath.Join(full, directoryEntry.Name())); annexed {
+				kind, mode = KindFile, syscall.S_IFREG
+			} else {
+				kind, mode = KindSymlink, syscall.S_IFLNK
+			}
 		}
+		entry := DirectoryEntry{Name: name, Path: child, Kind: kind, Mode: mode}
 		page.Entries = append(page.Entries, entry)
 		if request.Limit > 0 && len(page.Entries) == request.Limit {
 			page.Next = entry.Name
@@ -222,21 +325,30 @@ func (s *Service) Rename(ctx context.Context, oldPath, newPath, operationID stri
 	if oldClean == newClean {
 		return nil
 	}
-	fingerprint := "rename\x00" + oldClean + "\x00" + newClean
-	return s.idempotent(operationID, fingerprint, func() error {
+	action := func() error {
 		if err := ctx.Err(); err != nil {
 			return classify("rename", oldClean, err)
 		}
 		err := s.repo.WithWorkTreeLock(func() error { return os.Rename(oldFull, newFull) })
-		if err == nil && s.repo.Store != nil {
+		state := s.repo.Store != nil && (s.hasFileState(oldClean) || s.hasFileState(newClean))
+		if err == nil && state {
 			err = s.repo.Store.RenameFileState(oldClean, newClean)
 		}
 		if err != nil {
 			return classify("rename", oldClean, err)
 		}
+		s.clearMetadataCache()
+		if state {
+			s.renameFileState(oldClean, newClean)
+		}
 		s.events.publish("rename", operationID, oldClean, newClean)
 		return nil
-	})
+	}
+	if operationID == "" {
+		return action()
+	}
+	fingerprint := "rename\x00" + oldClean + "\x00" + newClean
+	return s.idempotent(operationID, fingerprint, action)
 }
 
 func (s *Service) Remove(ctx context.Context, path string, directory bool, operationID string) error {
@@ -244,18 +356,34 @@ func (s *Service) Remove(ctx context.Context, path string, directory bool, opera
 	if directory {
 		op = "remove directory"
 	}
-	return s.mutate(ctx, op, path, operationID, strconv.FormatBool(directory), func(full, cleaned string) error {
-		var err error
-		if directory {
-			err = os.Remove(full)
-		} else {
-			err = os.Remove(full)
-		}
-		if err == nil && s.repo.Store != nil {
-			err = s.repo.Store.RemoveFileState(cleaned)
-		}
+	cleaned, full, err := s.resolve(path)
+	if err != nil {
 		return err
-	})
+	}
+	action := func() error {
+		if err := ctx.Err(); err != nil {
+			return classify(op, cleaned, err)
+		}
+		if err := s.repo.WithWorkTreeLock(func() error { return os.Remove(full) }); err != nil {
+			return classify(op, cleaned, err)
+		}
+		state := s.repo.Store != nil && s.hasFileState(cleaned)
+		if state {
+			if err := s.repo.Store.RemoveFileState(cleaned); err != nil {
+				return classify(op, cleaned, err)
+			}
+		}
+		s.clearMetadataCache()
+		if state {
+			s.removeFileState(cleaned)
+		}
+		s.events.publish(op, operationID, cleaned)
+		return nil
+	}
+	if operationID == "" {
+		return action()
+	}
+	return s.idempotent(operationID, op+"\x00"+cleaned+"\x00"+strconv.FormatBool(directory), action)
 }
 
 func (s *Service) Link(ctx context.Context, oldPath, newPath, operationID string) error {
@@ -274,23 +402,28 @@ func (s *Service) Symlink(ctx context.Context, target, linkPath, operationID str
 	})
 }
 
-func (s *Service) mutate(ctx context.Context, kind, path, operationID, extra string, action func(string, string) error) error {
+func (s *Service) mutate(ctx context.Context, kind, path, operationID, extra string, operation func(string, string) error) error {
 	cleaned, full, err := s.resolve(path)
 	if err != nil {
 		return err
 	}
-	fingerprint := kind + "\x00" + cleaned + "\x00" + extra
-	return s.idempotent(operationID, fingerprint, func() error {
+	action := func() error {
 		if err := ctx.Err(); err != nil {
 			return classify(kind, cleaned, err)
 		}
-		err := s.repo.WithWorkTreeLock(func() error { return action(full, cleaned) })
+		err := s.repo.WithWorkTreeLock(func() error { return operation(full, cleaned) })
 		if err != nil {
 			return classify(kind, cleaned, err)
 		}
+		s.clearMetadataCache()
 		s.events.publish(kind, operationID, cleaned)
 		return nil
-	})
+	}
+	if operationID == "" {
+		return action()
+	}
+	fingerprint := kind + "\x00" + cleaned + "\x00" + extra
+	return s.idempotent(operationID, fingerprint, action)
 }
 
 func (s *Service) idempotent(operationID, fingerprint string, action func() error) error {
@@ -347,6 +480,9 @@ func (s *Service) SetXattr(ctx context.Context, path, name string, value []byte,
 		case errors.Is(err, store.ErrXAttrNotFound):
 			return &Error{Code: CodeNotFound, Op: "set xattr", Path: cleaned, Err: err}
 		default:
+			if err == nil {
+				s.markFileState(cleaned)
+			}
 			return err
 		}
 	})
@@ -425,7 +561,7 @@ func (s *Service) SetAttributes(ctx context.Context, path string, changes Attrib
 					return err
 				}
 			}
-			if annexed && s.repo.Store != nil {
+			if s.repo.Store != nil {
 				attributes, attrErr := s.attributes(full, cleaned)
 				if attrErr != nil {
 					return attrErr
@@ -445,8 +581,16 @@ func (s *Service) SetAttributes(ctx context.Context, path string, changes Attrib
 				if changes.Modified != nil {
 					attributes.Modified = *changes.Modified
 				}
-				return s.repo.Store.SaveFileMetadata(cleaned, store.FileMetadata{Mode: attributes.Mode, UID: attributes.UID, GID: attributes.GID,
-					AtimeNS: attributes.Accessed.UnixNano(), MtimeNS: attributes.Modified.UnixNano(), CtimeNS: time.Now().UnixNano()})
+				metadata := store.FileMetadata{Mode: attributes.Mode, UID: attributes.UID, GID: attributes.GID,
+					AtimeNS: attributes.Accessed.UnixNano(), MtimeNS: attributes.Modified.UnixNano(), CtimeNS: time.Now().UnixNano()}
+				if err := s.repo.Store.SaveFileMetadata(cleaned, metadata); err != nil {
+					return err
+				}
+				s.metadataMu.Lock()
+				s.metadata[cleaned] = metadataCacheEntry{value: metadata, found: true}
+				s.metadataMu.Unlock()
+				s.markFileState(cleaned)
+				return nil
 			}
 			return nil
 		})

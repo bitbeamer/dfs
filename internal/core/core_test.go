@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -105,6 +106,26 @@ func TestAPIContractThroughFrontend(t *testing.T) {
 	}
 	if _, err := service.Lookup(ctx, "Documents/renamed.txt"); !IsErrorCode(err, CodeNotFound) {
 		t.Fatalf("deleted lookup = %v", err)
+	}
+}
+
+func TestLookupPreservesUserSymlinkIdentity(t *testing.T) {
+	service, root := testService(t, 16)
+	if err := os.WriteFile(filepath.Join(root, "target.txt"), []byte("target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Symlink(context.Background(), "target.txt", "link", "symlink-1"); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := service.Lookup(context.Background(), "link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Attributes.Kind != KindSymlink || entry.Attributes.Mode&syscall.S_IFMT != syscall.S_IFLNK {
+		t.Fatalf("symlink attributes = %#v", entry.Attributes)
+	}
+	if target, err := service.ReadLink(context.Background(), "link"); err != nil || target != "target.txt" {
+		t.Fatalf("read link = %q, %v", target, err)
 	}
 }
 
@@ -237,6 +258,41 @@ func TestContextCancellationAndErrorTaxonomy(t *testing.T) {
 	}
 }
 
+func TestAdvisoryLockContractBlocksAndResumes(t *testing.T) {
+	service, _ := testService(t, 4)
+	ctx := context.Background()
+	requested := FileLock{Start: 0, End: ^uint64(0), Kind: LockWrite, PID: 10}
+	if err := service.SetLock(ctx, "locked.txt", 1, requested, false); err != nil {
+		t.Fatal(err)
+	}
+	if conflict, err := service.GetLock(ctx, "locked.txt", 2, requested); err != nil || conflict.Kind != LockWrite || conflict.PID != 10 {
+		t.Fatalf("conflicting lock = %#v, %v", conflict, err)
+	}
+	if err := service.SetLock(ctx, "locked.txt", 2, requested, false); !IsErrorCode(err, CodeConflict) {
+		t.Fatalf("nonblocking conflict = %v", err)
+	}
+	acquired := make(chan error, 1)
+	go func() { acquired <- service.SetLock(ctx, "locked.txt", 2, requested, true) }()
+	select {
+	case err := <-acquired:
+		t.Fatalf("blocking lock returned early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlocked := requested
+	unlocked.Kind = LockUnlocked
+	if err := service.SetLock(ctx, "locked.txt", 1, unlocked, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocking lock did not resume")
+	}
+}
+
 func TestLargeFilePartialIOAndMultiFilesystemIsolation(t *testing.T) {
 	first, _ := testService(t, 8)
 	second, _ := testService(t, 8)
@@ -308,6 +364,46 @@ func TestRemoteRangeReadIsCallerPacedAndCloseCancels(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("closing range handle did not cancel transfer")
+	}
+}
+
+func TestCachedAnnexReadUsesLocalDescriptorWithoutTransport(t *testing.T) {
+	service, root := testService(t, 8)
+	content := []byte("cached annex content")
+	key := fmt.Sprintf("SHA256E-s%d--%064d", len(content), 0)
+	object := filepath.Join(root, ".git", "annex", "objects", "AA", "BB", key, key)
+	if err := os.MkdirAll(filepath.Dir(object), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(object, content, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	target, err := filepath.Rel(root, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "cached.bin")); err != nil {
+		t.Fatal(err)
+	}
+	var transportCalls int
+	service.repo.SetManagedRangeFetcher(func(context.Context, *repository.Repository, string, int64, int64, io.Writer) (int64, error) {
+		transportCalls++
+		return 0, errors.New("transport must not be used")
+	})
+	handle, err := service.OpenRead(context.Background(), "cached.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if _, direct := handle.FileDescriptor(); !direct || !handle.DirectIO() {
+		t.Fatalf("cached annex provenance direct=%v directIO=%v", direct, handle.DirectIO())
+	}
+	buffer := make([]byte, len(content))
+	if n, err := handle.ReadAt(buffer, 0); err != nil || n != len(content) || !bytes.Equal(buffer, content) {
+		t.Fatalf("cached annex read = %q %d, %v", buffer, n, err)
+	}
+	if transportCalls != 0 {
+		t.Fatalf("cached annex used transport %d times", transportCalls)
 	}
 }
 

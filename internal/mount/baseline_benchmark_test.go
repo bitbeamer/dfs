@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/core"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/store"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -31,7 +32,9 @@ func benchmarkFileSystem(b *testing.B) (*FileSystem, string) {
 	b.Cleanup(func() { _ = state.Close() })
 	repo := &repository.Repository{Config: config.Default("benchmark", root), Store: state}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	filesystem := NewFileSystem(repo, nil, logger)
+	service := core.New(repo, core.Options{})
+	b.Cleanup(func() { _ = service.Close() })
+	filesystem := NewFileSystem(service, nil, logger)
 	return filesystem, root
 }
 

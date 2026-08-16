@@ -386,6 +386,17 @@ func (run *recoveryRun) recoverWrites() error {
 			}
 		}
 	}
+	// Core-API transactions use one private temporary file and an atomic rename;
+	// they need no destination manifest because an uncommitted file is never
+	// visible. Preserve abandoned payloads for inspection after a crashed mount.
+	for _, entry := range records {
+		if !strings.HasPrefix(entry.Name(), "write-") || strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if _, err := run.quarantine(filepath.Join(recordDirectory, entry.Name()), filepath.Join("writes", "core-"+entry.Name())); err != nil {
+			return err
+		}
+	}
 	stagingDirectory := filepath.Join(run.root, config.Directory, "staging")
 	staged, err := os.ReadDir(stagingDirectory)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {

@@ -40,6 +40,8 @@ type Namespace interface {
 	ListXattrs(context.Context, string) ([]string, error)
 	SetXattr(context.Context, string, string, []byte, XattrFlags, string) error
 	RemoveXattr(context.Context, string, string, string) error
+	GetLock(context.Context, string, uint64, FileLock) (FileLock, error)
+	SetLock(context.Context, string, uint64, FileLock, bool) error
 }
 
 type Content interface {
@@ -47,6 +49,7 @@ type Content interface {
 	// io.ReaderAt partial-read semantics and is caller-paced, providing natural
 	// backpressure. Closing it cancels an in-flight remote range request.
 	OpenRead(context.Context, string) (ReadHandle, error)
+	ContentVersion(context.Context, string) (string, error)
 	Evict(context.Context, string) error
 }
 
@@ -99,6 +102,14 @@ type Entry struct {
 	Attributes Attributes
 }
 
+type DirectoryEntry struct {
+	Name  string
+	Path  string
+	Kind  Kind
+	Mode  uint32
+	Inode uint64
+}
+
 type PageRequest struct {
 	// After is the last name returned by the preceding page. Empty starts at
 	// the beginning. Limit <= 0 requests all remaining entries.
@@ -107,7 +118,7 @@ type PageRequest struct {
 }
 
 type EntryPage struct {
-	Entries []Entry
+	Entries []DirectoryEntry
 	Next    string
 }
 
@@ -118,6 +129,10 @@ type ReadHandle interface {
 	// FileDescriptor exposes an optional direct local-content descriptor for
 	// zero-copy-capable in-process frontends. Callers do not own the descriptor.
 	FileDescriptor() (uintptr, bool)
+	// DirectIO requests that a mounted frontend bypass kernel page caching for
+	// content whose backing identity may change independently of its pathname.
+	DirectIO() bool
+	Version() string
 }
 
 type WriteRequest struct {
@@ -130,8 +145,12 @@ type WriteRequest struct {
 }
 
 type WriteTransaction interface {
+	io.ReaderAt
 	io.WriterAt
 	Truncate(int64) error
+	Allocate(int64, int64, uint32) error
+	SetAttributes(AttributeChanges) error
+	Rename(string) error
 	// Commit atomically publishes all successful writes. A retry with the same
 	// non-empty operation ID is idempotent. Commit after Abort is invalid.
 	Commit(context.Context) error
@@ -154,6 +173,21 @@ const (
 	XattrCreate XattrFlags = 1 << iota
 	XattrReplace
 )
+
+type LockKind uint8
+
+const (
+	LockUnlocked LockKind = iota
+	LockRead
+	LockWrite
+)
+
+type FileLock struct {
+	Start uint64
+	End   uint64
+	Kind  LockKind
+	PID   uint32
+}
 
 type PinScope string
 
