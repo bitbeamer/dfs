@@ -348,6 +348,48 @@ func TestGetAttrUsesAnnexObjectPermissions(t *testing.T) {
 	}
 }
 
+func TestTrackedAnnexGetAttrKeepsWritableMountedModeWithoutVisibleMetadata(t *testing.T) {
+	root := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	repo := &repository.Repository{Config: config.Default("test", root)}
+	filesystem := NewFileSystem(repo, nil, logger)
+
+	object := filepath.Join(root, ".git", "annex", "objects", "key", "content")
+	if err := os.MkdirAll(filepath.Dir(object), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(object, []byte("content"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(object, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	path := "synchronized.txt"
+	target, err := filepath.Rel(root, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, path)); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := os.Open(filepath.Join(root, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracked := &trackedFile{
+		File: nodefs.NewLoopbackFile(handle), filesystem: filesystem, path: path, annexTarget: target,
+	}
+	t.Cleanup(tracked.Release)
+
+	var attr fuse.Attr
+	if code := tracked.GetAttr(&attr); code != fuse.OK {
+		t.Fatalf("tracked GetAttr() = %v", code)
+	}
+	if got := attr.Mode & 0o777; got != 0o600 {
+		t.Fatalf("tracked GetAttr() permissions = %#o, want %#o", got, 0o600)
+	}
+}
+
 func TestOpenAnnexFileUsesDirectIO(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)

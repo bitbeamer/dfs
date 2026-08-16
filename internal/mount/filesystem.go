@@ -491,6 +491,13 @@ func (t *trackedFile) GetAttr(out *fuse.Attr) fuse.Status {
 		}
 		return fuse.OK
 	}
+	if t.annexTarget != "" {
+		// A cached git-annex object is deliberately read-only. Do not leak that
+		// private storage mode through fstat: applications such as Dolphin cache
+		// open-handle attributes and otherwise treat the user-visible file as
+		// undeletable when peer-local visible metadata has not been recorded yet.
+		out.Mode = syscall.S_IFREG | out.Mode&0o777 | 0o200
+	}
 	// FileSystem.GetAttr presents the inode and metadata captured when a write
 	// was published. Apply the same view to open handles: git-annex may replace
 	// the worktree file with a symlink to an object, but that internal

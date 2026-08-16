@@ -99,6 +99,32 @@ func TestMountedWriteIsAnnexed(t *testing.T) {
 			}
 		}
 	}()
+	synchronizedName := "synchronized-read-only-annex.txt"
+	synchronizedBacking := filepath.Join(repo.Config.Repository, synchronizedName)
+	if err := os.WriteFile(synchronizedBacking, []byte("peer content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, ctx, repo.Config.Repository, "annex", "add", "--", synchronizedName)
+	gitOutput(t, ctx, repo.Config.Repository, "commit", "-m", "Add synchronized annex fixture")
+	if _, found, err := repo.Store.FileMetadata(synchronizedName); err != nil || found {
+		t.Fatalf("synchronized fixture unexpectedly has visible metadata: found=%v err=%v", found, err)
+	}
+	synchronized, err := os.Open(filepath.Join(mountpoint, synchronizedName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	synchronizedInfo, err := synchronized.Stat()
+	if err != nil {
+		_ = synchronized.Close()
+		t.Fatal(err)
+	}
+	if got := synchronizedInfo.Mode().Perm(); got&0o200 == 0 {
+		_ = synchronized.Close()
+		t.Fatalf("open synchronized annex mode = %o, want owner-writable mounted view", got)
+	}
+	if err := synchronized.Close(); err != nil {
+		t.Fatal(err)
+	}
 	file, err := os.OpenFile(filepath.Join(mountpoint, "mounted.txt"), os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
