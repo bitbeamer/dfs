@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,7 +59,7 @@ func TestLoadMigratesLegacyStateIntoGitDirectory(t *testing.T) {
 	if loaded.Name != "legacy" {
 		t.Fatalf("loaded peer name = %q", loaded.Name)
 	}
-	if loaded.Version != 2 || loaded.PeerID == "" || loaded.NetworkName != filepath.Base(repository) {
+	if loaded.Version != 3 || loaded.PeerID == "" || loaded.Hostname == "" || loaded.NetworkName != filepath.Base(repository) {
 		t.Fatalf("migrated identity = version %d, peer %q, network %q", loaded.Version, loaded.PeerID, loaded.NetworkName)
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
@@ -87,7 +88,7 @@ func TestLoadUpgradesPeerIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Version != 2 || loaded.PeerID == "" || loaded.NetworkName != "family-files" {
+	if loaded.Version != 3 || loaded.PeerID == "" || loaded.Hostname == "" || loaded.NetworkName != "family-files" {
 		t.Fatalf("upgraded config = %#v", loaded)
 	}
 	reloaded, err := Load(repository)
@@ -96,5 +97,38 @@ func TestLoadUpgradesPeerIdentity(t *testing.T) {
 	}
 	if reloaded.PeerID != loaded.PeerID {
 		t.Fatalf("peer ID changed across loads: %q != %q", reloaded.PeerID, loaded.PeerID)
+	}
+}
+
+func TestLoadRejectsChangedHostname(t *testing.T) {
+	original := hostnameProvider
+	t.Cleanup(func() { hostnameProvider = original })
+	hostnameProvider = func() (string, error) { return "Iris.local", nil }
+	repository := t.TempDir()
+	cfg := Default("iris", repository)
+	if cfg.Hostname != "iris" {
+		t.Fatalf("canonical hostname = %q", cfg.Hostname)
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	hostnameProvider = func() (string, error) { return "Hera.local", nil }
+	_, err := Load(repository)
+	var mismatch *HostnameMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Load error = %v, want HostnameMismatchError", err)
+	}
+	if mismatch.Configured != "iris" || mismatch.Current != "hera" || mismatch.PeerID != cfg.PeerID {
+		t.Fatalf("hostname mismatch = %#v", mismatch)
+	}
+}
+
+func TestValidateHostnameTreatsLocalSuffixAsEquivalent(t *testing.T) {
+	original := hostnameProvider
+	t.Cleanup(func() { hostnameProvider = original })
+	hostnameProvider = func() (string, error) { return "ZEUS.local.", nil }
+	cfg := Config{Hostname: "zeus", PeerID: "peer"}
+	if err := ValidateHostname(cfg); err != nil {
+		t.Fatal(err)
 	}
 }

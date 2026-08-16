@@ -337,6 +337,9 @@ func (r *Repository) repairLegacyPrivateStateLocked(ctx context.Context) error {
 }
 
 func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
+	if err := config.ValidateHostname(r.Config); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, err := r.commitPendingLocked(ctx, "Synchronize local changes"); err != nil {

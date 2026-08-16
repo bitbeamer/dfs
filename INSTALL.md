@@ -205,6 +205,26 @@ pair. A missing account key or `known_hosts` entry is reported on the exact
 `FROM` → `TO` row as `PASSWORDLESS_SSH_FAILED`. Verify ordinary SSH separately
 with `ssh -o BatchMode=yes <peer>.local true` when repairing that status.
 
+### Hostname changes create a new peer
+
+DFS binds each peer identity to the machine hostname recorded during `init` or
+`network join`. Changing that hostname invalidates the pairing; DFS refuses to
+open or mount the repository and reports the old peer ID. It never silently
+transfers the old identity to the renamed machine. Re-add it as a new peer:
+
+1. Uninstall its managed mount with `scripts/install-macos.sh --uninstall` or
+   `scripts/install-cachyos.sh --uninstall`.
+2. On another mesh member, run
+   `dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<old-id>`.
+3. Move the renamed machine's old repository aside as a backup, create a new
+   invitation on an existing member, and run `network join` into the original
+   repository path. The join generates a new peer ID.
+4. Reinstall the managed mount and verify it with `doctor --mesh` and the
+   mounted-volume acceptance test.
+
+The `.local` DNS suffix and hostname letter case are normalized, so `zeus`,
+`ZEUS`, and `zeus.local` are the same hostname; an actual name change is not.
+
 ## Mounted-volume acceptance test
 
 After installing or updating DFS, run the same live-mount acceptance suite on

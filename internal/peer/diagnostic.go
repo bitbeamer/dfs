@@ -60,6 +60,9 @@ type MeshReport struct {
 // Diagnose probes all paired DFS remotes from this peer without changing any
 // refs or annex state.
 func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Duration) (DiagnosticReport, error) {
+	if err := config.ValidateHostname(repo.Config); err != nil {
+		return DiagnosticReport{}, err
+	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}

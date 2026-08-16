@@ -21,6 +21,7 @@ const (
 type Config struct {
 	Version      int           `json:"version"`
 	Name         string        `json:"name"`
+	Hostname     string        `json:"hostname"`
 	PeerID       string        `json:"peer_id"`
 	NetworkName  string        `json:"network_name"`
 	Repository   string        `json:"repository"`
@@ -30,15 +31,56 @@ type Config struct {
 }
 
 func Default(name, repository string) Config {
+	hostname, _ := hostnameProvider()
 	return Config{
-		Version:      2,
+		Version:      3,
 		Name:         name,
+		Hostname:     canonicalHostname(hostname),
 		PeerID:       randomID(),
 		NetworkName:  filepath.Base(filepath.Clean(repository)),
 		Repository:   repository,
 		CacheLimit:   100 * 1024 * 1024 * 1024,
 		SyncInterval: 30 * time.Second,
 	}
+}
+
+var hostnameProvider = os.Hostname
+
+type HostnameMismatchError struct {
+	Configured string
+	Current    string
+	PeerID     string
+}
+
+func (e *HostnameMismatchError) Error() string {
+	peer := e.PeerID
+	if len(peer) > 12 {
+		peer = peer[:12]
+	}
+	return fmt.Sprintf(
+		"DFS peer hostname changed from %q to %q; pairing %s is no longer valid; remove dfs-peer-%s from another mesh member and join this machine again as a new peer",
+		e.Configured, e.Current, peer, peer,
+	)
+}
+
+func canonicalHostname(value string) string {
+	value = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
+	return strings.TrimSuffix(value, ".local")
+}
+
+func ValidateHostname(cfg Config) error {
+	value, err := hostnameProvider()
+	if err != nil {
+		return fmt.Errorf("determine current hostname: %w", err)
+	}
+	current := canonicalHostname(value)
+	if current == "" {
+		return errors.New("determine current hostname: hostname is empty")
+	}
+	if cfg.Hostname != current {
+		return &HostnameMismatchError{Configured: cfg.Hostname, Current: current, PeerID: cfg.PeerID}
+	}
+	return nil
 }
 
 func Path(repository string) string {
@@ -63,8 +105,19 @@ func Load(repository string) (Config, error) {
 	}
 	cfg.Repository = repository
 	upgraded := false
-	if cfg.Version < 2 {
-		cfg.Version = 2
+	if cfg.Version < 3 {
+		cfg.Version = 3
+		upgraded = true
+	}
+	if cfg.Hostname == "" {
+		hostname, hostnameErr := hostnameProvider()
+		if hostnameErr != nil {
+			return Config{}, fmt.Errorf("determine hostname while upgrading DFS identity: %w", hostnameErr)
+		}
+		cfg.Hostname = canonicalHostname(hostname)
+		if cfg.Hostname == "" {
+			return Config{}, errors.New("determine hostname while upgrading DFS identity: hostname is empty")
+		}
 		upgraded = true
 	}
 	if cfg.PeerID == "" {
@@ -83,6 +136,9 @@ func Load(repository string) (Config, error) {
 		if err := Save(cfg); err != nil {
 			return Config{}, fmt.Errorf("upgrade DFS configuration: %w", err)
 		}
+	}
+	if err := ValidateHostname(cfg); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
 }
