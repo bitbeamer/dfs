@@ -317,6 +317,17 @@ func ServeSSH(repositoryPath string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
+	if service, ok, err := restrictedGitService(original, repositoryPath); err != nil {
+		return err
+	} else if ok {
+		gitService, err := executablePath(service, "/opt/homebrew/bin", "/usr/local/bin")
+		if err != nil {
+			return fmt.Errorf("locate %s: %w", service, err)
+		}
+		command := exec.CommandContext(ctx, gitService, repositoryPath)
+		command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return command.Run()
+	}
 	annexShell, err := executablePath("git-annex-shell", "/opt/homebrew/bin", "/usr/local/bin")
 	if err != nil {
 		return fmt.Errorf("locate git-annex-shell: %w", err)
@@ -327,6 +338,28 @@ func ServeSSH(repositoryPath string) error {
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	return command.Run()
+}
+
+func restrictedGitService(original, repositoryPath string) (string, bool, error) {
+	service, argument, found := strings.Cut(strings.TrimSpace(original), " ")
+	if !found || (service != "git-upload-pack" && service != "git-receive-pack" && service != "git-upload-archive") {
+		return "", false, nil
+	}
+	argument = strings.TrimSpace(argument)
+	if len(argument) >= 2 && argument[0] == '\'' && argument[len(argument)-1] == '\'' {
+		argument = strings.ReplaceAll(argument[1:len(argument)-1], `'\''`, `'`)
+	} else if strings.ContainsAny(argument, " \t\r\n;&|`$<>\\\"") {
+		return "", false, errors.New("invalid DFS Git service repository argument")
+	}
+	wanted, err := filepath.Abs(repositoryPath)
+	if err != nil {
+		return "", false, err
+	}
+	requested, err := filepath.Abs(argument)
+	if err != nil || requested != wanted {
+		return "", false, errors.New("DFS Git service requested a different repository")
+	}
+	return service, true, nil
 }
 
 func executablePath(name string, fallbackDirectories ...string) (string, error) {

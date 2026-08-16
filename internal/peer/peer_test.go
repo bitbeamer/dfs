@@ -337,7 +337,31 @@ func TestEnsureRepositoryTransportPreservesPinnedHostKeys(t *testing.T) {
 	}
 }
 
-func TestServeSSHDelegatesToRepositoryRestrictedAnnexShell(t *testing.T) {
+func TestServeSSHDispatchesRepositoryRestrictedGitService(t *testing.T) {
+	directory := t.TempDir()
+	capture := filepath.Join(directory, "capture")
+	script := filepath.Join(directory, "git-upload-pack")
+	contents := "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$CAPTURE_PATH\"\n"
+	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CAPTURE_PATH", capture)
+	repositoryPath := filepath.Join(directory, "repository")
+	t.Setenv("SSH_ORIGINAL_COMMAND", "git-upload-pack '"+repositoryPath+"'")
+	if err := ServeSSH(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != repositoryPath+"\n" {
+		t.Fatalf("Git service invocation:\n%s", data)
+	}
+}
+
+func TestServeSSHDelegatesAnnexCommand(t *testing.T) {
 	directory := t.TempDir()
 	capture := filepath.Join(directory, "capture")
 	script := filepath.Join(directory, "git-annex-shell")
@@ -347,7 +371,7 @@ func TestServeSSHDelegatesToRepositoryRestrictedAnnexShell(t *testing.T) {
 	}
 	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CAPTURE_PATH", capture)
-	t.Setenv("SSH_ORIGINAL_COMMAND", "git-upload-pack '/some/repository'")
+	t.Setenv("SSH_ORIGINAL_COMMAND", "git-annex-shell 'configlist'")
 	repositoryPath := filepath.Join(directory, "repository")
 	if err := ServeSSH(repositoryPath); err != nil {
 		t.Fatal(err)
@@ -356,8 +380,15 @@ func TestServeSSHDelegatesToRepositoryRestrictedAnnexShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "-c\ngit-upload-pack '/some/repository'\n"+repositoryPath+"\n" {
+	if string(data) != "-c\ngit-annex-shell 'configlist'\n"+repositoryPath+"\n" {
 		t.Fatalf("git-annex-shell invocation:\n%s", data)
+	}
+}
+
+func TestServeSSHRejectsGitServiceForDifferentRepository(t *testing.T) {
+	t.Setenv("SSH_ORIGINAL_COMMAND", "git-upload-pack '/another/repository'")
+	if err := ServeSSH(t.TempDir()); err == nil || !strings.Contains(err.Error(), "different repository") {
+		t.Fatalf("mismatched repository error = %v", err)
 	}
 }
 
