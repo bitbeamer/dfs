@@ -102,7 +102,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			go func() {
 				probeCtx, cancel := context.WithTimeout(ctx, timeout)
 				defer cancel()
-				fallbackResult <- repo.ProbeRemote(probeCtx, remote.Name)
+				fallbackResult <- repo.ProbeSSHFallback(probeCtx, remote.Name)
 			}()
 			go func() {
 				sshCtx, cancel := context.WithTimeout(ctx, timeout)

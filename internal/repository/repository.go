@@ -674,6 +674,19 @@ func (r *Repository) ProbeRemote(ctx context.Context, name string) error {
 	return err
 }
 
+func (r *Repository) ProbeSSHFallback(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("remote name is required")
+	}
+	fallback, err := r.PeerSSHFallback(ctx, name)
+	if err != nil {
+		return r.ProbeRemote(ctx, name)
+	}
+	_, err = r.runner.Run(ctx, "git", "-c", "remote."+name+".url="+fallback, "ls-remote", "--heads", name)
+	return err
+}
+
 func (r *Repository) remotesLocked(ctx context.Context) ([]Remote, error) {
 	out, err := r.runner.Run(ctx, "git", "remote", "-v")
 	if err != nil {
