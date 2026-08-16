@@ -96,7 +96,7 @@ if "$source_binary" --repo "$repository" health >/dev/null 2>&1; then
   printf 'Repository core is already running outside the managed service; stop it before installing.\n' >&2
   exit 1
 fi
-if [[ "$source_binary" != "$install_path" ]]; then
+if [[ ! -e "$install_path" ]] || ! [[ "$source_binary" -ef "$install_path" ]]; then
   install -m 0755 "$source_binary" "$install_path"
 fi
 
@@ -244,12 +244,19 @@ if [[ "$bootstrapped" != true ]]; then
 fi
 launchctl kickstart "$domain/$core_label"
 
+is_mounted() {
+  local mount_device parent_device
+  mount_device=$(stat -f '%d' "$mountpoint" 2>/dev/null) || return 1
+  parent_device=$(stat -f '%d' "$(dirname "$mountpoint")" 2>/dev/null) || return 1
+  [[ "$mount_device" != "$parent_device" ]]
+}
+
 for _ in $(seq 1 120); do
   if "$install_path" --repo "$repository" health >/dev/null 2>&1; then
     launchctl bootstrap "$domain" "$plist_path"
     launchctl kickstart "$domain/$label"
     for _ in $(seq 1 60); do
-      if mount | grep -Fq " on $mountpoint "; then
+      if is_mounted; then
         printf 'Installed %s and %s; mounted %s.\n' "$core_label" "$label" "$mountpoint"
         exit 0
       fi

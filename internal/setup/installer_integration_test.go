@@ -23,6 +23,7 @@ func TestInstallersCreateIndependentFilesystemInstances(t *testing.T) {
 	writeExecutable(t, filepath.Join(fakeBin, "launchctl"), "#!/bin/sh\n[ \"${1:-}\" = print ] && exit 1\nexit 0\n")
 	writeExecutable(t, filepath.Join(fakeBin, "mountpoint"), "#!/bin/sh\nexit 1\n")
 	writeExecutable(t, filepath.Join(fakeBin, "mount"), "#!/bin/sh\nprintf 'dfs on %s/mac-mount-0 (macfuse)\\ndfs on %s/mac-mount-1 (macfuse)\\n' \"$HOME\" \"$HOME\"\n")
+	writeExecutable(t, filepath.Join(fakeBin, "stat"), "#!/bin/sh\ncase \"$*\" in *mac-mount-*) echo 2;; *) echo 1;; esac\n")
 	for _, name := range []string{"codesign", "plutil", "git-annex", "fusermount3"} {
 		writeExecutable(t, filepath.Join(fakeBin, name), "#!/bin/sh\nexit 0\n")
 	}
@@ -44,6 +45,8 @@ func TestInstallersCreateIndependentFilesystemInstances(t *testing.T) {
 		runInstaller(t, environment, "../../scripts/install-cachyos.sh", "--pair-port", fmt.Sprint(7901+index), item.repository, mountpoint, sourceBinary)
 		coreUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-core-"+item.id[:12]+".service")
 		assertContains(t, coreUnit, "daemon --managed --pair-port "+fmt.Sprint(7901+index))
+		mountUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+item.id[:12]+".service")
+		assertNotContains(t, mountUnit, "Requires=dfs-core-")
 	}
 	firstUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+firstID[:12]+".service")
 	secondUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+secondID[:12]+".service")
@@ -120,5 +123,16 @@ func assertContains(t *testing.T, path, wanted string) {
 	}
 	if !strings.Contains(string(contents), wanted) {
 		t.Fatalf("%s does not contain %q\n%s", path, wanted, contents)
+	}
+}
+
+func assertNotContains(t *testing.T, path, unwanted string) {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(contents), unwanted) {
+		t.Fatalf("%s unexpectedly contains %q\n%s", path, unwanted, contents)
 	}
 }

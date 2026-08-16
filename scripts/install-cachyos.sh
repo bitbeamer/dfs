@@ -68,7 +68,11 @@ if [[ -f "$legacy_unit_path" ]] && grep -Fq -- "$repository" "$legacy_unit_path"
   systemctl --user daemon-reload
 fi
 if systemctl --user is-active --quiet "$unit_name" 2>/dev/null || systemctl --user is-active --quiet "$core_unit_name" 2>/dev/null; then
-  systemctl --user stop "$unit_name" "$core_unit_name"
+	for active_unit in "$unit_name" "$core_unit_name"; do
+		if systemctl --user is-active --quiet "$active_unit" 2>/dev/null; then
+			systemctl --user stop "$active_unit"
+		fi
+	done
   for _ in $(seq 1 30); do
     "$source_binary" --repo "$repository" health >/dev/null 2>&1 || break
     sleep 1
@@ -78,7 +82,7 @@ if mountpoint -q "$mountpoint"; then
   printf 'Mountpoint is already active outside the managed service; unmount it before installing.\n' >&2
   exit 1
 fi
-if [[ "$source_binary" != "$install_path" ]]; then
+if [[ ! -e "$install_path" ]] || ! [[ "$source_binary" -ef "$install_path" ]]; then
   install -m 0755 "$source_binary" "$install_path"
 fi
 
@@ -122,8 +126,6 @@ cat >"$unit_path" <<EOF
 [Unit]
 Description=DFS FUSE frontend
 Documentation=https://github.com/bitbeamer/dfs
-Requires=$core_unit_name
-After=$core_unit_name
 
 [Service]
 Type=simple
