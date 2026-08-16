@@ -145,7 +145,7 @@ export PATH
 directories to its own dependency search path, so diagnostics do not depend on
 interactive shell startup files.
 
-The existing peer and the new peer must be able to reach each other over SSH. On a default-drop firewall, allow UDP 5353, TCP 7843, and the SSH server port (normally TCP 22) from the trusted LAN.
+The existing peer and the new peer must be able to reach each other over managed QUIC and the SSH fallback. On a default-drop firewall, allow UDP 5353, both UDP and TCP 7843, and the SSH server port (normally TCP 22) from the trusted LAN.
 
 ## 2. Create a new filesystem (first peer only)
 
@@ -211,10 +211,11 @@ dfs --repo ~/.local/share/dfs/repository peer list
 dfs --repo ~/.local/share/dfs/repository doctor --mesh
 ```
 
-`doctor --mesh` verifies both the restricted SSH transport used internally by
-DFS and ordinary passwordless, non-interactive SSH for every directed peer
-pair. A missing account key or `known_hosts` entry is reported on the exact
-`FROM` → `TO` row as `PASSWORDLESS_SSH_FAILED`. Verify ordinary SSH separately
+`doctor --mesh` verifies managed QUIC, the repository-restricted SSH fallback,
+and ordinary passwordless, non-interactive SSH for every directed peer pair. A
+working fallback with unavailable QUIC is shown as `SSH_FALLBACK`; a missing
+account key or `known_hosts` entry is reported on the exact `FROM` → `TO` row as
+`PASSWORDLESS_SSH_FAILED`. Verify ordinary SSH separately
 with `ssh -o BatchMode=yes <peer>.local true` when repairing that status.
 
 ### Hostname changes create a new peer

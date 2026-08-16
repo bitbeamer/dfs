@@ -131,7 +131,7 @@ func TestSignedEndorsement(t *testing.T) {
 func signedTestRecord(t *testing.T, filesystemID, peerID, role, public string, key ed25519.PrivateKey) Record {
 	t.Helper()
 	record, err := Sign(Payload{Version: Version, FileSystemID: filesystemID, PeerID: peerID, Name: peerID,
-		Hostname: peerID, Role: role, SigningPublicKey: public, SSH: SSHTransport{Endpoint: "ssh://user@" + peerID + ".local/repository", PublicKey: "ssh-ed25519 test"},
+		Hostname: peerID, Role: role, SigningPublicKey: public, SSH: SSHTransport{Endpoint: "ssh://user@" + peerID + ".local/repository", PublicKey: "ssh-ed25519 test"}, QUICEndpoint: "quic://" + peerID + ".local:7843",
 		Generation: 1, UpdatedAt: time.Now().UTC()}, key)
 	if err != nil {
 		t.Fatal(err)

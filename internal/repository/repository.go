@@ -23,10 +23,11 @@ import (
 const RelayRemote = "dfs-relay"
 
 type Repository struct {
-	Config config.Config
-	Store  *store.Store
-	runner command.Runner
-	mu     sync.Mutex
+	Config         config.Config
+	Store          *store.Store
+	runner         command.Runner
+	mu             sync.Mutex
+	managedFetcher func(context.Context, *Repository, string, string) error
 }
 
 type Remote struct {
@@ -418,8 +419,26 @@ func (r *Repository) ChangedPaths(ctx context.Context, before, after string) ([]
 
 func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 	r.mu.Lock()
+	fetcher := r.managedFetcher
+	r.mu.Unlock()
+	if fetcher != nil {
+		if err := fetcher(ctx, r, path, from); err == nil {
+			return r.Store.Touch(path)
+		}
+	}
+	r.mu.Lock()
 	defer r.mu.Unlock()
-	args := []string{"annex", "get"}
+	args := []string{}
+	fallbacks, _ := r.runner.Run(ctx, "git", "config", "--get-regexp", `^remote\..*\.dfs-ssh-url$`)
+	for _, line := range strings.Split(strings.TrimSpace(fallbacks), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key := strings.TrimSuffix(fields[0], ".dfs-ssh-url") + ".url"
+		args = append(args, "-c", key+"="+strings.Join(fields[1:], " "))
+	}
+	args = append(args, "annex", "get")
 	if from != "" {
 		args = append(args, "--from="+from)
 	}
@@ -428,6 +447,29 @@ func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 		return err
 	}
 	return r.Store.Touch(path)
+}
+
+func (r *Repository) SetManagedFetcher(fetcher func(context.Context, *Repository, string, string) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.managedFetcher = fetcher
+}
+
+func (r *Repository) LookupKey(ctx context.Context, path string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, err := r.runner.Run(ctx, "git", "annex", "lookupkey", "--", filepath.ToSlash(path))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func (r *Repository) ReinjectContent(ctx context.Context, source, destination string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, err := r.runner.Run(ctx, "git", "annex", "reinject", source, filepath.ToSlash(destination))
+	return err
 }
 
 func (r *Repository) Unlock(ctx context.Context, path string) error {
@@ -511,6 +553,44 @@ func (r *Repository) AddPairedRemote(ctx context.Context, peerID, url string) (s
 		return "", err
 	}
 	return name, nil
+}
+
+func (r *Repository) AddManagedRemote(ctx context.Context, peerID, executable, sshFallback string) (string, error) {
+	executable, err := filepath.Abs(executable)
+	if err != nil {
+		return "", err
+	}
+	escape := func(value string) string {
+		value = strings.ReplaceAll(value, "%", "%%")
+		return strings.ReplaceAll(value, " ", "% ")
+	}
+	managedURL := "ext::" + escape(executable) + " --repo " + escape(r.Config.Repository) + " transport git " + escape(peerID) + " %S"
+	name, err := r.AddPairedRemote(ctx, peerID, managedURL)
+	if err != nil {
+		return "", err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := r.runner.Run(ctx, "git", "config", "protocol.ext.allow", "always"); err != nil {
+		return "", err
+	}
+	if _, err := r.runner.Run(ctx, "git", "config", "remote."+name+".dfs-transport", "quic"); err != nil {
+		return "", err
+	}
+	if _, err := r.runner.Run(ctx, "git", "config", "remote."+name+".dfs-ssh-url", sshFallback); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func (r *Repository) PeerSSHFallback(ctx context.Context, name string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, err := r.runner.Run(ctx, "git", "config", "--get", "remote."+name+".dfs-ssh-url")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
 }
 
 func (r *Repository) AdoptClonedPeer(ctx context.Context, peerID string) (string, error) {

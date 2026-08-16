@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
@@ -29,6 +30,9 @@ type RemoteDiagnostic struct {
 	Error                string `json:"error,omitempty"`
 	PasswordlessSSH      bool   `json:"passwordless_ssh"`
 	PasswordlessSSHError string `json:"passwordless_ssh_error,omitempty"`
+	ManagedQUIC          bool   `json:"managed_quic"`
+	ManagedQUICError     string `json:"managed_quic_error,omitempty"`
+	Transport            string `json:"transport,omitempty"`
 }
 
 type DiagnosticReport struct {
@@ -87,21 +91,41 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 		go func(index int, remote repository.Remote) {
 			defer checksWait.Done()
 			check := RemoteDiagnostic{Name: remote.Name, Reachable: true}
-			transportResult := make(chan error, 1)
+			managedResult := make(chan error, 1)
+			fallbackResult := make(chan error, 1)
 			sshResult := make(chan error, 1)
 			go func() {
 				probeCtx, cancel := context.WithTimeout(ctx, timeout)
 				defer cancel()
-				transportResult <- repo.ProbeRemote(probeCtx, remote.Name)
+				managedResult <- managed.Probe(probeCtx, repo, peerIDForRemote(repo.Config.Repository, remote.Name))
+			}()
+			go func() {
+				probeCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				fallbackResult <- repo.ProbeRemote(probeCtx, remote.Name)
 			}()
 			go func() {
 				sshCtx, cancel := context.WithTimeout(ctx, timeout)
 				defer cancel()
-				sshResult <- probePasswordlessSSH(sshCtx, remote.URL, timeout)
+				sshURL := remote.URL
+				if fallback, fallbackErr := repo.PeerSSHFallback(sshCtx, remote.Name); fallbackErr == nil {
+					sshURL = fallback
+				}
+				sshResult <- probePasswordlessSSH(sshCtx, sshURL, timeout)
 			}()
-			if err := <-transportResult; err != nil {
-				check.Reachable = false
-				check.Error = conciseError(err)
+			managedErr := <-managedResult
+			fallbackErr := <-fallbackResult
+			if managedErr == nil {
+				check.ManagedQUIC = true
+				check.Transport = "quic"
+			} else {
+				check.ManagedQUICError = conciseError(managedErr)
+				if fallbackErr == nil {
+					check.Transport = "ssh-fallback"
+				} else {
+					check.Reachable = false
+					check.Error = "QUIC: " + conciseError(managedErr) + "; fallback: " + conciseError(fallbackErr)
+				}
 			}
 			if err := <-sshResult; err != nil {
 				check.PasswordlessSSHError = conciseError(err)
@@ -233,10 +257,13 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 			} else if !check.PasswordlessSSH {
 				connection.Status = "PASSWORDLESS_SSH_FAILED"
 				connection.Error = check.PasswordlessSSHError
+			} else if check.Transport == "ssh-fallback" {
+				connection.Status = "SSH_FALLBACK"
+				connection.Error = check.ManagedQUICError
 			} else {
 				connection.Status = "OK"
 			}
-			if connection.Status != "OK" {
+			if connection.Status != "OK" && connection.Status != "SSH_FALLBACK" {
 				result.Complete = false
 			}
 			result.Connections = append(result.Connections, connection)
@@ -295,7 +322,20 @@ func diagnosticFor(report DiagnosticReport, name string) (RemoteDiagnostic, bool
 }
 
 func requestDiagnostic(ctx context.Context, repo *repository.Repository, remote repository.Remote, timeout time.Duration) (DiagnosticReport, error) {
-	target, port, err := sshRemote(remote.URL)
+	peerID := peerIDForRemote(repo.Config.Repository, remote.Name)
+	if peerID != "" {
+		if data, managedErr := managed.Diagnostic(ctx, repo, peerID); managedErr == nil {
+			var report DiagnosticReport
+			if err := json.Unmarshal(data, &report); err == nil && report.Version == 2 && report.PeerID != "" && report.FileSystemID != "" {
+				return report, nil
+			}
+		}
+	}
+	sshURL := remote.URL
+	if fallback, fallbackErr := repo.PeerSSHFallback(ctx, remote.Name); fallbackErr == nil {
+		sshURL = fallback
+	}
+	target, port, err := sshRemote(sshURL)
 	if err != nil {
 		return DiagnosticReport{}, fmt.Errorf("%s: %w", remote.Name, err)
 	}
@@ -341,6 +381,16 @@ func requestDiagnostic(ctx context.Context, repo *repository.Repository, remote 
 		return DiagnosticReport{}, errors.New("remote returned an invalid diagnostic response")
 	}
 	return report, nil
+}
+
+func peerIDForRemote(repositoryPath, remoteName string) string {
+	prefix := strings.TrimPrefix(remoteName, "dfs-peer-")
+	for _, record := range mustLoadMembership(repositoryPath) {
+		if strings.HasPrefix(record.Payload.PeerID, prefix) {
+			return record.Payload.PeerID
+		}
+	}
+	return prefix
 }
 
 func sshRemote(value string) (target, port string, err error) {

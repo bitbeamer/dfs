@@ -17,7 +17,7 @@ import (
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
-func ensureLocalMembership(ctx context.Context, repo *repository.Repository, filesystemID string, identity transportIdentity) (ed25519.PrivateKey, membership.Record, error) {
+func ensureLocalMembership(ctx context.Context, repo *repository.Repository, filesystemID string, identity transportIdentity, port int) (ed25519.PrivateKey, membership.Record, error) {
 	private, public, err := membership.EnsureKey(repo.Config.Repository)
 	if err != nil {
 		return nil, membership.Record{}, err
@@ -31,24 +31,29 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	if !strings.Contains(endpointHost, ".") {
 		endpointHost += ".local"
 	}
+	quicEndpoint := fmt.Sprintf("quic://%s:%d", endpointHost, port)
 	endpoint, err := sshURL(account.Username, endpointHost, repo.Config.Repository)
 	if err != nil {
 		return nil, membership.Record{}, err
 	}
 	for _, existing := range mustLoadMembership(repo.Config.Repository) {
 		payload := existing.Payload
-		if payload.PeerID == repo.Config.PeerID && payload.FileSystemID == filesystemID && payload.SigningPublicKey == public &&
-			payload.Name == repo.Config.Name && payload.Hostname == hostname && payload.SSH.Endpoint == endpoint &&
-			payload.SSH.PublicKey == identity.PublicKey && membership.VerifySelf(existing) == nil {
+		if payload.PeerID != repo.Config.PeerID || payload.SigningPublicKey != public {
+			continue
+		}
+		if payload.FileSystemID == filesystemID && payload.Name == repo.Config.Name && payload.Hostname == hostname &&
+			payload.SSH.Endpoint == endpoint && payload.SSH.PublicKey == identity.PublicKey &&
+			payload.QUICEndpoint == quicEndpoint && membership.VerifySelf(existing) == nil {
 			if err := membership.Trust(repo.Config.Repository, payload.PeerID, payload.SigningPublicKey); err != nil {
 				return nil, membership.Record{}, err
 			}
 			return private, existing, nil
 		}
+		return nil, membership.Record{}, errors.New("published DFS membership no longer matches this peer; revoke the old member and pair this machine again")
 	}
 	record, err := membership.Sign(membership.Payload{Version: membership.Version, FileSystemID: filesystemID,
 		PeerID: repo.Config.PeerID, Name: repo.Config.Name, Hostname: hostname, Role: "admin", SigningPublicKey: public,
-		SSH:        membership.SSHTransport{Endpoint: endpoint, PublicKey: identity.PublicKey, HostKeys: localSSHHostKeys()},
+		SSH: membership.SSHTransport{Endpoint: endpoint, PublicKey: identity.PublicKey, HostKeys: localSSHHostKeys()}, QUICEndpoint: quicEndpoint,
 		Generation: 1, UpdatedAt: time.Now().UTC()}, private)
 	if err != nil {
 		return nil, membership.Record{}, err
@@ -69,7 +74,7 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	return private, record, nil
 }
 
-func newMembershipDraft(keyRepositoryPath, endpointRepositoryPath, filesystemID, peerID, name, sshPublicKey string, sshHostKeys []string) (ed25519.PrivateKey, membership.Record, error) {
+func newMembershipDraft(keyRepositoryPath, endpointRepositoryPath, filesystemID, peerID, name, sshPublicKey string, sshHostKeys []string, quicPort int) (ed25519.PrivateKey, membership.Record, error) {
 	private, public, err := membership.EnsureKey(keyRepositoryPath)
 	if err != nil {
 		return nil, membership.Record{}, err
@@ -93,7 +98,7 @@ func newMembershipDraft(keyRepositoryPath, endpointRepositoryPath, filesystemID,
 	}
 	record, err := membership.Sign(membership.Payload{Version: membership.Version, FileSystemID: filesystemID,
 		PeerID: peerID, Name: name, Hostname: strings.TrimSuffix(hostname, ".local"), Role: "member", SigningPublicKey: public,
-		SSH:        membership.SSHTransport{Endpoint: endpoint, PublicKey: sshPublicKey, HostKeys: sshHostKeys},
+		SSH: membership.SSHTransport{Endpoint: endpoint, PublicKey: sshPublicKey, HostKeys: sshHostKeys}, QUICEndpoint: fmt.Sprintf("quic://%s:%d", endpointHost, quicPort),
 		Generation: 1, UpdatedAt: time.Now().UTC()}, private)
 	return private, record, err
 }
@@ -147,6 +152,10 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 		}
 	}
 	knownHosts := filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), "known_hosts")
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
 	for _, record := range accepted {
 		if record.Payload.PeerID == repo.Config.PeerID {
 			continue
@@ -157,7 +166,7 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 		if _, err := authorizePeer(record.Payload.SSH.PublicKey, repo.Config.Repository, filesystemID, record.Payload.PeerID); err != nil {
 			return fmt.Errorf("authorize member %s: %w", record.Payload.Name, err)
 		}
-		if _, err := repo.AddPairedRemote(ctx, record.Payload.PeerID, record.Payload.SSH.Endpoint); err != nil {
+		if _, err := repo.AddManagedRemote(ctx, record.Payload.PeerID, executable, record.Payload.SSH.Endpoint); err != nil {
 			return fmt.Errorf("configure member %s: %w", record.Payload.Name, err)
 		}
 	}

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/syncer"
@@ -137,6 +138,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Info("stale mountpoint detached", "mountpoint", mountpoint)
 	}
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
+	repo.SetManagedFetcher(managed.FetchPath)
 	scheduler.SetReconciler(func(ctx context.Context) error { return peer.ReconcileMembership(ctx, repo) })
 
 	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))

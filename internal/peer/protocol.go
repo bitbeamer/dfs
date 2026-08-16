@@ -27,6 +27,7 @@ type Invitation struct {
 	Secret            string `json:"secret"`
 	CertificateSHA256 string `json:"cert"`
 	Endpoint          string `json:"endpoint,omitempty"`
+	QUICEndpoint      string `json:"quic_endpoint,omitempty"`
 }
 
 type PairStartRequest struct {
@@ -116,6 +117,9 @@ func (i Invitation) Validate() error {
 	}
 	if i.Endpoint != "" && !strings.HasPrefix(i.Endpoint, "https://") {
 		return errors.New("DFS invitation endpoint must use HTTPS")
+	}
+	if i.QUICEndpoint != "" && !strings.HasPrefix(i.QUICEndpoint, "quic://") {
+		return errors.New("DFS invitation QUIC endpoint must use quic://")
 	}
 	return nil
 }

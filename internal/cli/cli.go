@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/managed"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
@@ -45,7 +46,7 @@ func New() *cobra.Command {
 	root.SetErr(app.Err)
 	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (or set DFS_REPO)")
 	root.AddCommand(
-		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(),
+		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
 		app.storageCommand(),
 		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
@@ -53,6 +54,39 @@ func New() *cobra.Command {
 		app.doctorCommand(),
 	)
 	return root
+}
+
+func (a *App) transportCommand() *cobra.Command {
+	transport := &cobra.Command{Use: "transport", Short: "Inspect the DFS-managed QUIC transport"}
+	gitProxy := &cobra.Command{Use: "git <peer-id> <service>", Args: cobra.ExactArgs(2), Hidden: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
+			_, err = managed.GitProxy(ctx, repo, args[0], args[1], cmd.InOrStdin(), a.Out, a.Err)
+			return err
+		}}
+	probe := &cobra.Command{Use: "probe <peer-id>", Args: cobra.ExactArgs(1), Short: "Probe mutually authenticated QUIC connectivity",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			if err := managed.Probe(ctx, repo, args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintln(a.Out, "Managed QUIC transport is reachable and authenticated")
+			return nil
+		}}
+	transport.AddCommand(gitProxy, probe)
+	return transport
 }
 
 func (a *App) setupCommand() *cobra.Command {
@@ -306,7 +340,13 @@ func (a *App) pairCommand() *cobra.Command {
 
 func Execute() error { return New().Execute() }
 
-func (a *App) open() (*repository.Repository, error) { return repository.Open(a.repo) }
+func (a *App) open() (*repository.Repository, error) {
+	repo, err := repository.Open(a.repo)
+	if err == nil {
+		repo.SetManagedFetcher(managed.FetchPath)
+	}
+	return repo, err
+}
 
 func commandContext(command *cobra.Command) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(command.Context(), 24*time.Hour)

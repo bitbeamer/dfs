@@ -47,6 +47,7 @@ type Payload struct {
 	Role             string       `json:"role"`
 	SigningPublicKey string       `json:"signing_public_key"`
 	SSH              SSHTransport `json:"ssh"`
+	QUICEndpoint     string       `json:"quic_endpoint"`
 	Generation       uint64       `json:"generation"`
 	UpdatedAt        time.Time    `json:"updated_at"`
 	Revoked          bool         `json:"revoked"`
@@ -623,6 +624,9 @@ func validatePayload(payload Payload) error {
 	}
 	if strings.TrimSpace(payload.SSH.Endpoint) == "" || strings.TrimSpace(payload.SSH.PublicKey) == "" {
 		return errors.New("membership SSH transport is incomplete")
+	}
+	if !strings.HasPrefix(payload.QUICEndpoint, "quic://") {
+		return errors.New("membership QUIC transport is incomplete")
 	}
 	return nil
 }

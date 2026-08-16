@@ -153,7 +153,7 @@ invitation from the prompt keeps its bearer secret out of shell history.
 `dfs network discover`, `dfs network join`, and the installer scripts remain as
 lower-level diagnostic and manual controls.
 
-The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; the forced command delegates Git and git-annex operations to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository. It also accepts one fixed, read-only DFS diagnostic command used by the mesh check. It does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
+The invitation contains a random bearer secret and the existing peer's TLS certificate fingerprint. DFS discovers the matching filesystem ID, pins that certificate, exchanges dedicated Ed25519 device keys and SSH host keys, clones the repository, and registers deterministic remotes in both directions. Pairing itself prefers QUIC and falls back to the pinned HTTPS endpoint. After admission, mutually authenticated QUIC is the primary transport for Git metadata, annex content, diagnostics, and membership traffic. Pairing also adds `restrict,command="... peer serve"` entries to each user's `~/.ssh/authorized_keys`; this repository-scoped SSH path remains the automatic fallback when QUIC cannot be established. The forced command delegates only Git and git-annex operations to `git-annex-shell` with `GIT_ANNEX_SHELL_DIRECTORY` fixed to that DFS repository and accepts one fixed, read-only diagnostic command. It does not grant a general shell. Private keys, pinned host keys, invitations, and runtime discovery state stay under `.git/dfs` with private permissions.
 
 Each admitted device also publishes a signed record under `.dfs/members` with
 its stable ID, hostname, role, generation, signing key, and transport endpoint.
@@ -182,7 +182,7 @@ Pairing records the completion token privately after the clone. If the final rec
 
 mDNS normally stays within one LAN and may be blocked by guest Wi-Fi isolation or VLAN boundaries. A currently mounted inviter embeds its `.local` pairing endpoint in the invitation as a fallback. `pair invite --clone-url <url>` can override the authenticated clone URL for routed or advanced setups; the manual join flow remains available.
 
-A default-drop host firewall must allow UDP 5353 for mDNS, TCP 7843 for the pairing endpoint, and the SSH server port (normally TCP 22) from the trusted LAN on every device that receives direct peer connections. The pairing port can be changed with `dfs mount --pair-port <port>`; managed-service definitions must use the same fixed port allowed by the firewall. DFS logs a warning and continues mounting when discovery or the pairing listener cannot start.
+A default-drop host firewall must allow UDP 5353 for mDNS, both UDP and TCP 7843 for managed QUIC and the HTTPS pairing fallback, and the SSH server port (normally TCP 22) from the trusted LAN on every device that receives direct peer connections. The pairing/transport port can be changed with `dfs mount --pair-port <port>`; managed-service definitions must use the same fixed port allowed by the firewall. DFS logs a warning and continues mounting when discovery or the pairing listener cannot start.
 
 Use `dfs mount --discovery=false` when a peer must not advertise the filesystem or run a pairing endpoint. Manual configured remotes continue to work.
 
@@ -348,8 +348,9 @@ adds the repository-aware mesh validation below.
 each paired peer to verify every configured peer transport in both directions.
 It evaluates the complete directed graph among peers discovered by the
 initiating peer: `desktop → laptop` and `laptop → desktop` are separate checks.
-Each probe is read-only and validates the configured Git/SSH transport without
-fetching or changing repository refs.
+Each probe is read-only: it checks mutually authenticated QUIC first, exercises
+the repository-restricted SSH fallback when needed, and separately verifies
+ordinary passwordless SSH without fetching or changing repository refs.
 
 ```text
 FROM                    TO                      STATUS          DETAIL
@@ -357,26 +358,26 @@ desktop (a1b2c3d4e5f6)  laptop (112233445566)   OK
 laptop (112233445566)   desktop (a1b2c3d4e5f6)  NOT_CONFIGURED  paired remote is missing
 ```
 
-`OK` means the directed transport works. `NOT_CONFIGURED` means the source
+`OK` means managed QUIC and the directed transport work. `SSH_FALLBACK` means
+QUIC is unavailable but the restricted SSH alternative works. `NOT_CONFIGURED` means the source
 peer has no direct remote for the discovered destination. `FAILED` means that
-remote exists but its Git/SSH probe failed. `UNREPORTED` means the initiating
-peer could not obtain a diagnostic report, for example because SSH failed or
+remote exists but both transport paths failed. `UNREPORTED` means the initiating
+peer could not obtain a diagnostic report, for example because both transports failed or
 the remote DFS version is too old. `ONLY_LOCAL_PEER` means no other peer was
 discovered, so there were no directed edges to test.
 
-The command exits unsuccessfully if any edge in the discovered mesh is not
-`OK`. Peers that are offline, outside the initiating peer's multicast domain,
-or running with discovery disabled are not included, so success is not a claim
-about peers that were absent from discovery. Adjust the bounded discovery and
-connection probes when necessary:
+The command exits unsuccessfully if any edge is neither `OK` nor the healthy,
+degraded `SSH_FALLBACK` state. Configured membership/remotes remain
+authoritative even when mDNS is blocked; discovery supplements them with nearby
+offers. Adjust the bounded discovery and connection probes when necessary:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository doctor --mesh \
   --discovery-timeout 5s --peer-timeout 10s
 ```
 
-All discovered peers must run a DFS version that supports the diagnostic SSH
-command; older peers are reported as `UNREPORTED` until they are upgraded.
+All peers must run a compatible DFS transport protocol; older peers are
+reported as `UNREPORTED` until they are upgraded.
 
 ## Architecture
 

@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
@@ -12,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/user"
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
@@ -47,6 +50,7 @@ type Service struct {
 	membershipRecord membership.Record
 	endorsements     []membership.Endorsement
 	listener         net.Listener
+	managed          *managed.Server
 	httpServer       *http.Server
 	mdnsServers      []mdnsAdvertiser
 	statePath        string
@@ -97,7 +101,14 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	if err != nil {
 		return nil, err
 	}
-	membershipKey, membershipRecord, err := ensureLocalMembership(ctx, repo, filesystemID, identity)
+	if listener == nil {
+		listener, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return nil, fmt.Errorf("listen for DFS pairing: %w", err)
+		}
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	membershipKey, membershipRecord, err := ensureLocalMembership(ctx, repo, filesystemID, identity, port)
 	if err != nil {
 		return nil, fmt.Errorf("prepare DFS membership: %w", err)
 	}
@@ -112,12 +123,6 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 			return nil, fmt.Errorf("endorse DFS membership: %w", endorseErr)
 		}
 		endorsements = append(endorsements, endorsement)
-	}
-	if listener == nil {
-		listener, err = net.Listen("tcp", ":0")
-		if err != nil {
-			return nil, fmt.Errorf("listen for DFS pairing: %w", err)
-		}
 	}
 	service := &Service{
 		repo: repo, logger: logger.With("component", "peer-network"), filesystemID: filesystemID,
@@ -135,10 +140,42 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second,
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
+	pairHandler := func(ctx context.Context, operation string, remote net.Addr, payload json.RawMessage) (json.RawMessage, error) {
+		path := "/v1/pair/start"
+		handler := service.handlePairStart
+		if operation == "pair-complete" {
+			path = "/v1/pair/complete"
+			handler = service.handlePairComplete
+		}
+		request := httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(payload))
+		request.RemoteAddr = remote.String()
+		response := httptest.NewRecorder()
+		handler(response, request)
+		if response.Code < 200 || response.Code >= 300 {
+			var failure protocolError
+			if json.Unmarshal(response.Body.Bytes(), &failure) == nil && failure.Error != "" {
+				return nil, errors.New(failure.Error)
+			}
+			return nil, fmt.Errorf("pairing returned HTTP %d", response.Code)
+		}
+		return append(json.RawMessage(nil), response.Body.Bytes()...), nil
+	}
+	managedService, err := managed.Start(repo, listener.Addr().String(), func(ctx context.Context) ([]byte, error) {
+		report, err := Diagnose(ctx, repo, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(report)
+	}, &certificate, pairHandler)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("start DFS managed QUIC transport: %w", err)
+	}
+	service.managed = managedService
 	if advertise {
 		interfaces := interfaceProvider()
 		if len(interfaces) == 0 {
+			_ = service.managed.Close()
 			_ = listener.Close()
 			return nil, errors.New("advertise DFS network: no multicast-capable interface")
 		}
@@ -151,6 +188,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 			serviceInstance(repo.Config.NetworkName, repo.Config.Name, repo.Config.PeerID), port, txt, interfaces,
 		)
 		if err != nil {
+			_ = service.managed.Close()
 			_ = listener.Close()
 			return nil, fmt.Errorf("advertise DFS network: %w", err)
 		}
@@ -160,6 +198,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		Version: ProtocolVersion, FileSystemID: filesystemID, Endpoint: endpoint,
 		CertificateSHA: fingerprint, PID: os.Getpid(), StartedAt: time.Now().UTC(),
 	}); err != nil {
+		_ = service.managed.Close()
 		for _, server := range service.mdnsServers {
 			server.Shutdown()
 		}
@@ -187,6 +226,11 @@ func (s *Service) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err := s.httpServer.Shutdown(ctx)
+	if s.managed != nil {
+		if managedErr := s.managed.Close(); err == nil {
+			err = managedErr
+		}
+	}
 	select {
 	case <-s.done:
 	case <-ctx.Done():

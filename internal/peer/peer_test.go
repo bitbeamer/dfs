@@ -200,7 +200,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	invitation.Endpoint = "https://" + listener.Addr().String()
+	invitation.QUICEndpoint = "quic://" + listener.Addr().String()
 	encoded, err := invitation.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -276,7 +276,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondInvitation.Endpoint = "https://" + listener.Addr().String()
+	secondInvitation.QUICEndpoint = "quic://" + listener.Addr().String()
 	secondEncoded, err := secondInvitation.Encode()
 	if err != nil {
 		t.Fatal(err)

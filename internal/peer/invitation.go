@@ -87,6 +87,7 @@ func CreateInvitation(repo *repository.Repository, lifetime time.Duration, clone
 	}
 	if state, err := readRuntimeState(repo.Config.Repository); err == nil && state.FileSystemID == filesystemID {
 		invitation.Endpoint = state.Endpoint
+		invitation.QUICEndpoint = "quic://" + strings.TrimPrefix(state.Endpoint, "https://")
 	}
 	return invitation, nil
 }

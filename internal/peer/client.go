@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
@@ -110,13 +111,13 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		request.ReverseUser = account.Username
 		request.ReversePath = destination
 	}
-	_, membershipDraft, err := newMembershipDraft(temporary, destination, invitation.FileSystemID, peerID, name, identity.PublicKey, request.SSHHostKeys)
+	_, membershipDraft, err := newMembershipDraft(temporary, destination, invitation.FileSystemID, peerID, name, identity.PublicKey, request.SSHHostKeys, DefaultPairingPort)
 	if err != nil {
 		return nil, fmt.Errorf("create signed DFS membership: %w", err)
 	}
 	request.Membership = membershipDraft
 
-	endpoints := []string{}
+	var quicEndpoints, endpoints []string
 	discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout+time.Second)
 	offers, discoverErr := Discover(discoveryCtx, discoveryTimeout)
 	cancel()
@@ -129,13 +130,18 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 				continue
 			}
 			endpoints = append(endpoints, offer.Endpoint)
+			quicEndpoints = append(quicEndpoints, "quic://"+strings.TrimPrefix(offer.Endpoint, "https://"))
 		}
 	}
 	if invitation.Endpoint != "" {
 		endpoints = append(endpoints, invitation.Endpoint)
 	}
+	if invitation.QUICEndpoint != "" {
+		quicEndpoints = append(quicEndpoints, invitation.QUICEndpoint)
+	}
+	quicEndpoints = uniqueStrings(quicEndpoints)
 	endpoints = uniqueStrings(endpoints)
-	if len(endpoints) == 0 {
+	if len(endpoints) == 0 && len(quicEndpoints) == 0 {
 		if discoverErr != nil {
 			return nil, discoverErr
 		}
@@ -149,8 +155,8 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		endpoint string
 		startErr error
 	)
-	for _, candidate := range endpoints {
-		startErr = postJSON(ctx, client, candidate+"/v1/pair/start", request, &start)
+	for _, candidate := range append(quicEndpoints, endpoints...) {
+		startErr = postPair(ctx, client, candidate, invitation.CertificateSHA256, "pair-start", request, &start)
 		if startErr == nil {
 			endpoint = candidate
 			break
@@ -274,7 +280,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	}
 	pairCompleted = true
 	var complete PairCompleteResponse
-	if err := postJSON(ctx, client, endpoint+"/v1/pair/complete", PairCompleteRequest{
+	if err := postPair(ctx, client, endpoint, invitation.CertificateSHA256, "pair-complete", PairCompleteRequest{
 		SessionID: start.SessionID, CompletionSecret: start.CompletionSecret,
 	}, &complete); err != nil {
 		return nil, fmt.Errorf("repository joined but reciprocal pairing is incomplete: %w; retry with dfs --repo %s network complete", err, repo.Config.Repository)
@@ -306,7 +312,7 @@ func CompletePairing(ctx context.Context, repositoryPath string) (PairCompleteRe
 	client := pinnedHTTPClient(resume.CertificateSHA256)
 	defer client.CloseIdleConnections()
 	var complete PairCompleteResponse
-	if err := postJSON(ctx, client, strings.TrimRight(resume.Endpoint, "/")+"/v1/pair/complete", PairCompleteRequest{
+	if err := postPair(ctx, client, resume.Endpoint, resume.CertificateSHA256, "pair-complete", PairCompleteRequest{
 		SessionID: resume.SessionID, CompletionSecret: resume.CompletionSecret,
 	}, &complete); err != nil {
 		return PairCompleteResponse{}, err
@@ -315,6 +321,18 @@ func CompletePairing(ctx context.Context, repositoryPath string) (PairCompleteRe
 		return PairCompleteResponse{}, err
 	}
 	return complete, nil
+}
+
+func postPair(ctx context.Context, client *http.Client, endpoint, certificateSHA256, operation string, input, output any) error {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if strings.HasPrefix(endpoint, "quic://") {
+		return managed.PairCall(ctx, endpoint, certificateSHA256, operation, input, output)
+	}
+	path := "/v1/pair/start"
+	if operation == "pair-complete" {
+		path = "/v1/pair/complete"
+	}
+	return postJSON(ctx, client, endpoint+path, input, output)
 }
 
 func savePairingResume(repositoryPath string, resume pairingResume) error {
