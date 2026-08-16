@@ -1,0 +1,33 @@
+goos: linux
+goarch: amd64
+pkg: github.com/bitbeamer/dfs/internal/mount
+cpu: AMD Ryzen 7 9800X3D 8-Core Processor
+BenchmarkBaselineNamespace/Enumerate256-16 2871 88386 ns/op 91626 B/op 784 allocs/op
+BenchmarkBaselineNamespace/Enumerate256-16 2732 87799 ns/op 91610 B/op 784 allocs/op
+BenchmarkBaselineNamespace/Enumerate256-16 2511 86214 ns/op 91599 B/op 784 allocs/op
+BenchmarkBaselineNamespace/Lookup-16 27765 8366 ns/op 1400 B/op 28 allocs/op
+BenchmarkBaselineNamespace/Lookup-16 28526 8308 ns/op 1400 B/op 28 allocs/op
+BenchmarkBaselineNamespace/Lookup-16 28563 8465 ns/op 1400 B/op 28 allocs/op
+BenchmarkBaselineNamespace/Attributes-16 29428 8260 ns/op 1320 B/op 28 allocs/op
+BenchmarkBaselineNamespace/Attributes-16 29281 8207 ns/op 1320 B/op 28 allocs/op
+BenchmarkBaselineNamespace/Attributes-16 29174 8261 ns/op 1320 B/op 28 allocs/op
+BenchmarkBaselineCachedContent/Open-16 30607 7878 ns/op 816 B/op 18 allocs/op
+BenchmarkBaselineCachedContent/Open-16 30262 7914 ns/op 816 B/op 18 allocs/op
+BenchmarkBaselineCachedContent/Open-16 29798 7896 ns/op 816 B/op 18 allocs/op
+BenchmarkBaselineCachedContent/Read128KiB-16 99879 2365 ns/op 55432.52 MB/s 24 B/op 1 allocs/op
+BenchmarkBaselineCachedContent/Read128KiB-16 97178 2387 ns/op 54910.34 MB/s 24 B/op 1 allocs/op
+BenchmarkBaselineCachedContent/Read128KiB-16 100042 2384 ns/op 54987.22 MB/s 24 B/op 1 allocs/op
+BenchmarkBaselineCachedContent/Read8MiB-16 1399 167351 ns/op 50125.69 MB/s 24 B/op 1 allocs/op
+BenchmarkBaselineCachedContent/Read8MiB-16 1437 169160 ns/op 49589.79 MB/s 24 B/op 1 allocs/op
+BenchmarkBaselineCachedContent/Read8MiB-16 1371 164885 ns/op 50875.65 MB/s 24 B/op 1 allocs/op
+BenchmarkBaselineMutations/CreateAndCommit128KiB-16 1755 134435 ns/op 974.98 MB/s 41773 B/op 117 allocs/op
+BenchmarkBaselineMutations/CreateAndCommit128KiB-16 1779 132407 ns/op 989.92 MB/s 41912 B/op 117 allocs/op
+BenchmarkBaselineMutations/CreateAndCommit128KiB-16 1792 133756 ns/op 979.93 MB/s 41874 B/op 117 allocs/op
+BenchmarkBaselineMutations/Rename-16 8221 28618 ns/op 3065 B/op 73 allocs/op
+BenchmarkBaselineMutations/Rename-16 7150 28599 ns/op 3063 B/op 73 allocs/op
+BenchmarkBaselineMutations/Rename-16 8388 29041 ns/op 3061 B/op 73 allocs/op
+BenchmarkBaselineMutations/Delete-16 15690 15151 ns/op 1982 B/op 47 allocs/op
+BenchmarkBaselineMutations/Delete-16 16018 14959 ns/op 1993 B/op 47 allocs/op
+BenchmarkBaselineMutations/Delete-16 16050 14846 ns/op 1992 B/op 46 allocs/op
+PASS
+
