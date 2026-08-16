@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
@@ -73,25 +74,45 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	report := DiagnosticReport{
 		Version: 2, FileSystemID: filesystemID, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
 	}
-	for _, remote := range remotes {
+	checks := make([]RemoteDiagnostic, len(remotes))
+	var checksWait sync.WaitGroup
+	for index, remote := range remotes {
 		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
 			continue
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, timeout)
-		check := RemoteDiagnostic{Name: remote.Name, Reachable: true}
-		if err := repo.ProbeRemote(probeCtx, remote.Name); err != nil {
-			check.Reachable = false
-			check.Error = conciseError(err)
+		checksWait.Add(1)
+		go func(index int, remote repository.Remote) {
+			defer checksWait.Done()
+			check := RemoteDiagnostic{Name: remote.Name, Reachable: true}
+			transportResult := make(chan error, 1)
+			sshResult := make(chan error, 1)
+			go func() {
+				probeCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				transportResult <- repo.ProbeRemote(probeCtx, remote.Name)
+			}()
+			go func() {
+				sshCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				sshResult <- probePasswordlessSSH(sshCtx, remote.URL, timeout)
+			}()
+			if err := <-transportResult; err != nil {
+				check.Reachable = false
+				check.Error = conciseError(err)
+			}
+			if err := <-sshResult; err != nil {
+				check.PasswordlessSSHError = conciseError(err)
+			} else {
+				check.PasswordlessSSH = true
+			}
+			checks[index] = check
+		}(index, remote)
+	}
+	checksWait.Wait()
+	for _, check := range checks {
+		if check.Name != "" {
+			report.Remotes = append(report.Remotes, check)
 		}
-		cancel()
-		sshCtx, sshCancel := context.WithTimeout(ctx, timeout)
-		if err := probePasswordlessSSH(sshCtx, remote.URL, timeout); err != nil {
-			check.PasswordlessSSHError = conciseError(err)
-		} else {
-			check.PasswordlessSSH = true
-		}
-		sshCancel()
-		report.Remotes = append(report.Remotes, check)
 	}
 	sort.Slice(report.Remotes, func(i, j int) bool { return report.Remotes[i].Name < report.Remotes[j].Name })
 	return report, nil
