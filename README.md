@@ -41,24 +41,25 @@ organizing files therefore does not require their content to be present locally.
 ### Add and operate trusted devices
 
 - Discover nearby DFS filesystems over mDNS/DNS-SD.
-- Join with an authenticated, one-use invitation and one explicit approval.
+- Select a discovered filesystem, submit a signed expiring join request, and
+  obtain one explicit approval from any online member without copying a token.
 - Resume or abort an interrupted `dfs setup` transaction safely.
-- Reconcile signed full-mesh membership, remotes, trust pins, and restricted SSH
-  authorizations automatically, including after an offline peer returns.
-- Transfer Git metadata, git-annex content, membership, and diagnostics over
-  mutually authenticated QUIC, with repository-restricted SSH as a fallback.
+- Reconcile signed full-mesh membership, remotes, and trust pins automatically,
+  including after an offline peer returns.
+- Transfer Git metadata, git-annex content, membership, and diagnostics only
+  over mutually authenticated QUIC.
 - Stream requested ranges of uncached files over authenticated QUIC, retaining
   resumable sparse partials privately and promoting only verified complete
   objects into git-annex.
-- Diagnose dependencies and every directed peer-to-peer path, including ordinary
-  passwordless SSH, with `health` and `health --cluster`.
+- Diagnose dependencies and every directed authenticated QUIC path with
+  `health` and `health --cluster`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
   membership, and peer health with `dfs health`; add `--cluster` for an active
   whole-cluster check and namespace-convergence comparison. Health output lists
   every pinned file or directory with its scope, hydration status, logical size,
   and missing-file count.
 - Run more than one active DFS filesystem on the same host. Each repository has
-  independent state, mountpoint, service, logs, and TCP/UDP transport port.
+  independent state, mountpoint, service, logs, and UDP transport port.
 
 ### Protect and recover data
 
@@ -71,27 +72,26 @@ organizing files therefore does not require their content to be present locally.
 
 ## Requirements and build
 
-Each peer needs Go 1.26 or newer to build, Git, git-annex, OpenSSH, rsync, and a
-FUSE runtime. QUIC is the primary managed peer transport. OpenSSH and rsync are
-required for the compatibility fallback and diagnostics; inbound SSH requires
-an SSH server on that peer.
+Each peer needs Go 1.26 or newer to build, Git, git-annex, and a FUSE runtime.
+DFS peer communication uses authenticated QUIC and does not require a remote
+login service or a file-copy utility.
 
 Arch Linux/CachyOS:
 
 ```sh
-sudo pacman -S --needed go git git-annex openssh rsync fuse3
+sudo pacman -S --needed go git git-annex fuse3
 ```
 
 Debian/Ubuntu:
 
 ```sh
-sudo apt install golang-go git git-annex openssh-client openssh-server rsync fuse3
+sudo apt install golang-go git git-annex fuse3
 ```
 
 macOS:
 
 ```sh
-brew install go git git-annex rsync
+brew install go git git-annex
 ```
 
 Install the current macFUSE package from [macfuse.io](https://macfuse.io/).
@@ -142,25 +142,24 @@ another terminal.
 
 ## Add another peer
 
-On an existing mounted peer, create a one-use invitation. It expires after ten
-minutes by default:
-
-```sh
-dfs --repo ~/.local/share/dfs/repository pair invite
-```
-
-Send the resulting `dfs2_...` secret through a trusted channel. On the new
-device, from the DFS source checkout, run:
+On the new device, from the DFS source checkout, run:
 
 ```sh
 ./bin/dfs setup --name laptop --cache-limit 50GiB
 ```
 
-Paste the invitation at the prompt and approve the displayed filesystem once.
-`dfs setup` joins the repository, completes reciprocal mesh registration,
-installs the platform user service, mounts the default `~/dfs_storage`, and
-verifies health. Reading the invitation from the prompt keeps it out of shell
-history.
+`dfs setup` lists nearby filesystems and asks you to select one. It prints a
+short request ID and waits. On any existing online member, review and approve
+that exact signed request:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository pair requests
+dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
+```
+
+The new peer then joins over QUIC, completes reciprocal registration, installs
+the platform user service, mounts the default `~/dfs_storage`, and verifies
+health. No invitation secret is copied between machines.
 
 If setup is interrupted, continue or roll it back:
 
@@ -173,7 +172,7 @@ Setup progress, locks, and pairing state are private and repository-specific.
 For a non-default repository, pass the same `--repository` to the initial,
 resume, or abort command. `--mountpoint` selects another mountpoint and
 `--pair-port` selects a local managed transport port. Otherwise setup uses the
-first free TCP/UDP port beginning at 7843.
+first free UDP port beginning at 7843.
 
 `dfs network discover`, `dfs network join`, `dfs network complete`, and the
 installer scripts are the lower-level controls for manual recovery and
@@ -182,17 +181,17 @@ the first peer still uses `dfs init` and a platform installer.
 
 ### Pairing and membership security
 
-The invitation contains a random bearer secret and the inviter's TLS
-certificate fingerprint. DFS pins that identity, exchanges dedicated Ed25519
-device keys and SSH host keys, clones the repository, and registers
-deterministic remotes in both directions. Pairing prefers QUIC and can fall back
-to the pinned HTTPS endpoint.
+The discovered advertisement supplies a certificate fingerprint. The new peer
+pins it, sends a signed, peer-bound, expiring request, and polls the discovered
+members for explicit approval. Approval creates an internal single-use secret
+that is never copied by the user. DFS clones the repository over QUIC and
+registers deterministic authenticated remotes in both directions.
 
 Each admitted peer publishes a signed record in the dedicated
 `refs/heads/dfs-membership` Git metadata ref. The approving member signs the
 admission and endorses its roster, so one approval establishes the new peer's
 full mesh. Periodic synchronization verifies the signature chain and repairs
-missing remotes, trust pins, and repository-restricted SSH authorizations.
+missing remotes and trust pins.
 `peer remove` publishes a signed revocation; revocations accepted locally remain
 sticky even if shared history is later altered.
 
@@ -213,23 +212,21 @@ Useful administration commands are:
 dfs --repo ~/.local/share/dfs/repository network discover
 dfs --repo ~/.local/share/dfs/repository network set-name "Home Files"
 dfs --repo ~/.local/share/dfs/repository network complete
-dfs --repo ~/.local/share/dfs/repository pair list
-dfs --repo ~/.local/share/dfs/repository pair revoke <invitation-id>
+dfs --repo ~/.local/share/dfs/repository pair requests
+dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
+dfs --repo ~/.local/share/dfs/repository pair reject <request-id>
 dfs --repo ~/.local/share/dfs/repository peer list
 dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<id>
 dfs --repo ~/.local/share/dfs/repository transport probe <peer-id>
 ```
 
 Restart the managed mount after changing its advertised network name. Removing
-a peer also removes its repository-restricted authorization locally and
-publishes its signed revocation, but cannot erase content it already copied.
+a peer publishes its signed revocation but cannot erase content it already copied.
 If reciprocal registration was interrupted after cloning, `network complete`
 retries it without consuming a new invitation.
 
-For advanced or non-discovery deployments, `dfs join <git-url> <repository>`
-clones an existing repository and `dfs peer add <name> <ssh-url>` registers a
-direct SSH remote. These lower-level commands do not replace the admission and
-verification performed by guided setup.
+`dfs network join` and the legacy invitation subcommands remain available only
+for recovery and compatibility. Guided `dfs setup` is the normal admission path.
 
 ## Run multiple filesystems on one host
 
@@ -325,25 +322,20 @@ dependencies are missing or the cluster is incomplete or inconsistent.
 
 `health --cluster` asks every known mounted peer to test every configured peer in both directions:
 `desktop -> laptop` and `laptop -> desktop` are separate rows. Each read-only
-probe tests mutually authenticated QUIC, the repository-restricted SSH
-fallback, and ordinary passwordless non-interactive SSH.
+probe tests mutually authenticated QUIC.
 
 Important cluster statuses are:
 
-- `OK`: managed QUIC and the directed transport work.
-- `SSH_FALLBACK`: QUIC is unavailable but restricted SSH works.
-- `PASSWORDLESS_SSH_FAILED`: DFS transport works, but ordinary passwordless SSH
-  is missing for that exact source-to-destination direction.
+- `OK`: authenticated QUIC works in that direction.
 - `NOT_CONFIGURED`: the source peer has no direct remote for the destination.
-- `FAILED`: both managed transport paths failed.
+- `FAILED`: the authenticated QUIC path failed.
 - `UNREPORTED`: no diagnostic report could be obtained, or the peer runs an
   incompatible DFS transport version.
 - `ONLY_LOCAL_PEER`: no other member or discovered peer was available, so there
   were no directed edges to test.
 
-`PASSWORDLESS_SSH_FAILED`, `NOT_CONFIGURED`, `FAILED`, and `UNREPORTED` make the
-command fail. `SSH_FALLBACK` is a healthy but degraded result. Adjust bounded
-probes when needed:
+`NOT_CONFIGURED`, `FAILED`, and `UNREPORTED` make the command fail. Adjust
+bounded probes when needed:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository health --cluster \
@@ -399,8 +391,8 @@ and disconnected FUSE endpoint are recovered automatically.
 ## Network and firewall requirements
 
 mDNS normally remains within one LAN and can be blocked by guest isolation or
-VLANs. A default-drop firewall must allow UDP 5353 for discovery, both UDP and
-TCP for each instance's managed port, and TCP 22 if the SSH fallback is wanted.
+VLANs. A default-drop firewall must allow UDP 5353 for discovery and UDP for
+each instance's managed port.
 The first instance normally uses 7843, the next 7844, and so on. DFS continues
 mounting with a warning if discovery or the listener cannot start.
 
@@ -413,9 +405,8 @@ A bare relay lets peers publish Git namespace and annex-location metadata at
 different times. It does not store file content:
 
 ```sh
-ssh server.example.com 'git init --bare /srv/dfs.git'
 dfs --repo ~/.local/share/dfs/repository relay set \
-  ssh://server.example.com/srv/dfs.git
+  https://git.example.com/dfs-metadata.git
 dfs --repo ~/.local/share/dfs/repository sync --metadata-only
 ```
 
@@ -488,9 +479,8 @@ DFS transactions, synchronization, and quota scheduler
         |-- Git: namespace, history, signed membership and cluster-pin metadata refs
         |-- git-annex: content hashes, locations, safe copies
         |-- SQLite: peer-local pins, applied cluster pins, access, and filesystem metadata
-        |-- mDNS + pinned TLS: discovery and pairing
-        |-- mutually authenticated QUIC: primary peer transport
-        |-- restricted SSH: compatibility fallback
+        |-- mDNS + pinned TLS: discovery and approval
+        |-- mutually authenticated QUIC: peer transport
         `-- S3: optional durable content
 ```
 

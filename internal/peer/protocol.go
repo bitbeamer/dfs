@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	ServiceType        = "_dfs._tcp"
+	ServiceType        = "_dfs._udp"
 	ProtocolVersion    = 2
 	DefaultPairingPort = 7843
 	invitationPrefix   = "dfs2_"
@@ -35,8 +35,6 @@ type PairStartRequest struct {
 	Secret       string            `json:"secret"`
 	PeerID       string            `json:"peer_id"`
 	PeerName     string            `json:"peer_name"`
-	SSHPublicKey string            `json:"ssh_public_key"`
-	SSHHostKeys  []string          `json:"ssh_host_keys,omitempty"`
 	ReverseUser  string            `json:"reverse_user,omitempty"`
 	ReversePath  string            `json:"reverse_path,omitempty"`
 	Membership   membership.Record `json:"membership"`
@@ -48,9 +46,6 @@ type PairStartResponse struct {
 	NetworkName      string                   `json:"network_name"`
 	PeerName         string                   `json:"peer_name"`
 	PeerID           string                   `json:"peer_id"`
-	CloneURL         string                   `json:"clone_url"`
-	SSHPublicKey     string                   `json:"ssh_public_key"`
-	SSHHostKeys      []string                 `json:"ssh_host_keys,omitempty"`
 	SessionID        string                   `json:"session_id"`
 	CompletionSecret string                   `json:"completion_secret"`
 	ExpiresAt        time.Time                `json:"expires_at"`

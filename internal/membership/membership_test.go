@@ -3,6 +3,8 @@ package membership
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -331,12 +333,37 @@ func TestSignedEndorsement(t *testing.T) {
 func signedTestRecord(t *testing.T, filesystemID, peerID, role, public string, key ed25519.PrivateKey) Record {
 	t.Helper()
 	record, err := Sign(Payload{Version: Version, FileSystemID: filesystemID, PeerID: peerID, Name: peerID,
-		Hostname: peerID, Role: role, SigningPublicKey: public, SSH: SSHTransport{Endpoint: "ssh://user@" + peerID + ".local/repository", PublicKey: "ssh-ed25519 test"}, QUICEndpoint: "quic://" + peerID + ".local:7843",
+		Hostname: peerID, Role: role, SigningPublicKey: public, QUICEndpoint: "quic://" + peerID + ".local:7843",
 		Generation: 1, UpdatedAt: time.Now().UTC()}, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return record
+}
+
+func TestLegacyMembershipRecordRemainsVerifiableDuringQUICMigration(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := Sign(Payload{Version: Version, FileSystemID: strings.Repeat("a", 40), PeerID: "legacy1234567890",
+		Name: "offline", Hostname: "offline", Role: "member", SigningPublicKey: base64.RawStdEncoding.EncodeToString(public),
+		LegacyTransport: &legacyTransport{Endpoint: "legacy://offline/repository", PublicKey: "legacy-public-key"},
+		QUICEndpoint:    "quic://offline.local:7843", Generation: 1, UpdatedAt: time.Now().UTC()}, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Record
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySelf(decoded); err != nil {
+		t.Fatalf("legacy signed membership no longer verifies: %v", err)
+	}
 }
 
 func gitMembershipRepository(t *testing.T) string {

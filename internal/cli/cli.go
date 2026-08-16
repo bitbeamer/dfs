@@ -322,7 +322,6 @@ func (a *App) networkCommand() *cobra.Command {
 func (a *App) pairCommand() *cobra.Command {
 	pairing := &cobra.Command{Use: "pair", Short: "Review and approve secure peer join requests"}
 	var expires time.Duration
-	var cloneURL string
 	invite := &cobra.Command{
 		Use: "invite", Args: cobra.NoArgs, Short: "Create a one-use pairing invitation",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -331,7 +330,7 @@ func (a *App) pairCommand() *cobra.Command {
 				return err
 			}
 			defer repo.Close()
-			invitation, err := peer.CreateInvitation(repo, expires, cloneURL)
+			invitation, err := peer.CreateInvitation(repo, expires)
 			if err != nil {
 				return err
 			}
@@ -344,7 +343,6 @@ func (a *App) pairCommand() *cobra.Command {
 		},
 	}
 	invite.Flags().DurationVar(&expires, "expires", 10*time.Minute, "invitation lifetime (maximum 24h)")
-	invite.Flags().StringVar(&cloneURL, "clone-url", "", "override the SSH clone URL returned after authentication")
 
 	list := &cobra.Command{
 		Use: "list", Args: cobra.NoArgs, Short: "List active pairing invitations",
@@ -515,31 +513,8 @@ func (a *App) joinCommand() *cobra.Command {
 }
 
 func (a *App) peerCommand() *cobra.Command {
-	peers := &cobra.Command{Use: "peer", Short: "Manage direct Git/git-annex peers"}
-	serve := &cobra.Command{
-		Use: "serve", Args: cobra.NoArgs, Hidden: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repositoryPath, err := config.ResolveRepository(a.repo)
-			if err != nil {
-				return err
-			}
-			return peer.ServeSSH(repositoryPath)
-		},
-	}
+	peers := &cobra.Command{Use: "peer", Short: "Manage authenticated DFS peers"}
 	peers.AddCommand(
-		&cobra.Command{
-			Use: "add <name> <ssh-url>", Args: cobra.ExactArgs(2), Short: "Add a peer",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				repo, err := a.open()
-				if err != nil {
-					return err
-				}
-				defer repo.Close()
-				ctx, cancel := commandContext(cmd)
-				defer cancel()
-				return repo.AddRemote(ctx, args[0], args[1])
-			},
-		},
 		&cobra.Command{
 			Use: "remove <name>", Args: cobra.ExactArgs(1), Short: "Remove a peer",
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -558,9 +533,9 @@ func (a *App) peerCommand() *cobra.Command {
 				if err := repo.RemovePeer(ctx, args[0]); err != nil {
 					return err
 				}
-				return peer.RevokePeerAuthorization(args[0])
+				return nil
 			},
-		}, serve,
+		},
 		&cobra.Command{
 			Use: "list", Args: cobra.NoArgs, Short: "List peers and remotes",
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -870,10 +845,6 @@ func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
 			remoteStatus, detail := "OK", ""
 			if !remote.Reachable {
 				remoteStatus, detail = "UNREACHABLE", compactHealthDetail(remote.Error)
-			} else if !remote.PasswordlessSSH {
-				remoteStatus, detail = "SSH FAILED", compactHealthDetail(remote.PasswordlessSSHError)
-			} else if remote.Transport == "ssh-fallback" {
-				remoteStatus, detail = "FALLBACK", compactHealthDetail(remote.ManagedQUICError)
 			}
 			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", remoteHealthName(remote), remoteStatus, remote.Transport, detail)
 		}
@@ -937,7 +908,7 @@ func printMeshHealth(output io.Writer, report peer.MeshReport) {
 	for _, node := range report.Reports {
 		for _, issue := range node.Issues {
 			switch issue.Code {
-			case "PEER_UNREACHABLE", "PASSWORDLESS_SSH_FAILED", "SSH_FALLBACK":
+			case "PEER_UNREACHABLE":
 				continue // The directed connection table communicates these once and more clearly.
 			}
 			issues = append(issues, issue)
@@ -1376,7 +1347,7 @@ func checkEnvironment(goos string) (environmentHealth, error) {
 	if err := prepareDoctorPath(goos); err != nil {
 		return report, fmt.Errorf("prepare dependency search path: %w", err)
 	}
-	commands := []string{"git", "git-annex", "git-annex-shell", "ssh", "ssh-keygen", "rsync"}
+	commands := []string{"git", "git-annex"}
 	if goos == "linux" {
 		commands = append(commands, "fusermount3")
 	}

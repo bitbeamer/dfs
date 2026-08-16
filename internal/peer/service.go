@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -67,18 +66,21 @@ func Start(repo *repository.Repository, logger *slog.Logger, port int, changed f
 	} else if port < 0 {
 		port = 0
 	}
-	listener, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(port)))
-	if err != nil {
-		return nil, fmt.Errorf("listen for DFS pairing on TCP port %d: %w", port, err)
-	}
-	service, err := startService(repo, logger, listener, true, changed)
-	if err != nil {
-		_ = listener.Close()
-	}
-	return service, err
+	return startServiceAddress(repo, logger, net.JoinHostPort("", strconv.Itoa(port)), true, changed)
 }
 
 func startService(repo *repository.Repository, logger *slog.Logger, listener net.Listener, advertise bool, changed func(string, []string)) (*Service, error) {
+	if listener == nil {
+		return nil, errors.New("test transport listener is required")
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		return nil, err
+	}
+	return startServiceAddress(repo, logger, address, advertise, changed)
+}
+
+func startServiceAddress(repo *repository.Repository, logger *slog.Logger, address string, advertise bool, changed func(string, []string)) (*Service, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -88,6 +90,9 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	if err != nil {
 		return nil, err
 	}
+	if err := removeLegacyAuthorizations(filesystemID); err != nil {
+		return nil, fmt.Errorf("remove legacy DFS peer authorizations: %w", err)
+	}
 	if err := membership.MigrateLegacySharedState(repo.Config.Repository); err != nil {
 		return nil, fmt.Errorf("migrate DFS membership metadata: %w", err)
 	}
@@ -95,13 +100,11 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 	if err != nil {
 		return nil, err
 	}
-	if listener == nil {
-		listener, err = net.Listen("tcp", ":0")
-		if err != nil {
-			return nil, fmt.Errorf("listen for DFS pairing: %w", err)
-		}
+	udpAddress, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return nil, fmt.Errorf("resolve DFS managed transport address: %w", err)
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
+	port := udpAddress.Port
 	membershipKey, membershipRecord, err := ensureLocalMembership(ctx, repo, filesystemID, port)
 	if err != nil {
 		return nil, fmt.Errorf("prepare DFS membership: %w", err)
@@ -151,7 +154,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		}
 		return append(json.RawMessage(nil), response.Body.Bytes()...), nil
 	}
-	managedService, err := managed.Start(repo, listener.Addr().String(), func(ctx context.Context) ([]byte, error) {
+	managedService, err := managed.Start(repo, address, func(ctx context.Context) ([]byte, error) {
 		report, err := Diagnose(ctx, repo, 10*time.Second)
 		if err != nil {
 			return nil, err
@@ -159,16 +162,16 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		return json.Marshal(report)
 	}, &certificate, pairHandler, service.authorizePairClone, changed)
 	if err != nil {
-		_ = listener.Close()
 		return nil, fmt.Errorf("start DFS managed QUIC transport: %w", err)
 	}
 	service.managed = managedService
-	_ = listener.Close()
+	if actual, ok := managedService.Addr().(*net.UDPAddr); ok && port == 0 {
+		port = actual.Port
+	}
 	if advertise {
 		interfaces := interfaceProvider()
 		if len(interfaces) == 0 {
 			_ = service.managed.Close()
-			_ = listener.Close()
 			return nil, errors.New("advertise DFS network: no multicast-capable interface")
 		}
 		txt := []string{
@@ -181,7 +184,6 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		)
 		if err != nil {
 			_ = service.managed.Close()
-			_ = listener.Close()
 			return nil, fmt.Errorf("advertise DFS network: %w", err)
 		}
 	}
@@ -194,7 +196,6 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 		for _, server := range service.mdnsServers {
 			server.Shutdown()
 		}
-		_ = listener.Close()
 		return nil, err
 	}
 	go service.cleanupInvitations()
@@ -284,7 +285,6 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		writeJSON(response, http.StatusOK, s.startResponse(record.Pending, completionSecret))
 		return
 	}
-	cloneURL := record.CloneURL
 	completionSecret, err := randomString(32)
 	if err != nil {
 		writeProtocolError(response, http.StatusInternalServerError, "cannot create pairing session")
@@ -302,7 +302,7 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 	}
 	record.Pending = &pendingPair{
 		SessionID: sessionID, CompletionHash: secretHash(completionSecret), PeerID: input.PeerID,
-		PeerName: strings.TrimSpace(input.PeerName), CloneURL: cloneURL,
+		PeerName:   strings.TrimSpace(input.PeerName),
 		ExpiresAt:  minTime(record.ExpiresAt, time.Now().UTC().Add(pairingLease)),
 		Membership: approvedMembership,
 	}
@@ -316,7 +316,7 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 func (s *Service) startResponse(pending *pendingPair, completionSecret string) PairStartResponse {
 	return PairStartResponse{
 		Version: ProtocolVersion, FileSystemID: s.filesystemID, NetworkName: s.repo.Config.NetworkName,
-		PeerName: s.repo.Config.Name, PeerID: s.repo.Config.PeerID, CloneURL: pending.CloneURL,
+		PeerName: s.repo.Config.Name, PeerID: s.repo.Config.PeerID,
 		SessionID: pending.SessionID, CompletionSecret: completionSecret, ExpiresAt: pending.ExpiresAt,
 		Membership: pending.Membership, Approver: s.membershipRecord, Members: s.members, Endorsements: s.endorsements,
 	}
@@ -459,18 +459,6 @@ func writeJSON(response http.ResponseWriter, status int, value any) {
 	response.Header().Set("Content-Type", "application/json")
 	response.WriteHeader(status)
 	_ = json.NewEncoder(response).Encode(value)
-}
-
-func sshURL(username, host, path string) (string, error) {
-	username = strings.TrimSpace(username)
-	host = strings.TrimSpace(host)
-	if username == "" || host == "" || !filepath.IsAbs(path) {
-		return "", errors.New("SSH user, host, and absolute repository path are required")
-	}
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil && ip.To4() == nil {
-		host = "[" + strings.Trim(host, "[]") + "]"
-	}
-	return (&url.URL{Scheme: "ssh", User: url.User(username), Host: host, Path: filepath.ToSlash(path)}).String(), nil
 }
 
 func localAddress(request *http.Request) string {

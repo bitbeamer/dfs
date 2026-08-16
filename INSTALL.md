@@ -4,31 +4,21 @@ DFS is experimental. Start with test data and keep an independent backup.
 
 ## 1. Install and build
 
-Each peer needs Go 1.26+, Git, git-annex, OpenSSH, rsync, and a FUSE
-runtime. DFS-managed QUIC is the primary peer transport. OpenSSH and rsync
-provide the repository-restricted compatibility fallback and are also used by
-cluster diagnostics and the cross-peer acceptance test.
+Each peer needs Go 1.26+, Git, git-annex, and a FUSE runtime. DFS peer
+communication and cluster diagnostics use authenticated QUIC.
 
 ### CachyOS/Arch Linux prerequisites
 
 ```sh
-sudo pacman -S --needed go git git-annex openssh rsync fuse3
-```
-
-Enable the SSH server to make the fallback and complete cluster diagnostics
-available to other peers:
-
-```sh
-sudo systemctl enable --now sshd
+sudo pacman -S --needed go git git-annex fuse3
 ```
 
 ### macOS prerequisites
 
-Install the command-line dependencies with Homebrew. macOS supplies the SSH
-client and server.
+Install the command-line dependencies with Homebrew.
 
 ```sh
-brew install go git git-annex rsync
+brew install go git git-annex
 ```
 
 Installing `git-annex` may print a suggestion to run
@@ -65,10 +55,6 @@ Verify that the runtime helper is installed:
 test -x /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse \
   && echo "macFUSE is installed"
 ```
-
-For inbound fallback connections and complete cluster diagnostics, enable
-**Remote Login** under **System Settings → General → Sharing** for the DFS
-account.
 
 ### Build DFS
 
@@ -134,19 +120,19 @@ launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
 The installer puts the daemon in a signed `DFS.app` helper with a stable bundle
 identifier and keeps `~/Library/Application Support/DFS/bin/dfs` as a
 compatibility link. On first install, allow **DFS** under **System Settings →
-Privacy & Security → Local Network** so discovery can use `_dfs._tcp`.
+Privacy & Security → Local Network** so discovery can use `_dfs._udp`.
 When updating, reuse each instance's existing `--pair-port`; choosing another
 port changes its advertised endpoint, and omitting the option defaults a manual
 installer invocation to 7843.
 
-Homebrew is normally added to interactive macOS shells automatically. When
-building through a non-interactive SSH command, make it explicit first:
+Homebrew is normally added to interactive macOS shells automatically. For a
+non-interactive build environment, make it explicit first:
 
 ```sh
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
-To make Homebrew available to every non-interactive zsh command permanently,
+To make Homebrew available to non-interactive zsh commands permanently,
 add the following to `~/.zshenv` on the Mac:
 
 ```sh
@@ -159,10 +145,9 @@ export PATH
 directories to its own dependency search path, so diagnostics do not depend on
 interactive shell startup files.
 
-The existing peer and the new peer should be able to reach each other over
-managed QUIC and the SSH fallback. On a default-drop firewall, allow UDP 5353,
-both UDP and TCP for each filesystem instance's selected managed port, and the
-SSH server port (normally TCP 22) from the trusted LAN. The first instance
+The existing peer and the new peer must reach each other over managed QUIC. On
+a default-drop firewall, allow UDP 5353 and UDP for each filesystem instance's
+selected managed port from the trusted LAN. The first instance
 normally uses 7843; subsequent automatic setups select the next free port and
 print it.
 
@@ -189,17 +174,7 @@ starts it, and waits for the mount to become healthy. It now advertises the
 filesystem to nearby peers. `dfs setup` currently joins an existing filesystem;
 creation of the first peer is the explicit `init` plus installer flow above.
 
-## 3. Create an invitation
-
-On an existing, mounted DFS peer:
-
-```sh
-dfs --repo ~/.local/share/dfs/repository pair invite
-```
-
-Send the resulting `dfs2_...` invitation to the new peer through a trusted channel. It is a temporary secret.
-
-## 4. Join and mount
+## 3. Join and approve
 
 On the new peer, from the cloned DFS source directory, run the transactional
 setup command:
@@ -208,14 +183,22 @@ setup command:
 ./bin/dfs setup --name laptop --cache-limit 50GiB
 ```
 
-Paste the invitation when prompted and approve the displayed filesystem once.
-DFS then prepares the repository, reconciles the reciprocal peer, installs the
-platform service, mounts `~/dfs_storage`, and verifies health. The invitation
-is read from standard input instead of appearing in shell history.
+Select one of the discovered filesystems. DFS prints a short request ID and
+waits. On any existing online member, verify the peer name and ID, then approve
+the request:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository pair requests
+dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
+```
+
+DFS then clones over authenticated QUIC, reconciles reciprocal membership,
+installs the platform service, mounts `~/dfs_storage`, and verifies health. No
+long invitation or bearer secret is copied between machines.
 
 Every completed step is recorded privately and atomically. If setup is
 interrupted or a dependency is temporarily unavailable, retry it without a new
-invitation:
+join request while the recorded request is still valid:
 
 ```sh
 ./bin/dfs setup --resume
@@ -229,10 +212,11 @@ transaction created, run:
 ```
 
 Use `--repository` and `--mountpoint` on the initial command to override their
-defaults. Setup state and locks are repository-specific, so multiple incomplete
+defaults. `--filesystem` selects an unambiguous discovered name or ID without an
+interactive menu. Setup state and locks are repository-specific, so multiple incomplete
 or completed filesystem transactions do not collide. Resume and abort select
 the transaction using `--repository`; use the same non-default repository path
-you supplied initially. `--pair-port` selects an explicit local TCP/UDP port;
+you supplied initially. `--pair-port` selects an explicit local UDP port;
 otherwise DFS uses the first free port beginning at 7843. The
 lower-level `network join` and installer scripts remain available for debugging
 and manual deployments.
@@ -280,12 +264,9 @@ resumable sparse partials under the repository's private
 complete content is verified before atomic git-annex promotion. Explicit fetch
 and pin operations still hydrate the entire selected content.
 
-`health --cluster` verifies managed QUIC, the repository-restricted SSH fallback,
-and ordinary passwordless, non-interactive SSH for every directed peer pair. A
-working fallback with unavailable QUIC is shown as `SSH_FALLBACK`; a missing
-account key or `known_hosts` entry is reported on the exact `FROM` → `TO` row as
-`PASSWORDLESS_SSH_FAILED`. Verify ordinary SSH separately
-with `ssh -o BatchMode=yes <peer>.local true` when repairing that status.
+`health --cluster` verifies authenticated QUIC for every directed peer pair.
+An unavailable member is reported without delaying healthy-peer operations or
+trying another transport.
 
 ### Hostname changes create a new peer
 
@@ -299,8 +280,8 @@ transfers the old identity to the renamed machine. Re-add it as a new peer:
 2. On another cluster member, run
    `dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<old-id>`.
 3. Move the renamed machine's old repository aside as a backup, create a new
-   invitation on an existing member, and run `network join` into the original
-   repository path. The join generates a new peer ID.
+   `dfs setup` against an existing member into the original repository path.
+   The join generates a new peer ID.
 4. Reinstall the managed mount and verify it with `health --cluster` and the
    mounted-volume acceptance test.
 
@@ -331,7 +312,8 @@ updated, and deleted before the propagation deadline. The output reports the
 observed number of seconds for every peer and operation. It does not modify
 existing files. The default 45-second deadline allows one pass of DFS's
 30-second synchronization schedule plus network latency. The peers must be
-reachable through non-interactive SSH. Arch
+reachable through an independently configured administrative remote shell.
+That channel only launches the cross-host test; DFS itself never uses it. Arch
 requires the `attr` package for its extended-attribute check:
 
 ```sh
@@ -346,7 +328,7 @@ skipped and must not be treated as a complete cross-peer acceptance test.
 
 Run the cluster check while all peers you expect to validate are mounted and
 advertising. Configured signed membership remains authoritative when mDNS is
-unavailable. The command exits unsuccessfully if any directed peer is missing,
-both managed transports fail, or ordinary passwordless SSH is not configured.
+unavailable. The command exits unsuccessfully if any directed authenticated
+QUIC path is missing or fails.
 
 See [README.md](README.md) for platform-specific dependencies, manual mounting, troubleshooting, and advanced configuration.

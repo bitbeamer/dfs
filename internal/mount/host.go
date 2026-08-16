@@ -219,9 +219,8 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 			scheduler.Notify(reason)
 		})
 		if peerErr != nil {
-			// Multicast is unavailable on some networks. Keep the filesystem usable
-			// and leave manual SSH joining available, but make the missing onboarding
-			// service visible in managed-service logs.
+			// Multicast is unavailable on some networks. Keep the filesystem usable,
+			// but make the missing onboarding service visible in managed-service logs.
 			logger.Warn("peer discovery unavailable", "error", peerErr)
 		} else {
 			defer func() {

@@ -132,10 +132,6 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 }
 
 func Join(ctx context.Context, remote, path, name string, cacheLimit int64) (*Repository, error) {
-	return JoinWithSSH(ctx, remote, path, name, cacheLimit, "")
-}
-
-func JoinWithSSH(ctx context.Context, remote, path, name string, cacheLimit int64, sshCommand string) (*Repository, error) {
 	if err := CheckDependencies(); err != nil {
 		return nil, err
 	}
@@ -148,12 +144,7 @@ func JoinWithSSH(ctx context.Context, remote, path, name string, cacheLimit int6
 		return nil, err
 	}
 	runner := command.Runner{Directory: parent}
-	cloneArgs := []string{}
-	if sshCommand != "" {
-		cloneArgs = append(cloneArgs, "-c", "core.sshCommand="+sshCommand)
-	}
-	cloneArgs = append(cloneArgs, "clone", remote, path)
-	if _, err := runner.Run(ctx, "git", cloneArgs...); err != nil {
+	if _, err := runner.Run(ctx, "git", "clone", remote, path); err != nil {
 		return nil, err
 	}
 	if name == "" {
@@ -182,10 +173,36 @@ func Open(path string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}, remoteRetry: make(map[string]remoteRetry), remoteChecked: make(map[string]bool)}, nil
+	repo := &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}, remoteRetry: make(map[string]remoteRetry), remoteChecked: make(map[string]bool)}
+	if err := repo.migrateLegacyTransport(context.Background()); err != nil {
+		_ = state.Close()
+		return nil, err
+	}
+	return repo, nil
 }
 
 func (r *Repository) Close() error { return r.Store.Close() }
+
+// migrateLegacyTransport removes settings and credentials created by DFS
+// versions that predate the authenticated managed transport. Unrelated user
+// configuration and remotes are left untouched.
+func (r *Repository) migrateLegacyTransport(ctx context.Context) error {
+	for _, key := range []string{"core.sshCommand", "annex.ssh-options"} {
+		_, _ = r.runner.Run(ctx, "git", "config", "--unset-all", key)
+	}
+	if output, err := r.runner.Run(ctx, "git", "config", "--name-only", "--get-regexp", `^remote\..*\.dfs-ssh-url$`); err == nil {
+		for _, key := range strings.Fields(output) {
+			_, _ = r.runner.Run(ctx, "git", "config", "--unset-all", key)
+		}
+	}
+	stateDirectory := filepath.Join(r.Config.Repository, filepath.FromSlash(config.Directory))
+	for _, name := range []string{"peer-ssh-key", "peer-ssh-key.pub", "known_hosts"} {
+		if err := os.Remove(filepath.Join(stateDirectory, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove legacy DFS transport credential %s: %w", name, err)
+		}
+	}
+	return nil
+}
 
 // SetLogger enables diagnostic logging for commands run on behalf of this
 // repository. Call it before starting concurrent repository operations.
@@ -231,27 +248,6 @@ func (r *Repository) SetNetworkName(name string) error {
 	defer r.mu.Unlock()
 	r.Config.NetworkName = name
 	return r.SaveConfig()
-}
-
-func (r *Repository) ConfigureSSHCommand(ctx context.Context, sshCommand string) error {
-	sshCommand = strings.TrimSpace(sshCommand)
-	if sshCommand == "" {
-		return errors.New("SSH command cannot be empty")
-	}
-	_, annexOptions, found := strings.Cut(sshCommand, " ")
-	if !found || strings.TrimSpace(annexOptions) == "" {
-		return errors.New("SSH command must include transport options")
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, err := r.runner.Run(ctx, "git", "config", "core.sshCommand", sshCommand); err != nil {
-		return err
-	}
-	// git-annex uses its own SSH/rsync transport for content transfers and does
-	// not consistently inherit core.sshCommand. Give it the same identity,
-	// pinned host keys, and timeouts as Git metadata operations.
-	_, err := r.runner.Run(ctx, "git", "config", "annex.ssh-options", strings.TrimSpace(annexOptions))
-	return err
 }
 
 // WithWorkTreeLock runs fn while repository operations that may replace paths
@@ -782,16 +778,6 @@ func (r *Repository) AddManagedRemote(ctx context.Context, peerID, executable st
 	return name, nil
 }
 
-func (r *Repository) PeerSSHFallback(ctx context.Context, name string) (string, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	value, err := r.runner.Run(ctx, "git", "config", "--get", "remote."+name+".dfs-ssh-url")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(value), nil
-}
-
 func (r *Repository) AdoptClonedPeer(ctx context.Context, peerID string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -870,19 +856,6 @@ func (r *Repository) ProbeRemote(ctx context.Context, name string) error {
 		return errors.New("remote name is required")
 	}
 	_, err := r.runner.Run(ctx, "git", "ls-remote", "--heads", name)
-	return err
-}
-
-func (r *Repository) ProbeSSHFallback(ctx context.Context, name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return errors.New("remote name is required")
-	}
-	fallback, err := r.PeerSSHFallback(ctx, name)
-	if err != nil {
-		return r.ProbeRemote(ctx, name)
-	}
-	_, err = r.runner.Run(ctx, "git", "ls-remote", "--heads", fallback)
 	return err
 }
 

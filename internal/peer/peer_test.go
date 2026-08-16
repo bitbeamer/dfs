@@ -1,7 +1,6 @@
 package peer
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,11 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
-	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/pion/mdns/v2"
 )
 
@@ -162,7 +159,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, command := range []string{"git-annex", "ssh", "rsync"} {
+	for _, command := range []string{"git-annex"} {
 		if err := os.WriteFile(filepath.Join(bin, command), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -192,7 +189,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 	defer service.Close()
 
-	invitation, err := CreateInvitation(existing, 5*time.Minute, existing.Config.Repository)
+	invitation, err := CreateInvitation(existing, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +250,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 		if output, err := command.CombinedOutput(); err == nil {
 			t.Fatalf("QUIC pairing configured core.sshCommand = %q", output)
 		}
-		if _, err := os.Stat(filepath.Join(repo.Config.Repository, ".git", "dfs", transportKeyFile)); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(repo.Config.Repository, ".git", "dfs", "peer-ssh-key")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("QUIC pairing created an SSH transport key: %v", err)
 		}
 		records, err := membership.LoadAll(repo.Config.Repository)
@@ -261,7 +258,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 			t.Fatalf("paired membership records = %#v, %v", records, err)
 		}
 	}
-	secondInvitation, err := CreateInvitation(existing, 5*time.Minute, existing.Config.Repository)
+	secondInvitation, err := CreateInvitation(existing, 5*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,172 +370,6 @@ func TestDiscoveredJoinRequestRequiresExplicitBoundApproval(t *testing.T) {
 	}
 }
 
-func TestEnsureRepositoryTransportPreservesPinnedHostKeys(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Transport Test\nemail = transport@example.invalid\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	repo, err := repository.Init(ctx, filepath.Join(home, "repository"), "desktop", 10<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repo.Close()
-	stateDirectory := filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory))
-	knownHosts := filepath.Join(stateDirectory, "known_hosts")
-	if err := os.WriteFile(knownHosts, []byte("peer.local ssh-ed25519 test\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ensureRepositoryTransport(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
-	command := gitOutput(t, repo.Config.Repository, "config", "--get", "core.sshCommand")
-	for _, expected := range []string{knownHosts, "StrictHostKeyChecking=yes", "ConnectTimeout=5", transportKeyFile} {
-		if !strings.Contains(command, expected) {
-			t.Fatalf("SSH command %q does not contain %q", command, expected)
-		}
-	}
-	annexOptions := gitOutput(t, repo.Config.Repository, "config", "--get", "annex.ssh-options")
-	for _, expected := range []string{knownHosts, "StrictHostKeyChecking=yes", "ConnectTimeout=5", transportKeyFile} {
-		if !strings.Contains(annexOptions, expected) {
-			t.Fatalf("git-annex SSH options %q do not contain %q", annexOptions, expected)
-		}
-	}
-}
-
-func TestServeSSHDispatchesRepositoryRestrictedGitService(t *testing.T) {
-	directory := t.TempDir()
-	capture := filepath.Join(directory, "capture")
-	script := filepath.Join(directory, "git-upload-pack")
-	contents := "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$CAPTURE_PATH\"\n"
-	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("CAPTURE_PATH", capture)
-	repositoryPath := filepath.Join(directory, "repository")
-	t.Setenv("SSH_ORIGINAL_COMMAND", "git-upload-pack '"+repositoryPath+"'")
-	if err := ServeSSH(repositoryPath); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != repositoryPath+"\n" {
-		t.Fatalf("Git service invocation:\n%s", data)
-	}
-}
-
-func TestServeSSHReceiveNotifiesRunningMount(t *testing.T) {
-	directory := t.TempDir()
-	script := filepath.Join(directory, "git-receive-pack")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	repositoryPath := filepath.Join(directory, "repository")
-	listener, err := wakeup.Listen(repositoryPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	t.Setenv("SSH_ORIGINAL_COMMAND", "git-receive-pack '"+repositoryPath+"'")
-	if err := ServeSSH(repositoryPath); err != nil {
-		t.Fatal(err)
-	}
-	reason, err := listener.Receive()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reason != "managed Git receive" {
-		t.Fatalf("event = %q", reason)
-	}
-}
-
-func TestServeSSHDelegatesAnnexCommand(t *testing.T) {
-	directory := t.TempDir()
-	capture := filepath.Join(directory, "capture")
-	script := filepath.Join(directory, "git-annex-shell")
-	contents := "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$1\" \"$2\" \"$GIT_ANNEX_SHELL_DIRECTORY\" > \"$CAPTURE_PATH\"\n"
-	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("CAPTURE_PATH", capture)
-	t.Setenv("SSH_ORIGINAL_COMMAND", "git-annex-shell 'configlist'")
-	repositoryPath := filepath.Join(directory, "repository")
-	if err := ServeSSH(repositoryPath); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "-c\ngit-annex-shell 'configlist'\n"+repositoryPath+"\n" {
-		t.Fatalf("git-annex-shell invocation:\n%s", data)
-	}
-}
-
-func TestServeSSHRejectsGitServiceForDifferentRepository(t *testing.T) {
-	t.Setenv("SSH_ORIGINAL_COMMAND", "git-upload-pack '/another/repository'")
-	if err := ServeSSH(t.TempDir()); err == nil || !strings.Contains(err.Error(), "different repository") {
-		t.Fatalf("mismatched repository error = %v", err)
-	}
-}
-
-func TestExecutablePathUsesFallbackDirectory(t *testing.T) {
-	directory := t.TempDir()
-	executable := filepath.Join(directory, "test-command")
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", "")
-	path, err := executablePath("test-command", directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if path != executable {
-		t.Fatalf("executable path = %q, want %q", path, executable)
-	}
-}
-
-func TestServeDiagnosticReturnsRepositoryIdentity(t *testing.T) {
-	directory := t.TempDir()
-	gitOutput(t, directory, "init", "-b", "main")
-	gitOutput(t, directory, "config", "user.name", "Diagnostic Test")
-	gitOutput(t, directory, "config", "user.email", "diagnostic@example.invalid")
-	gitOutput(t, directory, "commit", "--allow-empty", "-m", "Initialize")
-	gitOutput(t, directory, "annex", "init", "desktop")
-	reachable := filepath.Join(t.TempDir(), "reachable.git")
-	if err := os.Mkdir(reachable, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	gitOutput(t, reachable, "init", "--bare")
-	gitOutput(t, directory, "remote", "add", "dfs-peer-bbbbbbbbbbbb", reachable)
-	gitOutput(t, directory, "remote", "add", "dfs-peer-cccccccccccc", filepath.Join(t.TempDir(), "missing.git"))
-	cfg := config.Default("desktop", directory)
-	cfg.PeerID = "aaaaaaaaaaaaaaaa"
-	if err := config.Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	var output bytes.Buffer
-	if err := serveDiagnostic(directory, &output); err != nil {
-		t.Fatal(err)
-	}
-	var report DiagnosticReport
-	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
-		t.Fatal(err)
-	}
-	if report.Version != 2 || report.PeerID != cfg.PeerID || report.PeerName != cfg.Name || report.FileSystemID == "" {
-		t.Fatalf("diagnostic report = %#v", report)
-	}
-	if len(report.Remotes) != 2 || !report.Remotes[0].Reachable || report.Remotes[1].Reachable || report.Remotes[1].Error == "" {
-		t.Fatalf("remote diagnostics = %#v", report.Remotes)
-	}
-}
-
 func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	peers := map[string]MeshPeer{
 		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop"},
@@ -548,13 +379,13 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	reports := map[string]DiagnosticReport{
 		"aaaaaaaaaaaaaaaa": {
 			PeerID: "aaaaaaaaaaaaaaaa", Remotes: []RemoteDiagnostic{
-				{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, PasswordlessSSH: true},
+				{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true},
 				{Name: "dfs-peer-cccccccccccc", Reachable: false, Error: "connection refused"},
 			},
 		},
 		"bbbbbbbbbbbbbbbb": {
 			PeerID: "bbbbbbbbbbbbbbbb", Remotes: []RemoteDiagnostic{
-				{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, PasswordlessSSHError: "publickey denied"},
+				{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true},
 			},
 		},
 	}
@@ -564,7 +395,7 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	}
 	want := map[string]string{
 		"desktop>laptop": "OK", "desktop>server": "FAILED",
-		"laptop>desktop": "PASSWORDLESS_SSH_FAILED", "laptop>server": "NOT_CONFIGURED",
+		"laptop>desktop": "OK", "laptop>server": "NOT_CONFIGURED",
 		"server>desktop": "UNREPORTED", "server>laptop": "UNREPORTED",
 	}
 	for _, connection := range report.Connections {
@@ -590,8 +421,8 @@ func TestEvaluateMeshDetectsNamespaceDivergence(t *testing.T) {
 		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop"},
 	}
 	reports := map[string]DiagnosticReport{
-		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop", TreeID: "tree-a", Remotes: []RemoteDiagnostic{{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
-		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop", TreeID: "tree-b", Remotes: []RemoteDiagnostic{{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop", TreeID: "tree-a", Remotes: []RemoteDiagnostic{{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, Transport: "quic"}}},
+		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop", TreeID: "tree-b", Remotes: []RemoteDiagnostic{{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, Transport: "quic"}}},
 	}
 	report := evaluateMesh(peers, reports, nil)
 	if report.Complete || report.NamespaceStatus != "inconsistent" || len(report.Issues) != 1 || report.Issues[0].Code != "NAMESPACE_DIVERGED" {
@@ -607,42 +438,13 @@ func TestEvaluateMeshDetectsClusterPinPolicyDivergence(t *testing.T) {
 	reports := map[string]DiagnosticReport{
 		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop", TreeID: "same-tree",
 			Stats:   repository.HealthStats{Pinned: []repository.PinnedPathHealth{{Path: "Media", Scope: "cluster", Status: "ready"}}},
-			Remotes: []RemoteDiagnostic{{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+			Remotes: []RemoteDiagnostic{{Name: "dfs-peer-bbbbbbbbbbbb", Reachable: true, Transport: "quic"}}},
 		"bbbbbbbbbbbbbbbb": {PeerID: "bbbbbbbbbbbbbbbb", PeerName: "laptop", TreeID: "same-tree",
-			Remotes: []RemoteDiagnostic{{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, PasswordlessSSH: true, Transport: "quic"}}},
+			Remotes: []RemoteDiagnostic{{Name: "dfs-peer-aaaaaaaaaaaa", Reachable: true, Transport: "quic"}}},
 	}
 	report := evaluateMesh(peers, reports, nil)
 	if report.Complete || len(report.Issues) != 1 || report.Issues[0].Code != "CLUSTER_PIN_POLICY_DIVERGED" {
 		t.Fatalf("cluster pin health report = %+v", report)
-	}
-}
-
-func TestProbePasswordlessSSHUsesOrdinaryNonInteractiveSSH(t *testing.T) {
-	directory := t.TempDir()
-	capture := filepath.Join(directory, "arguments")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\n"
-	if err := os.WriteFile(filepath.Join(directory, "ssh"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("CAPTURE_PATH", capture)
-	if err := probePasswordlessSSH(context.Background(), "ssh://alice@example.test:2222/repository", time.Second); err != nil {
-		t.Fatal(err)
-	}
-	arguments, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{
-		"BatchMode=yes\n", "PasswordAuthentication=no\n", "KbdInteractiveAuthentication=no\n",
-		"StrictHostKeyChecking=yes\n", "-p\n2222\n", "--\nalice@example.test\ntrue\n",
-	} {
-		if !strings.Contains(string(arguments), expected) {
-			t.Fatalf("SSH arguments do not contain %q:\n%s", expected, arguments)
-		}
-	}
-	if strings.Contains(string(arguments), "IdentitiesOnly=yes") || strings.Contains(string(arguments), "peer-ssh-key") {
-		t.Fatalf("ordinary SSH probe unexpectedly uses the DFS transport identity:\n%s", arguments)
 	}
 }
 
@@ -655,71 +457,6 @@ func TestMeshPeerIDForRemoteUsesConfiguredShortID(t *testing.T) {
 	}
 	if got := meshPeerIDForRemote(peers, "dfs-peer-fa0841841386"); got != "" {
 		t.Fatalf("unknown peer ID = %q", got)
-	}
-}
-
-func TestSSHRemoteAcceptsOnlySSHURLs(t *testing.T) {
-	tests := []struct {
-		url, target, port string
-		wantErr           bool
-	}{
-		{"ssh://alice@example.test:2222/repository", "alice@example.test", "2222", false},
-		{"ssh://alice@[2001:db8::1]/repository", "alice@[2001:db8::1]", "", false},
-		{"alice@example.test:repository", "", "", true},
-		{"https://example.test/repository", "", "", true},
-	}
-	for _, test := range tests {
-		target, port, err := sshRemote(test.url)
-		if (err != nil) != test.wantErr || target != test.target || port != test.port {
-			t.Errorf("sshRemote(%q) = %q, %q, %v", test.url, target, port, err)
-		}
-	}
-}
-
-func TestRequestDiagnosticUsesPinnedRestrictedSSH(t *testing.T) {
-	directory := t.TempDir()
-	stateDirectory := filepath.Join(directory, filepath.FromSlash(config.Directory))
-	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{transportKeyFile, "known_hosts"} {
-		if err := os.WriteFile(filepath.Join(stateDirectory, name), []byte("test\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	bin := filepath.Join(directory, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	capture := filepath.Join(directory, "arguments")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\nprintf '%s\\n' \"$DIAGNOSTIC_REPORT\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("CAPTURE_PATH", capture)
-	t.Setenv("DIAGNOSTIC_REPORT", `{"version":2,"filesystem_id":"filesystem","peer_id":"bbbbbbbbbbbbbbbb","peer_name":"laptop","remotes":[]}`)
-	repo := &repository.Repository{Config: config.Config{Repository: directory}}
-	report, err := requestDiagnostic(context.Background(), repo, repository.Remote{
-		Name: "dfs-peer-bbbbbbbbbbbb", URL: "ssh://alice@example.test:2222/repository",
-	}, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.PeerID != "bbbbbbbbbbbbbbbb" {
-		t.Fatalf("diagnostic response = %#v", report)
-	}
-	arguments, err := os.ReadFile(capture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{
-		"IdentitiesOnly=yes\n", "BatchMode=yes\n", "StrictHostKeyChecking=yes\n",
-		"--\nalice@example.test\n" + diagnosticCommand + "\n",
-	} {
-		if !strings.Contains(string(arguments), expected) {
-			t.Fatalf("SSH arguments do not contain %q:\n%s", expected, arguments)
-		}
 	}
 }
 
@@ -772,7 +509,7 @@ func TestCompletePairingResumesAndRemovesState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
-	invitation, err := CreateInvitation(repo, time.Minute, "")
+	invitation, err := CreateInvitation(repo, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

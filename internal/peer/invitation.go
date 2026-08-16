@@ -29,7 +29,6 @@ type invitationRecord struct {
 	SecretHash   string       `json:"secret_hash"`
 	FileSystemID string       `json:"filesystem_id"`
 	ExpiresAt    time.Time    `json:"expires_at"`
-	CloneURL     string       `json:"clone_url,omitempty"`
 	BoundPeerID  string       `json:"bound_peer_id,omitempty"`
 	Pending      *pendingPair `json:"pending,omitempty"`
 }
@@ -39,8 +38,6 @@ type pendingPair struct {
 	CompletionHash   string            `json:"completion_hash"`
 	PeerID           string            `json:"peer_id"`
 	PeerName         string            `json:"peer_name"`
-	ReverseURL       string            `json:"reverse_url,omitempty"`
-	CloneURL         string            `json:"clone_url"`
 	AuthorizedMarker string            `json:"authorized_marker,omitempty"`
 	ExpiresAt        time.Time         `json:"expires_at"`
 	Membership       membership.Record `json:"membership"`
@@ -52,11 +49,11 @@ type InvitationInfo struct {
 	Pending   bool
 }
 
-func CreateInvitation(repo *repository.Repository, lifetime time.Duration, cloneURL string) (Invitation, error) {
-	return createInvitation(repo, lifetime, cloneURL, "")
+func CreateInvitation(repo *repository.Repository, lifetime time.Duration) (Invitation, error) {
+	return createInvitation(repo, lifetime, "")
 }
 
-func createInvitation(repo *repository.Repository, lifetime time.Duration, cloneURL, boundPeerID string) (Invitation, error) {
+func createInvitation(repo *repository.Repository, lifetime time.Duration, boundPeerID string) (Invitation, error) {
 	if lifetime <= 0 || lifetime > 24*time.Hour {
 		return Invitation{}, errors.New("invitation lifetime must be greater than zero and at most 24 hours")
 	}
@@ -81,7 +78,7 @@ func createInvitation(repo *repository.Repository, lifetime time.Duration, clone
 	record := invitationRecord{
 		Version: ProtocolVersion, ID: id, SecretHash: secretHash(secret),
 		FileSystemID: filesystemID, ExpiresAt: time.Now().UTC().Add(lifetime),
-		CloneURL: strings.TrimSpace(cloneURL), BoundPeerID: strings.TrimSpace(boundPeerID),
+		BoundPeerID: strings.TrimSpace(boundPeerID),
 	}
 	if err := saveInvitation(repo.Config.Repository, record); err != nil {
 		return Invitation{}, err

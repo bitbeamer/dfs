@@ -537,11 +537,6 @@ func choosePairingPort(requested int) (int, error) {
 
 func pairingPortAvailable(port int) bool {
 	address := fmt.Sprintf(":%d", port)
-	tcpListener, err := net.Listen("tcp", address)
-	if err != nil {
-		return false
-	}
-	defer tcpListener.Close()
 	udpListener, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return false

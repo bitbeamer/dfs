@@ -123,7 +123,7 @@ cat >"$info_path" <<'EOF'
   <true/>
   <key>NSBonjourServices</key>
   <array>
-    <string>_dfs._tcp</string>
+    <string>_dfs._udp</string>
   </array>
   <key>NSLocalNetworkUsageDescription</key>
   <string>DFS discovers and connects to peers on your local network.</string>

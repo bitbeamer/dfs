@@ -38,25 +38,25 @@ func KeyPath(repositoryPath string) string {
 	return filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), privateKeyFile)
 }
 
-type SSHTransport struct {
+type legacyTransport struct {
 	Endpoint  string   `json:"endpoint"`
 	PublicKey string   `json:"public_key"`
 	HostKeys  []string `json:"host_keys"`
 }
 
 type Payload struct {
-	Version          int          `json:"version"`
-	FileSystemID     string       `json:"filesystem_id"`
-	PeerID           string       `json:"peer_id"`
-	Name             string       `json:"name"`
-	Hostname         string       `json:"hostname"`
-	Role             string       `json:"role"`
-	SigningPublicKey string       `json:"signing_public_key"`
-	SSH              SSHTransport `json:"ssh"`
-	QUICEndpoint     string       `json:"quic_endpoint"`
-	Generation       uint64       `json:"generation"`
-	UpdatedAt        time.Time    `json:"updated_at"`
-	Revoked          bool         `json:"revoked"`
+	Version          int              `json:"version"`
+	FileSystemID     string           `json:"filesystem_id"`
+	PeerID           string           `json:"peer_id"`
+	Name             string           `json:"name"`
+	Hostname         string           `json:"hostname"`
+	Role             string           `json:"role"`
+	SigningPublicKey string           `json:"signing_public_key"`
+	LegacyTransport  *legacyTransport `json:"ssh,omitempty"`
+	QUICEndpoint     string           `json:"quic_endpoint"`
+	Generation       uint64           `json:"generation"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+	Revoked          bool             `json:"revoked"`
 }
 
 type Record struct {
@@ -731,10 +731,12 @@ func validatePayload(payload Payload) error {
 	if _, err := decodePublicKey(payload.SigningPublicKey); err != nil {
 		return err
 	}
-	sshEndpoint := strings.TrimSpace(payload.SSH.Endpoint)
-	sshPublicKey := strings.TrimSpace(payload.SSH.PublicKey)
-	if (sshEndpoint == "") != (sshPublicKey == "") {
-		return errors.New("membership legacy SSH transport is incomplete")
+	if payload.LegacyTransport != nil {
+		endpoint := strings.TrimSpace(payload.LegacyTransport.Endpoint)
+		publicKey := strings.TrimSpace(payload.LegacyTransport.PublicKey)
+		if (endpoint == "") != (publicKey == "") {
+			return errors.New("legacy membership transport is incomplete")
+		}
 	}
 	if !strings.HasPrefix(payload.QUICEndpoint, "quic://") {
 		return errors.New("membership QUIC transport is incomplete")

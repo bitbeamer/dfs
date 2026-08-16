@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -144,12 +143,17 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	sshMarker := filepath.Join(home, "ssh-invoked")
+	rsyncMarker := filepath.Join(home, "rsync-invoked")
 	if err := os.WriteFile(filepath.Join(fakeBin, "ssh"), []byte("#!/bin/sh\ntouch \"$DFS_SSH_MARKER\"\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "rsync"), []byte("#!/bin/sh\ntouch \"$DFS_RSYNC_MARKER\"\nexit 99\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	originalPath := os.Getenv("PATH")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+originalPath)
 	t.Setenv("DFS_SSH_MARKER", sshMarker)
+	t.Setenv("DFS_RSYNC_MARKER", rsyncMarker)
 	offlineRecord := serverRecord
 	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -178,6 +182,9 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	cancelProbe()
 	if _, err := os.Stat(sshMarker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("offline QUIC probe invoked SSH: %v", err)
+	}
+	if _, err := os.Stat(rsyncMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("offline QUIC probe invoked rsync: %v", err)
 	}
 	if err := membership.Save(clientRepo.Config.Repository, serverRecord); err != nil {
 		t.Fatal(err)
@@ -293,6 +300,9 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if _, err := os.Stat(sshMarker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("offline QUIC content fetch invoked SSH: %v", err)
 	}
+	if _, err := os.Stat(rsyncMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("offline QUIC content fetch invoked rsync: %v", err)
+	}
 }
 
 func TestLocalIPv4PrefersIPv4ForLocalHostname(t *testing.T) {
@@ -327,7 +337,6 @@ func managedTestRecord(t *testing.T, repo *repository.Repository, filesystemID, 
 	}
 	record, err := membership.Sign(membership.Payload{Version: membership.Version, FileSystemID: filesystemID,
 		PeerID: repo.Config.PeerID, Name: repo.Config.Name, Hostname: repo.Config.Hostname, Role: "admin", SigningPublicKey: public,
-		SSH:          membership.SSHTransport{Endpoint: fmt.Sprintf("ssh://user@%s.local%s", repo.Config.Hostname, repo.Config.Repository), PublicKey: "ssh-ed25519 test"},
 		QUICEndpoint: endpoint, Generation: 1, UpdatedAt: time.Now().UTC()}, key)
 	if err != nil {
 		t.Fatal(err)

@@ -19,7 +19,7 @@ func TestPrintNodeHealthIncludesOperationalDetailsAndActions(t *testing.T) {
 			CacheBytes: 600, CacheLimitBytes: 2048, RepositoryBytes: 4096, MetadataBytes: 3000,
 			PrivateStateBytes: 1000, DiskAvailableBytes: 1 << 30, DiskTotalBytes: 2 << 30,
 			Pinned: []repository.PinnedPathHealth{{Path: "Media", Scope: "cluster", Status: "hydrating", Kind: "directory", LogicalFiles: 2, LogicalBytes: 768}}},
-		Issues: []peer.HealthIssue{{Code: "SSH_FALLBACK", Severity: "warning", Detail: "fallback", Action: "open UDP"}},
+		Issues: []peer.HealthIssue{{Code: "PEER_UNREACHABLE", Severity: "warning", Detail: "offline", Action: "open UDP"}},
 	}
 	var output bytes.Buffer
 	printNodeHealth(&output, report)
@@ -86,8 +86,8 @@ func TestHealthIncludesMissingDependencyDiagnostics(t *testing.T) {
 	if err == nil || report.Healthy {
 		t.Fatalf("checkEnvironment() = %+v, %v; want degraded error", report, err)
 	}
-	if len(report.Checks) != 6 {
-		t.Fatalf("dependency checks = %d, want 6", len(report.Checks))
+	if len(report.Checks) != 2 {
+		t.Fatalf("dependency checks = %d, want 2", len(report.Checks))
 	}
 	var output bytes.Buffer
 	printEnvironmentHealth(&output, report)

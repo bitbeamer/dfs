@@ -168,7 +168,7 @@ func ApproveJoinRequest(repo *repository.Repository, id string, lifetime time.Du
 	if lifetime <= 0 || time.Now().Add(lifetime).After(record.ExpiresAt) {
 		lifetime = time.Until(record.ExpiresAt)
 	}
-	invitation, err := createInvitation(repo, lifetime, "", record.PeerID)
+	invitation, err := createInvitation(repo, lifetime, record.PeerID)
 	if err != nil {
 		return Invitation{}, err
 	}

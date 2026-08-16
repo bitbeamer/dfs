@@ -1,16 +1,11 @@
 package peer
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,19 +17,14 @@ import (
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
-const diagnosticCommand = "dfs-peer-diagnose-v2"
-
 type RemoteDiagnostic struct {
-	Name                 string `json:"name"`
-	PeerID               string `json:"peer_id,omitempty"`
-	PeerName             string `json:"peer_name,omitempty"`
-	Reachable            bool   `json:"reachable"`
-	Error                string `json:"error,omitempty"`
-	PasswordlessSSH      bool   `json:"passwordless_ssh"`
-	PasswordlessSSHError string `json:"passwordless_ssh_error,omitempty"`
-	ManagedQUIC          bool   `json:"managed_quic"`
-	ManagedQUICError     string `json:"managed_quic_error,omitempty"`
-	Transport            string `json:"transport,omitempty"`
+	Name        string `json:"name"`
+	PeerID      string `json:"peer_id,omitempty"`
+	PeerName    string `json:"peer_name,omitempty"`
+	Reachable   bool   `json:"reachable"`
+	Error       string `json:"error,omitempty"`
+	ManagedQUIC bool   `json:"managed_quic"`
+	Transport   string `json:"transport,omitempty"`
 }
 
 type DiagnosticReport struct {
@@ -171,46 +161,15 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			defer checksWait.Done()
 			member := membersByRemote[remote.Name]
 			check := RemoteDiagnostic{Name: remote.Name, PeerID: member.PeerID, PeerName: member.PeerName, Reachable: true}
-			managedResult := make(chan error, 1)
-			fallbackResult := make(chan error, 1)
-			sshResult := make(chan error, 1)
-			go func() {
-				probeCtx, cancel := context.WithTimeout(ctx, timeout)
-				defer cancel()
-				managedResult <- managed.Probe(probeCtx, repo, peerIDForRemote(repo.Config.Repository, remote.Name))
-			}()
-			go func() {
-				probeCtx, cancel := context.WithTimeout(ctx, timeout)
-				defer cancel()
-				fallbackResult <- repo.ProbeSSHFallback(probeCtx, remote.Name)
-			}()
-			go func() {
-				sshCtx, cancel := context.WithTimeout(ctx, timeout)
-				defer cancel()
-				sshURL := remote.URL
-				if fallback, fallbackErr := repo.PeerSSHFallback(sshCtx, remote.Name); fallbackErr == nil {
-					sshURL = fallback
-				}
-				sshResult <- probePasswordlessSSH(sshCtx, sshURL, timeout)
-			}()
-			managedErr := <-managedResult
-			fallbackErr := <-fallbackResult
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			managedErr := managed.Probe(probeCtx, repo, peerIDForRemote(repo.Config.Repository, remote.Name))
+			cancel()
 			if managedErr == nil {
 				check.ManagedQUIC = true
 				check.Transport = "quic"
 			} else {
-				check.ManagedQUICError = conciseError(managedErr)
-				if fallbackErr == nil {
-					check.Transport = "ssh-fallback"
-				} else {
-					check.Reachable = false
-					check.Error = "QUIC: " + conciseError(managedErr) + "; fallback: " + conciseError(fallbackErr)
-				}
-			}
-			if err := <-sshResult; err != nil {
-				check.PasswordlessSSHError = conciseError(err)
-			} else {
-				check.PasswordlessSSH = true
+				check.Reachable = false
+				check.Error = conciseError(managedErr)
 			}
 			checks[index] = check
 		}(index, remote)
@@ -222,13 +181,6 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			if !check.Reachable {
 				report.Issues = append(report.Issues, HealthIssue{Code: "PEER_UNREACHABLE", Severity: "warning",
 					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs health --cluster"})
-			} else if check.Transport == "ssh-fallback" {
-				report.Issues = append(report.Issues, HealthIssue{Code: "SSH_FALLBACK", Severity: "warning",
-					Detail: check.Name + " is reachable only through SSH fallback", Action: "check UDP reachability for the peer's managed DFS port"})
-			}
-			if check.Reachable && !check.PasswordlessSSH {
-				report.Issues = append(report.Issues, HealthIssue{Code: "PASSWORDLESS_SSH_FAILED", Severity: "error",
-					Detail: check.Name + ": " + check.PasswordlessSSHError, Action: "configure ordinary non-interactive SSH for this directed peer path"})
 			}
 		}
 	}
@@ -366,16 +318,10 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 			} else if !check.Reachable {
 				connection.Status = "FAILED"
 				connection.Error = check.Error
-			} else if !check.PasswordlessSSH {
-				connection.Status = "PASSWORDLESS_SSH_FAILED"
-				connection.Error = check.PasswordlessSSHError
-			} else if check.Transport == "ssh-fallback" {
-				connection.Status = "SSH_FALLBACK"
-				connection.Error = check.ManagedQUICError
 			} else {
 				connection.Status = "OK"
 			}
-			if connection.Status != "OK" && connection.Status != "SSH_FALLBACK" {
+			if connection.Status != "OK" {
 				result.Complete = false
 			}
 			result.Connections = append(result.Connections, connection)
@@ -427,39 +373,6 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 	return result
 }
 
-func probePasswordlessSSH(ctx context.Context, remoteURL string, timeout time.Duration) error {
-	target, port, err := sshRemote(remoteURL)
-	if err != nil {
-		return err
-	}
-	seconds := int((timeout + time.Second - 1) / time.Second)
-	if seconds < 1 {
-		seconds = 1
-	}
-	args := []string{
-		"-o", "BatchMode=yes",
-		"-o", "PasswordAuthentication=no",
-		"-o", "KbdInteractiveAuthentication=no",
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", "ConnectTimeout=" + strconv.Itoa(seconds),
-	}
-	if port != "" && port != "22" {
-		args = append(args, "-p", port)
-	}
-	args = append(args, "--", target, "true")
-	command := exec.CommandContext(ctx, "ssh", args...)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
-		}
-		return fmt.Errorf("passwordless SSH to %s failed: %s", target, message)
-	}
-	return nil
-}
-
 func pairedRemoteName(peerID string) string {
 	if len(peerID) > 12 {
 		peerID = peerID[:12]
@@ -478,58 +391,15 @@ func diagnosticFor(report DiagnosticReport, name string) (RemoteDiagnostic, bool
 
 func requestDiagnostic(ctx context.Context, repo *repository.Repository, remote repository.Remote, timeout time.Duration) (DiagnosticReport, error) {
 	peerID := peerIDForRemote(repo.Config.Repository, remote.Name)
-	if peerID != "" {
-		if data, managedErr := managed.Diagnostic(ctx, repo, peerID); managedErr == nil {
-			var report DiagnosticReport
-			if err := json.Unmarshal(data, &report); err == nil && report.Version == 2 && report.PeerID != "" && report.FileSystemID != "" {
-				return report, nil
-			}
-		}
+	if peerID == "" {
+		return DiagnosticReport{}, fmt.Errorf("membership for %s is unavailable", remote.Name)
 	}
-	sshURL := remote.URL
-	if fallback, fallbackErr := repo.PeerSSHFallback(ctx, remote.Name); fallbackErr == nil {
-		sshURL = fallback
-	}
-	target, port, err := sshRemote(sshURL)
+	data, err := managed.Diagnostic(ctx, repo, peerID)
 	if err != nil {
-		return DiagnosticReport{}, fmt.Errorf("%s: %w", remote.Name, err)
-	}
-	stateDirectory := filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory))
-	privateKey := filepath.Join(stateDirectory, transportKeyFile)
-	if _, statErr := os.Stat(privateKey); statErr != nil {
-		return DiagnosticReport{}, fmt.Errorf("paired SSH identity unavailable: %w", statErr)
-	}
-	knownHosts := filepath.Join(stateDirectory, "known_hosts")
-	if _, statErr := os.Stat(knownHosts); statErr != nil {
-		return DiagnosticReport{}, fmt.Errorf("pinned peer host keys unavailable: %w", statErr)
-	}
-	args := []string{
-		"-i", privateKey, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-		"-o", "UserKnownHostsFile=" + knownHosts, "-o", "StrictHostKeyChecking=yes",
-	}
-	seconds := int((timeout + time.Second - 1) / time.Second)
-	if seconds < 1 {
-		seconds = 1
-	}
-	args = append(args, "-o", "ConnectTimeout="+strconv.Itoa(seconds))
-	if port != "" && port != "22" {
-		args = append(args, "-p", port)
-	}
-	args = append(args, "--", target, diagnosticCommand)
-	command := exec.CommandContext(ctx, "ssh", args...)
-	command.Dir = repo.Config.Repository
-	var stdout, stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
-		}
-		return DiagnosticReport{}, errors.New(message)
+		return DiagnosticReport{}, err
 	}
 	var report DiagnosticReport
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+	if err := json.Unmarshal(data, &report); err != nil {
 		return DiagnosticReport{}, fmt.Errorf("decode diagnostic response: %w", err)
 	}
 	if report.Version != 2 || report.PeerID == "" || report.FileSystemID == "" {
@@ -548,21 +418,6 @@ func peerIDForRemote(repositoryPath, remoteName string) string {
 	return prefix
 }
 
-func sshRemote(value string) (target, port string, err error) {
-	parsed, err := url.Parse(strings.TrimSpace(value))
-	if err != nil || parsed.Scheme != "ssh" || parsed.Hostname() == "" {
-		return "", "", errors.New("paired remote is not an ssh:// URL")
-	}
-	host := parsed.Hostname()
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
-	if parsed.User != nil && parsed.User.Username() != "" {
-		host = parsed.User.Username() + "@" + host
-	}
-	return host, parsed.Port(), nil
-}
-
 func conciseError(err error) string {
 	if err == nil {
 		return ""
@@ -572,19 +427,4 @@ func conciseError(err error) string {
 		message = message[:497] + "..."
 	}
 	return message
-}
-
-func serveDiagnostic(repositoryPath string, output io.Writer) error {
-	repo, err := repository.Open(repositoryPath)
-	if err != nil {
-		return err
-	}
-	defer repo.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	report, err := Diagnose(ctx, repo, 10*time.Second)
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(output).Encode(report)
 }
