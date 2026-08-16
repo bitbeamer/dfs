@@ -3,6 +3,11 @@
 - After finishing each task, verify the task's changes and commit them with Jujutsu (`jj`) using a concise, descriptive commit message.
 - Keep unrelated user changes out of the task commit.
 - Do not leave completed task changes in the working copy unless the user explicitly asks for them to remain uncommitted.
+- Never put DFS internal state in the user-visible repository worktree or the
+  mounted logical filesystem. Peer-local private/runtime state belongs under
+  `.git/dfs`; replicated control-plane state belongs in dedicated Git metadata
+  refs. Do not use tracked worktree paths such as `.dfs/` or `.gitattributes`
+  rules as an internal-state transport.
 - After source changes that can affect mounted filesystem behavior, run
   `make test-mount MOUNTPOINT=<live-dfs-mount> PEERS='<host:remote-mount> ...'`
   on the current platform and on each available macOS/Arch peer, in addition
