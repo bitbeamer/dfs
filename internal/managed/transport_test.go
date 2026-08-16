@@ -107,9 +107,15 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build DFS helper: %v\n%s", err, output)
 	}
+	if _, err := clientRepo.AdoptClonedPeer(ctx, serverRepo.Config.PeerID); err != nil {
+		t.Fatalf("adopt cloned peer: %v", err)
+	}
 	remoteName, err := clientRepo.AddManagedRemote(ctx, serverRepo.Config.PeerID, binary, serverRecord.Payload.SSH.Endpoint)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := clientRepo.Sync(ctx, true); err != nil {
+		t.Fatalf("identify managed annex remote: %v", err)
 	}
 	if err := clientRepo.ProbeRemote(ctx, remoteName); err != nil {
 		t.Fatalf("Git metadata over managed QUIC: %v", err)
@@ -195,6 +201,20 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	materialized, err := os.ReadFile(filepath.Join(clientRepo.Config.Repository, "payload.txt"))
 	if err != nil || string(materialized) != string(payload) {
 		t.Fatalf("managed repository fetch = %q, %v", materialized, err)
+	}
+	if output, err := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "annex", "drop", "--force", "--", "payload.txt").CombinedOutput(); err != nil {
+		t.Fatalf("drop content before SSH fallback: %v\n%s", err, output)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+originalPath)
+	if err := membership.Save(clientRepo.Config.Repository, offlineRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientRepo.Fetch(ctx, "payload.txt", remoteName); err != nil {
+		t.Fatalf("repository content over SSH fallback: %v", err)
+	}
+	materialized, err = os.ReadFile(filepath.Join(clientRepo.Config.Repository, "payload.txt"))
+	if err != nil || string(materialized) != string(payload) {
+		t.Fatalf("SSH fallback repository fetch = %q, %v", materialized, err)
 	}
 }
 

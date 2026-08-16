@@ -124,7 +124,7 @@ remote_content() {
   remote_host=$1
   remote_path=$2
   remote_quoted=$(shell_quote "$remote_path")
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" \
+  run_with_timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" \
     "test -f $remote_quoted && cat -- $remote_quoted" 2>/dev/null
 }
 
@@ -132,8 +132,29 @@ remote_absent() {
   remote_host=$1
   remote_path=$2
   remote_quoted=$(shell_quote "$remote_path")
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" \
+  run_with_timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" \
     "test ! -e $remote_quoted" 2>/dev/null
+}
+
+# ConnectTimeout only covers opening SSH. A FUSE operation can hang after the
+# connection succeeds, so bound the complete remote command without relying on
+# GNU timeout, which is not installed by default on macOS.
+run_with_timeout() {
+  local timeout_seconds=$1
+  local command_pid watchdog_pid command_status
+  shift
+  "$@" &
+  command_pid=$!
+  (
+    sleep "$timeout_seconds"
+    kill -TERM "$command_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+  wait "$command_pid"
+  command_status=$?
+  kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$command_status"
 }
 
 wait_for_content() {
@@ -191,7 +212,7 @@ else
     peer_parts "$peer_spec" || fail "parse peer specification: $peer_spec"
     peer_mount=${peer_mount%/}
     remote_mount_quoted=$(shell_quote "$peer_mount")
-    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$peer_host" \
+    if ! run_with_timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$peer_host" \
       "test -d $remote_mount_quoted" 2>/dev/null; then
       fail "reach mounted peer $peer_host:$peer_mount"
     fi

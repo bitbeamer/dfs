@@ -428,22 +428,44 @@ func (r *Repository) Fetch(ctx context.Context, path, from string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	args := []string{}
-	fallbacks, _ := r.runner.Run(ctx, "git", "config", "--get-regexp", `^remote\..*\.dfs-ssh-url$`)
-	for _, line := range strings.Split(strings.TrimSpace(fallbacks), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+	var failures []string
+	remotes, _ := r.remotesLocked(ctx)
+	for _, remote := range remotes {
+		if from != "" && from != remote.Name {
 			continue
 		}
-		key := strings.TrimSuffix(fields[0], ".dfs-ssh-url") + ".url"
-		args = append(args, "-c", key+"="+strings.Join(fields[1:], " "))
+		sshURL, sshErr := r.runner.Run(ctx, "git", "config", "--get", "remote."+remote.Name+".dfs-ssh-url")
+		if sshErr != nil || strings.TrimSpace(sshURL) == "" {
+			continue
+		}
+		uuid, uuidErr := r.runner.Run(ctx, "git", "config", "--get", "remote."+remote.Name+".annex-uuid")
+		if uuidErr != nil || strings.TrimSpace(uuid) == "" {
+			continue
+		}
+		// Defining a separate remote on the command line prevents Git's
+		// multi-valued URL rules from selecting the managed ext:: URL again.
+		// It is intentionally ephemeral so sync never treats it as another peer.
+		alias := "dfs-ssh-fallback-" + strings.TrimPrefix(remote.Name, "dfs-peer-")
+		fallbackArgs := []string{
+			"-c", "remote." + alias + ".url=" + strings.TrimSpace(sshURL),
+			"-c", "remote." + alias + ".annex-uuid=" + strings.TrimSpace(uuid),
+			"annex", "get", "--from=" + alias, "--", filepath.ToSlash(path),
+		}
+		if _, err := r.runner.Run(ctx, "git", fallbackArgs...); err == nil {
+			return r.Store.Touch(path)
+		} else {
+			failures = append(failures, remote.Name+": "+err.Error())
+		}
 	}
-	args = append(args, "annex", "get")
+	args := []string{"annex", "get"}
 	if from != "" {
 		args = append(args, "--from="+from)
 	}
 	args = append(args, "--", filepath.ToSlash(path))
 	if _, err := r.runner.Run(ctx, "git", args...); err != nil {
+		if len(failures) > 0 {
+			return fmt.Errorf("SSH content fallback failed: %s; regular annex retrieval failed: %w", strings.Join(failures, "; "), err)
+		}
 		return err
 	}
 	return r.Store.Touch(path)
