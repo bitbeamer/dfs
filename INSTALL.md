@@ -5,7 +5,9 @@ DFS is experimental. Start with test data and keep an independent backup.
 ## 1. Install and build
 
 Each peer needs Go 1.26+, Git, git-annex, OpenSSH, rsync, and a FUSE
-runtime.
+runtime. DFS-managed QUIC is the primary peer transport. OpenSSH and rsync
+provide the repository-restricted compatibility fallback and are also used by
+mesh diagnostics and the cross-peer acceptance test.
 
 ### CachyOS/Arch Linux prerequisites
 
@@ -13,8 +15,8 @@ runtime.
 sudo pacman -S --needed go git git-annex openssh rsync fuse3
 ```
 
-Enable the SSH server on a peer that will receive direct connections from
-other peers:
+Enable the SSH server to make the fallback and complete mesh diagnostics
+available to other peers:
 
 ```sh
 sudo systemctl enable --now sshd
@@ -64,8 +66,9 @@ test -x /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse \
   && echo "macFUSE is installed"
 ```
 
-For direct inbound connections, enable **Remote Login** under **System Settings
-→ General → Sharing** for the DFS account.
+For inbound fallback connections and complete mesh diagnostics, enable
+**Remote Login** under **System Settings → General → Sharing** for the DFS
+account.
 
 ### Build DFS
 
@@ -91,18 +94,24 @@ make build
 ./bin/dfs doctor
 ```
 
-Do not copy `bin/dfs` over the installed binary while the daemon is running.
-Rerun the installer for the current platform. The installer stops the managed
-mount, installs the newly built binary, reloads the service definition, starts
+Do not copy `bin/dfs` over the installed binary while a daemon is running.
+Rerun the installer for the current platform. The installer stops that managed
+mount, installs the newly built binary, reloads its service definition, starts
 the mount, and waits for DFS to report healthy. Let the command finish; if it is
 interrupted after stopping the old daemon, rerun the same installer command.
+
+The installed executable is shared, but every active filesystem has its own
+service. On a host with multiple DFS filesystems, rerun the installer once for
+each repository and mountpoint. This updates every service definition and
+restarts every daemon on the new executable; updating only one instance can
+leave another active process running the old code.
 
 On CachyOS/systemd:
 
 ```sh
 cd ~/dfs
-./scripts/install-cachyos.sh \
-  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+./scripts/install-cachyos.sh --pair-port 7843 \
+  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 
 DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
 systemctl --user --no-pager --full status "dfs-mount-$DFS_INSTANCE"
@@ -113,8 +122,8 @@ On macOS/launchd:
 
 ```sh
 cd ~/dfs
-./scripts/install-macos.sh \
-  ~/.local/share/dfs/repository ~/DFS ./bin/dfs
+./scripts/install-macos.sh --pair-port 7843 \
+  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 
 DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
@@ -126,6 +135,9 @@ The installer puts the daemon in a signed `DFS.app` helper with a stable bundle
 identifier and keeps `~/Library/Application Support/DFS/bin/dfs` as a
 compatibility link. On first install, allow **DFS** under **System Settings →
 Privacy & Security → Local Network** so discovery can use `_dfs._tcp`.
+When updating, reuse each instance's existing `--pair-port`; choosing another
+port changes its advertised endpoint, and omitting the option defaults a manual
+installer invocation to 7843.
 
 Homebrew is normally added to interactive macOS shells automatically. When
 building through a non-interactive SSH command, make it explicit first:
@@ -147,23 +159,35 @@ export PATH
 directories to its own dependency search path, so diagnostics do not depend on
 interactive shell startup files.
 
-The existing peer and the new peer must be able to reach each other over managed
-QUIC and the SSH fallback. On a default-drop firewall, allow UDP 5353, both UDP
-and TCP for each filesystem instance's selected managed port, and the SSH server
-port (normally TCP 22) from the trusted LAN. The first instance normally uses
-7843; subsequent automatic setups select the next free port and print it.
+The existing peer and the new peer should be able to reach each other over
+managed QUIC and the SSH fallback. On a default-drop firewall, allow UDP 5353,
+both UDP and TCP for each filesystem instance's selected managed port, and the
+SSH server port (normally TCP 22) from the trusted LAN. The first instance
+normally uses 7843; subsequent automatic setups select the next free port and
+print it.
 
 ## 2. Create a new filesystem (first peer only)
 
-If no DFS filesystem exists yet, initialize and mount one:
+If no DFS filesystem exists yet, initialize one and install its managed mount.
+Use a unique repository and mountpoint for every logical filesystem:
 
 ```sh
 ./bin/dfs init ~/.local/share/dfs/repository \
   --name desktop --network-name "Home Files" --cache-limit 100GiB
-./bin/dfs --repo ~/.local/share/dfs/repository mount ~/DFS
+
+# CachyOS/Arch
+./scripts/install-cachyos.sh \
+  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
+
+# macOS
+./scripts/install-macos.sh \
+  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 ```
 
-Keep the mount running. It now advertises the filesystem to nearby peers. Run the next step in another terminal.
+The installer creates a filesystem-specific systemd service or launchd agent,
+starts it, and waits for the mount to become healthy. It now advertises the
+filesystem to nearby peers. `dfs setup` currently joins an existing filesystem;
+creation of the first peer is the explicit `init` plus installer flow above.
 
 ## 3. Create an invitation
 
@@ -212,6 +236,17 @@ you supplied initially. `--pair-port` selects an explicit local TCP/UDP port;
 otherwise DFS uses the first free port beginning at 7843. The
 lower-level `network join` and installer scripts remain available for debugging
 and manual deployments.
+
+To join a second active DFS filesystem on the same host, choose another
+repository and mountpoint. The new instance receives a distinct service, logs,
+health state, and managed port:
+
+```sh
+./bin/dfs setup \
+  --repository ~/.local/share/dfs/repository-archive \
+  --mountpoint ~/dfs_archive \
+  --name laptop-archive --cache-limit 25GiB
+```
 
 Verify the peer:
 
@@ -286,7 +321,8 @@ available, local filesystem checks can be run explicitly with
 skipped and must not be treated as a complete cross-peer acceptance test.
 
 Run the mesh check while all peers you expect to validate are mounted and
-advertising. It exits unsuccessfully if any discovered peer lacks a direct
-remote or any directed Git/SSH connection fails.
+advertising. Configured signed membership remains authoritative when mDNS is
+unavailable. The command exits unsuccessfully if any directed peer is missing,
+both managed transports fail, or ordinary passwordless SSH is not configured.
 
 See [README.md](README.md) for platform-specific dependencies, manual mounting, troubleshooting, and advanced configuration.
