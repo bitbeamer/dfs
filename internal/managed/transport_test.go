@@ -81,7 +81,10 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := Start(serverRepo, "127.0.0.1:0", func(context.Context) ([]byte, error) { return []byte(`{"peer":"server"}`), nil }, nil, nil)
+	received := make(chan string, 16)
+	server, err := Start(serverRepo, "127.0.0.1:0", func(context.Context) ([]byte, error) { return []byte(`{"peer":"server"}`), nil }, nil, nil, func(reason string, _ []string) {
+		received <- reason
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,9 +123,20 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if err := clientRepo.ProbeRemote(ctx, remoteName); err != nil {
 		t.Fatalf("Git metadata over managed QUIC: %v", err)
 	}
+	for len(received) > 0 {
+		<-received
+	}
 	push := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "push", remoteName, "HEAD:refs/heads/managed-quic-test")
 	if output, err := push.CombinedOutput(); err != nil {
 		t.Fatalf("push Git metadata over managed QUIC: %v\n%s", err, output)
+	}
+	select {
+	case reason := <-received:
+		if reason != "managed Git receive" {
+			t.Fatalf("managed Git receive notification = %q", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("managed Git receive did not notify the repository scheduler")
 	}
 	fakeBin := filepath.Join(home, "fake-bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
@@ -215,6 +229,30 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	materialized, err = os.ReadFile(filepath.Join(clientRepo.Config.Repository, "payload.txt"))
 	if err != nil || string(materialized) != string(payload) {
 		t.Fatalf("SSH fallback repository fetch = %q, %v", materialized, err)
+	}
+}
+
+func TestLocalIPv4PrefersIPv4ForLocalHostname(t *testing.T) {
+	lookupCalled := false
+	lookup := func(_ context.Context, network, hostname string) ([]net.IP, error) {
+		lookupCalled = true
+		if network != "ip4" || hostname != "peer.local" {
+			t.Fatalf("lookup = %q, %q", network, hostname)
+		}
+		return []net.IP{net.ParseIP("192.0.2.10")}, nil
+	}
+	if address, ok := localIPv4WithResolver(context.Background(), "Peer.Local.", lookup); !ok || address != "192.0.2.10" {
+		t.Fatalf("local IPv4 = %q, %v", address, ok)
+	}
+	if !lookupCalled {
+		t.Fatal("local hostname was not resolved")
+	}
+	lookupCalled = false
+	if address, ok := localIPv4WithResolver(context.Background(), "example.com", lookup); ok || address != "" {
+		t.Fatalf("non-local IPv4 = %q, %v", address, ok)
+	}
+	if lookupCalled {
+		t.Fatal("non-local hostname unexpectedly resolved")
 	}
 }
 

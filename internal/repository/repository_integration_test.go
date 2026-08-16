@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,69 @@ func TestSyncIsolatesUnavailableRemoteAndReleasesRepositoryLock(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(healthy.Config.Repository, "new.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("healthy remote retained deleted path: %v", err)
+	}
+}
+
+func TestDirectionalPushPublishesThroughPeerInbox(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\n\tname = DFS Test\n\temail = dfs@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	source, err := Init(ctx, filepath.Join(home, "source"), "source", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	receiver, err := Join(ctx, source.Config.Repository, filepath.Join(home, "receiver"), "receiver", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	if err := source.AddRemote(ctx, "receiver", receiver.Config.Repository); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(source.Config.Repository, "event.txt")
+	if err := os.WriteFile(path, []byte("created\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SyncDirectional(ctx, true, false, true); err != nil {
+		t.Fatal(err)
+	}
+	inbox := "refs/heads/dfs-incoming/" + source.Config.PeerID + "/main"
+	if _, err := receiver.runner.Run(ctx, "git", "rev-parse", "--verify", inbox); err != nil {
+		t.Fatalf("receiver has no sender inbox ref: %v", err)
+	}
+	inboxTree, err := receiver.runner.Run(ctx, "git", "ls-tree", "-r", "--name-only", inbox)
+	if err != nil || !strings.Contains(inboxTree, "event.txt") {
+		t.Fatalf("sender inbox tree = %q, %v", inboxTree, err)
+	}
+	if err := receiver.ApplyReceived(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(receiver.Config.Repository, "event.txt")); err != nil {
+		t.Fatalf("received inbox did not materialize file metadata: %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SyncDirectional(ctx, true, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := receiver.ApplyReceived(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(receiver.Config.Repository, "event.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("received inbox retained deleted file: %v", err)
 	}
 }
 

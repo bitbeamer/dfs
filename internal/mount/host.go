@@ -46,9 +46,13 @@ type mountpointAccess struct {
 }
 
 type nodeContentInvalidator struct {
-	paths  *pathfs.PathNodeFs
-	root   string
+	paths  entryNotifier
 	logger *slog.Logger
+}
+
+type entryNotifier interface {
+	FileNotify(path string, off int64, length int64) fuse.Status
+	EntryNotify(dir string, name string) fuse.Status
 }
 
 func (i nodeContentInvalidator) InvalidateContent(path string) {
@@ -61,25 +65,31 @@ func (i nodeContentInvalidator) InvalidateContent(path string) {
 }
 
 func (i nodeContentInvalidator) InvalidateEntry(path string) {
-	directory, name := filepath.Split(filepath.ToSlash(path))
-	directory = strings.TrimSuffix(directory, "/")
 	time.AfterFunc(10*time.Millisecond, func() {
-		status := fuse.OK
-		if _, err := os.Lstat(filepath.Join(i.root, filepath.FromSlash(path))); os.IsNotExist(err) {
-			parent, child := i.paths.Node(directory), i.paths.Node(path)
-			if parent != nil && child != nil {
-				status = i.paths.Connector().DeleteNotify(parent, child, name)
-				parent.RmChild(name)
-			} else {
-				status = i.paths.EntryNotify(directory, name)
-			}
-		} else {
-			status = i.paths.EntryNotify(directory, name)
-		}
+		// Do not mutate pathfs's internal node tree here. RmChild races active
+		// lookups on macOS and can leave a name lookup blocked indefinitely.
+		// If the changed path's parent is not represented in that tree, walk up
+		// to the nearest represented ancestor. Invalidating that child clears
+		// negative kernel lookups for the whole unknown branch.
+		status := i.invalidateEntry(path)
 		if status != fuse.OK && i.logger != nil {
 			i.logger.Warn("FUSE entry invalidation failed", "path", path, "status", status)
 		}
 	})
+}
+
+func (i nodeContentInvalidator) invalidateEntry(path string) fuse.Status {
+	path = strings.Trim(filepath.ToSlash(path), "/")
+	for path != "" {
+		directory, name := filepath.Split(path)
+		directory = strings.TrimSuffix(filepath.ToSlash(directory), "/")
+		status := i.paths.EntryNotify(directory, name)
+		if status != fuse.ENOENT || directory == "" {
+			return status
+		}
+		path = directory
+	}
+	return fuse.OK
 }
 
 const normalUnmountGrace = time.Second
@@ -146,7 +156,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
-	invalidator := nodeContentInvalidator{paths: pathNodes, root: repo.Config.Repository, logger: logger.With("component", "fuse")}
+	invalidator := nodeContentInvalidator{paths: pathNodes, logger: logger.With("component", "fuse")}
 	filesystem.cacheInvalidator = invalidator
 	scheduler.SetEntryInvalidator(invalidator)
 	mountOptions := &fuse.MountOptions{
@@ -174,7 +184,10 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
 	}
 	if !options.DisablePeerDiscovery {
-		peerService, peerErr := peer.Start(repo, logger, options.PairingPort)
+		peerService, peerErr := peer.Start(repo, logger, options.PairingPort, func(reason string, paths []string) {
+			scheduler.Invalidate(paths)
+			scheduler.Notify(reason)
+		})
 		if peerErr != nil {
 			// Multicast is unavailable on some networks. Keep the filesystem usable
 			// and leave manual SSH joining available, but make the missing onboarding

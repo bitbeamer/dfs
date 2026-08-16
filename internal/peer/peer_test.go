@@ -142,7 +142,7 @@ func TestServiceAdvertisesWithMDNS(t *testing.T) {
 	previousProvider := interfaceProvider
 	interfaceProvider = func() []*net.Interface { return []*net.Interface{loopback} }
 	defer func() { interfaceProvider = previousProvider }()
-	service, err := Start(repo, nil, -1)
+	service, err := Start(repo, nil, -1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := startService(existing, nil, listener, false)
+	service, err := startService(existing, nil, listener, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

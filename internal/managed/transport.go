@@ -2,6 +2,7 @@ package managed
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -33,6 +34,8 @@ import (
 const ALPN = "dfs-managed-v1"
 const PairALPN = "dfs-pair-v2"
 
+const managedDialTimeout = time.Second
+
 type Request struct {
 	Operation string          `json:"operation"`
 	Service   string          `json:"service,omitempty"`
@@ -52,12 +55,13 @@ type Server struct {
 	listener   *quic.Listener
 	diagnostic func(context.Context) ([]byte, error)
 	pair       func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error)
+	changed    func(string, []string)
 	stop       context.CancelFunc
 	done       chan struct{}
 	once       sync.Once
 }
 
-func Start(repo *repository.Repository, address string, diagnostic func(context.Context) ([]byte, error), pairingCertificate *tls.Certificate, pair func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error)) (*Server, error) {
+func Start(repo *repository.Repository, address string, diagnostic func(context.Context) ([]byte, error), pairingCertificate *tls.Certificate, pair func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error), changed func(string, []string)) (*Server, error) {
 	private, _, err := membership.EnsureKey(repo.Config.Repository)
 	if err != nil {
 		return nil, err
@@ -103,7 +107,7 @@ func Start(repo *repository.Repository, address string, diagnostic func(context.
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &Server{repo: repo, listener: listener, diagnostic: diagnostic, pair: pair, stop: cancel, done: make(chan struct{})}
+	server := &Server{repo: repo, listener: listener, diagnostic: diagnostic, pair: pair, changed: changed, stop: cancel, done: make(chan struct{})}
 	go server.serve(ctx)
 	return server, nil
 }
@@ -249,6 +253,10 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		writeResponse(stream, Response{Error: "unsupported Git service"})
 		return
 	}
+	var treeBefore string
+	if service == "git-receive-pack" {
+		treeBefore = worktreeTree(stream.Context(), s.repo.Config.Repository)
+	}
 	command := exec.CommandContext(stream.Context(), service, s.repo.Config.Repository)
 	command.Stdin, command.Stdout, command.Stderr = input, stream, io.Discard
 	if err := command.Start(); err != nil {
@@ -260,7 +268,54 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		_ = command.Wait()
 		return
 	}
-	_ = command.Wait()
+	if err := command.Wait(); err == nil && service == "git-receive-pack" && s.changed != nil {
+		treeAfter := worktreeTree(stream.Context(), s.repo.Config.Repository)
+		s.changed("managed Git receive", changedPaths(stream.Context(), s.repo.Config.Repository, treeBefore, treeAfter))
+	}
+}
+
+func worktreeTree(ctx context.Context, repositoryPath string) string {
+	output, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "rev-parse", "HEAD^{tree}").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func changedPaths(ctx context.Context, repositoryPath, before, after string) []string {
+	if before == "" || after == "" || before == after {
+		return nil
+	}
+	output, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "diff", "--name-only", "-z", before, after).Output()
+	if err != nil {
+		return nil
+	}
+	parts := bytes.Split(output, []byte{0})
+	paths := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) > 0 {
+			paths = append(paths, string(part))
+		}
+	}
+	return paths
+}
+
+func userVisibleRefs(ctx context.Context, repositoryPath string) []byte {
+	output, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads").Output()
+	if err != nil {
+		return nil
+	}
+	var visible []byte
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		if bytes.HasSuffix(line, []byte(" refs/heads/git-annex")) ||
+			bytes.HasSuffix(line, []byte(" refs/heads/synced/git-annex")) ||
+			bytes.HasSuffix(line, []byte(" refs/heads/dfs-membership")) {
+			continue
+		}
+		visible = append(visible, line...)
+		visible = append(visible, '\n')
+	}
+	return visible
 }
 
 func (s *Server) serveContent(stream *quic.Stream, key string) {
@@ -317,6 +372,10 @@ func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*qui
 	if err != nil || endpoint.Host == "" {
 		return nil, membership.Record{}, errors.New("invalid member QUIC endpoint")
 	}
+	address := endpoint.Host
+	if ipv4, ok := localIPv4(ctx, endpoint.Hostname()); ok {
+		address = net.JoinHostPort(ipv4, endpoint.Port())
+	}
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{clientCertificate}, MinVersion: tls.VersionTLS13,
 		NextProtos: []string{ALPN}, ServerName: target.Payload.Hostname, InsecureSkipVerify: true}
 	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -333,12 +392,30 @@ func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*qui
 		}
 		return nil
 	}
-	dialContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+	dialContext, cancel := context.WithTimeout(ctx, managedDialTimeout)
 	defer cancel()
-	connection, err := quic.DialAddr(dialContext, endpoint.Host, tlsConfig, &quic.Config{
-		HandshakeIdleTimeout: 3 * time.Second, MaxIdleTimeout: 2 * time.Minute, KeepAlivePeriod: 20 * time.Second,
+	connection, err := quic.DialAddr(dialContext, address, tlsConfig, &quic.Config{
+		HandshakeIdleTimeout: managedDialTimeout, MaxIdleTimeout: 2 * time.Minute, KeepAlivePeriod: 20 * time.Second,
 	})
 	return connection, target, err
+}
+
+func localIPv4(ctx context.Context, hostname string) (string, bool) {
+	return localIPv4WithResolver(ctx, hostname, net.DefaultResolver.LookupIP)
+}
+
+func localIPv4WithResolver(ctx context.Context, hostname string, lookup func(context.Context, string, string) ([]net.IP, error)) (string, bool) {
+	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if !strings.HasSuffix(hostname, ".local") {
+		return "", false
+	}
+	lookupContext, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	addresses, err := lookup(lookupContext, "ip4", hostname)
+	if err != nil || len(addresses) == 0 {
+		return "", false
+	}
+	return addresses[0].String(), true
 }
 
 func Open(ctx context.Context, repo *repository.Repository, peerID string, request Request) (*quic.Conn, *quic.Stream, *bufio.Reader, Response, error) {
@@ -503,11 +580,16 @@ func sshGitProxy(ctx context.Context, repo *repository.Repository, peerID, servi
 	}
 	stateDirectory := filepath.Join(repo.Config.Repository, ".git", "dfs")
 	args := []string{"-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
-		"-o", "ConnectTimeout=10", "-i", filepath.Join(stateDirectory, "peer-ssh-key"), "-o", "UserKnownHostsFile=" + filepath.Join(stateDirectory, "known_hosts")}
+		"-o", "ConnectTimeout=2", "-o", "ConnectionAttempts=1", "-i", filepath.Join(stateDirectory, "peer-ssh-key"), "-o", "UserKnownHostsFile=" + filepath.Join(stateDirectory, "known_hosts")}
 	if endpoint.Port() != "" {
 		args = append(args, "-p", endpoint.Port())
 	}
-	destination := endpoint.User.Username() + "@" + endpoint.Hostname()
+	connectHost := endpoint.Hostname()
+	if ipv4, ok := localIPv4(ctx, connectHost); ok {
+		args = append(args, "-o", "HostKeyAlias="+connectHost)
+		connectHost = ipv4
+	}
+	destination := endpoint.User.Username() + "@" + connectHost
 	args = append(args, destination, service+" "+shellQuote(endpoint.Path))
 	command := exec.CommandContext(ctx, "ssh", args...)
 	command.Stdin, command.Stdout, command.Stderr = input, output, errorOutput

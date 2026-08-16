@@ -13,6 +13,8 @@ import (
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
+const eventDebounce = 300 * time.Millisecond
+
 type Scheduler struct {
 	repo      *repository.Repository
 	interval  time.Duration
@@ -22,6 +24,9 @@ type Scheduler struct {
 	done      chan struct{}
 	once      sync.Once
 	writers   atomic.Int64
+	activeMu  sync.Mutex
+	active    string
+	cancel    context.CancelFunc
 	entries   EntryInvalidator
 	reconcile func(context.Context) error
 }
@@ -54,6 +59,15 @@ func (s *Scheduler) SetEntryInvalidator(invalidator EntryInvalidator) {
 	s.entries = invalidator
 }
 
+func (s *Scheduler) Invalidate(paths []string) {
+	if s.entries == nil {
+		return
+	}
+	for _, path := range paths {
+		s.entries.InvalidateEntry(path)
+	}
+}
+
 func (s *Scheduler) SetReconciler(reconcile func(context.Context) error) {
 	s.reconcile = reconcile
 }
@@ -65,6 +79,11 @@ func (s *Scheduler) Stop() {
 
 func (s *Scheduler) Notify(reason string) {
 	s.logger.Debug("sync requested", "reason", reason)
+	s.activeMu.Lock()
+	if s.cancel != nil && (s.active == "startup" || s.active == "periodic") {
+		s.cancel()
+	}
+	s.activeMu.Unlock()
 	select {
 	case s.events <- reason:
 	default:
@@ -73,6 +92,15 @@ func (s *Scheduler) Notify(reason string) {
 
 func (s *Scheduler) BeginWrite() {
 	writers := s.writers.Add(1)
+	// A local FUSE mutation takes priority over an outbound background pass.
+	// Canceling it releases the repository lock; EndWrite's subsequent change
+	// notification schedules a fresh pass containing the local operation.
+	// Applying a received commit and shutdown cleanup are intentionally atomic.
+	s.activeMu.Lock()
+	if s.cancel != nil && s.active != "managed Git receive" && s.active != "shutdown" {
+		s.cancel()
+	}
+	s.activeMu.Unlock()
 	s.logger.Debug("writer opened", "open_writers", writers)
 }
 
@@ -91,6 +119,7 @@ func (s *Scheduler) loop() {
 	defer ticker.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
+	pendingReason := "filesystem change"
 	for {
 		select {
 		case <-s.stop:
@@ -101,10 +130,13 @@ func (s *Scheduler) loop() {
 			s.logger.Info("sync scheduler stopped")
 			return
 		case <-ticker.C:
-			s.sync("periodic")
-		case <-s.events:
+			if debounceC == nil {
+				s.sync("periodic")
+			}
+		case reason := <-s.events:
+			pendingReason = reason
 			if debounce == nil {
-				debounce = time.NewTimer(1500 * time.Millisecond)
+				debounce = time.NewTimer(eventDebounce)
 			} else {
 				if !debounce.Stop() {
 					select {
@@ -112,12 +144,12 @@ func (s *Scheduler) loop() {
 					default:
 					}
 				}
-				debounce.Reset(1500 * time.Millisecond)
+				debounce.Reset(eventDebounce)
 			}
 			debounceC = debounce.C
 		case <-debounceC:
 			debounceC = nil
-			s.sync("filesystem change")
+			s.sync(pendingReason)
 		}
 	}
 }
@@ -131,10 +163,36 @@ func (s *Scheduler) sync(reason string) {
 	started := time.Now()
 	s.logger.Info("automatic sync started", "reason", reason)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+	s.activeMu.Lock()
+	s.active = reason
+	s.cancel = cancel
+	s.activeMu.Unlock()
+	defer func() {
+		cancel()
+		s.activeMu.Lock()
+		s.active = ""
+		s.cancel = nil
+		s.activeMu.Unlock()
+	}()
 	degradedRemotes := make(map[string]error)
-	passes, changedPaths, err := syncUntilConverged(ctx, 4, 2, s.repo.TreeID, s.repo.ChangedPaths, func(ctx context.Context) error {
-		err := s.repo.Sync(ctx, true)
+	maxPasses, stablePasses := 1, 0
+	maintenance := reason == "startup" || reason == "periodic" || reason == "shutdown"
+	if maintenance {
+		maxPasses, stablePasses = 4, 1
+	}
+	passes, _, err := syncUntilConverged(ctx, maxPasses, stablePasses, s.repo.TreeID, s.repo.ChangedPaths, func(ctx context.Context) error {
+		var err error
+		switch reason {
+		case "managed Git receive":
+			err = s.repo.ApplyReceived(ctx)
+		case "startup", "periodic", "shutdown":
+			err = s.repo.Sync(ctx, true)
+		default:
+			err = s.repo.SyncDirectional(ctx, true, false, true)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		var degraded *repository.RemoteSyncError
 		if errors.As(err, &degraded) {
 			for _, failure := range degraded.Failures {
@@ -143,13 +201,18 @@ func (s *Scheduler) sync(reason string) {
 			return nil
 		}
 		return err
-	})
-	if s.entries != nil {
-		for _, path := range changedPaths {
-			s.entries.InvalidateEntry(path)
+	}, func(paths []string) {
+		if s.entries != nil {
+			for _, path := range paths {
+				s.entries.InvalidateEntry(path)
+			}
 		}
-	}
+	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.logger.Info("automatic sync preempted", "reason", reason, "duration", time.Since(started))
+			return
+		}
 		s.logger.Error("automatic sync failed", "reason", reason, "duration", time.Since(started), "error", err)
 		return
 	}
@@ -163,11 +226,21 @@ func (s *Scheduler) sync(reason string) {
 			s.logger.Warn("remote synchronization deferred", "remote", remote, "error", degradedRemotes[remote])
 		}
 	}
-	if s.reconcile != nil {
+	if maintenance && s.reconcile != nil {
 		if err := s.reconcile(ctx); err != nil {
 			s.logger.Error("membership reconciliation failed", "error", err)
 			return
 		}
+	}
+	if !maintenance {
+		s.logger.Info("automatic sync completed",
+			"reason", reason,
+			"duration", time.Since(started),
+			"convergence_passes", passes,
+			"pins_refreshed", 0,
+			"files_evicted", 0,
+		)
+		return
 	}
 	pins, err := s.repo.Store.Pins()
 	if err != nil {
@@ -201,8 +274,9 @@ func syncUntilConverged(
 	treeID func(context.Context) (string, error),
 	changedPaths func(context.Context, string, string) ([]string, error),
 	syncPass func(context.Context) error,
+	onChanged func([]string),
 ) (int, []string, error) {
-	if maxPasses < 1 || stablePasses < 1 {
+	if maxPasses < 1 || stablePasses < 0 {
 		return 0, nil, fmt.Errorf("invalid convergence limits: max=%d stable=%d", maxPasses, stablePasses)
 	}
 	previous, err := treeID(ctx)
@@ -236,9 +310,15 @@ func syncUntilConverged(
 					changedList = append(changedList, path)
 				}
 			}
+			if onChanged != nil && len(paths) > 0 {
+				onChanged(paths)
+			}
 		}
 		if syncErr != nil {
 			return pass, changedList, syncErr
+		}
+		if stablePasses == 0 {
+			return pass, changedList, nil
 		}
 		if current == previous {
 			stable++

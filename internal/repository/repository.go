@@ -23,7 +23,7 @@ import (
 const RelayRemote = "dfs-relay"
 
 const (
-	remoteProbeTimeout = 15 * time.Second
+	remoteProbeTimeout = 5 * time.Second
 	remoteRetryDelay   = time.Minute
 	remoteSyncTimeout  = 20 * time.Second
 	remoteSyncAttempts = 2
@@ -36,6 +36,7 @@ type Repository struct {
 	mu             sync.Mutex
 	syncStateMu    sync.Mutex
 	remoteRetry    map[string]remoteRetry
+	remoteChecked  map[string]bool
 	managedFetcher func(context.Context, *Repository, string, string) error
 }
 
@@ -177,7 +178,7 @@ func Open(path string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}, remoteRetry: make(map[string]remoteRetry)}, nil
+	return &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}, remoteRetry: make(map[string]remoteRetry), remoteChecked: make(map[string]bool)}, nil
 }
 
 func (r *Repository) Close() error { return r.Store.Close() }
@@ -373,6 +374,32 @@ func (r *Repository) repairLegacyPrivateStateLocked(ctx context.Context) error {
 }
 
 func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
+	return r.SyncDirectional(ctx, metadataOnly, true, true)
+}
+
+// ApplyReceived merges refs already delivered by a peer into the checked-out
+// worktree. It deliberately performs no network I/O: the peer's receive-pack
+// has completed, and unrelated or offline peers must not delay visibility.
+func (r *Repository) ApplyReceived(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	refs, err := r.runner.Run(ctx, "git", "for-each-ref", "--format=%(refname)", "refs/heads/dfs-incoming", "refs/heads/synced/main")
+	if err != nil {
+		return err
+	}
+	for _, ref := range strings.Fields(refs) {
+		if _, err := r.runner.Run(ctx, "git", "-c", "merge.renames=false", "merge", "--no-edit", ref); err != nil {
+			return err
+		}
+	}
+	_, err = r.runner.Run(ctx, "git", "-c", "merge.renames=false", "annex", "sync", "--no-content", "--no-pull", "--no-push")
+	return err
+}
+
+// SyncDirectional exchanges metadata in only the directions needed by an
+// event-driven pass. Periodic synchronization should use Sync so it performs
+// a full bidirectional convergence pass.
+func (r *Repository) SyncDirectional(ctx context.Context, metadataOnly, pull, push bool) error {
 	if err := config.ValidateHostname(r.Config); err != nil {
 		return err
 	}
@@ -393,6 +420,12 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 	if metadataOnly {
 		args = append(args, "--no-content")
 	}
+	if !pull {
+		args = append(args, "--no-pull")
+	}
+	if !push {
+		args = append(args, "--no-push")
+	}
 	if len(remotes) == 0 {
 		r.mu.Lock()
 		_, err := r.runner.Run(ctx, "git", args...)
@@ -411,8 +444,17 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 	results := make(chan probeResult, len(remotes))
 	now := time.Now()
 	for _, remote := range remotes {
-		if retry, waiting := r.remoteRetryState(remote.Name, now); waiting {
+		retry, waiting := r.remoteRetryState(remote.Name, now)
+		if waiting || ((!pull || !push) && retry.err != "") {
 			results <- probeResult{remote: remote, err: fmt.Errorf("retry after %s following: %s", retry.until.Format(time.RFC3339), retry.err), deferred: true}
+			continue
+		}
+		// Startup and periodic passes probe every remote to establish and refresh
+		// availability. Latency-critical directional passes reuse that state: the
+		// Git exchange itself is already a connectivity check, so a preceding
+		// ls-remote would add a redundant network round trip in each direction.
+		if (!pull || !push) && r.remoteWasChecked(remote.Name) {
+			results <- probeResult{remote: remote}
 			continue
 		}
 		go func(remote Remote) {
@@ -424,8 +466,12 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 	}
 
 	var failures []RemoteSyncFailure
+	var available []Remote
 	for range remotes {
 		result := <-results
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if result.err != nil {
 			if !result.deferred {
 				r.recordRemoteFailure(result.remote.Name, result.err)
@@ -434,24 +480,53 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 			continue
 		}
 		r.clearRemoteFailure(result.remote.Name)
-		remoteArgs := append(append([]string(nil), args...), result.remote.Name)
-		var syncErr error
-		for attempt := 0; attempt < remoteSyncAttempts; attempt++ {
-			syncCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
-			r.mu.Lock()
-			_, syncErr = r.runner.Run(syncCtx, "git", remoteArgs...)
-			r.mu.Unlock()
-			cancel()
-			if syncErr == nil {
-				break
+		available = append(available, result.remote)
+	}
+
+	// Local filesystem events only need to publish the committed worktree. Give
+	// every sender its own inbox ref on each receiver and push those refs in
+	// parallel. This avoids both shared-ref races and git-annex sync's per-peer
+	// bookkeeping on the latency-critical path. Periodic passes reconcile the
+	// full annex metadata graph.
+	if !pull && push && len(available) > 0 {
+		pushResults := make(chan RemoteSyncFailure, len(available))
+		inbox := fmt.Sprintf("refs/heads/dfs-incoming/%s/main", r.Config.PeerID)
+		for _, remote := range available {
+			go func(remote Remote) {
+				pushCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
+				defer cancel()
+				_, pushErr := r.runner.Run(pushCtx, "git", "push", "--porcelain", remote.Name, "refs/heads/main:"+inbox)
+				pushResults <- RemoteSyncFailure{Remote: remote.Name, Err: pushErr}
+			}(remote)
+		}
+		for range available {
+			result := <-pushResults
+			if result.Err != nil {
+				failures = append(failures, result)
 			}
 		}
-		if syncErr != nil {
+	} else {
+		for _, remote := range available {
+			remoteArgs := append(append([]string(nil), args...), remote.Name)
+			var syncErr error
+			for attempt := 0; attempt < remoteSyncAttempts; attempt++ {
+				syncCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
+				r.mu.Lock()
+				_, syncErr = r.runner.Run(syncCtx, "git", remoteArgs...)
+				r.mu.Unlock()
+				cancel()
+				if syncErr == nil {
+					break
+				}
+			}
+			if syncErr == nil {
+				continue
+			}
 			// The probe established that this peer is reachable. A concurrent
 			// bidirectional sync can still cause a transient Git lock or push
 			// race, so let the convergence loop retry it instead of imposing the
 			// unavailable-peer backoff.
-			failures = append(failures, RemoteSyncFailure{Remote: result.remote.Name, Err: syncErr})
+			failures = append(failures, RemoteSyncFailure{Remote: remote.Name, Err: syncErr})
 		}
 	}
 	if len(failures) > 0 {
@@ -474,13 +549,27 @@ func (r *Repository) recordRemoteFailure(name string, err error) {
 	if r.remoteRetry == nil {
 		r.remoteRetry = make(map[string]remoteRetry)
 	}
+	if r.remoteChecked == nil {
+		r.remoteChecked = make(map[string]bool)
+	}
+	r.remoteChecked[name] = true
 	r.remoteRetry[name] = remoteRetry{until: time.Now().Add(remoteRetryDelay), err: err.Error()}
 }
 
 func (r *Repository) clearRemoteFailure(name string) {
 	r.syncStateMu.Lock()
 	defer r.syncStateMu.Unlock()
+	if r.remoteChecked == nil {
+		r.remoteChecked = make(map[string]bool)
+	}
+	r.remoteChecked[name] = true
 	delete(r.remoteRetry, name)
+}
+
+func (r *Repository) remoteWasChecked(name string) bool {
+	r.syncStateMu.Lock()
+	defer r.syncStateMu.Unlock()
+	return r.remoteChecked[name]
 }
 
 // TreeID returns the current worktree snapshot recorded by HEAD. Comparing

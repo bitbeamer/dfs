@@ -114,6 +114,13 @@ func (f *FileSystem) hydrate(name string) error {
 	path := clean(name)
 	started := time.Now()
 	f.logger.Info("content hydration started", "path", path)
+	// Interactive reads take priority over outbound and maintenance syncs. The
+	// repository lock protects git-annex, while BeginWrite asks the scheduler to
+	// release that lock before Fetch waits for it.
+	if f.notifier != nil {
+		f.notifier.BeginWrite()
+		defer f.notifier.EndWrite()
+	}
 	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 24*time.Hour)
 	defer cancel()
 	err := f.repo.Fetch(ctx, path, "")
@@ -161,6 +168,10 @@ func status(err error) fuse.Status {
 }
 
 func (f *FileSystem) mutateWorkTree(operation func() fuse.Status) fuse.Status {
+	if f.notifier != nil {
+		f.notifier.BeginWrite()
+		defer f.notifier.EndWrite()
+	}
 	code := fuse.EIO
 	if err := f.repo.WithWorkTreeLock(func() error {
 		code = operation()

@@ -9,7 +9,67 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
+
+type entryNotifyCall struct {
+	directory string
+	name      string
+}
+
+type recordingEntryNotifier struct {
+	statuses []fuse.Status
+	calls    []entryNotifyCall
+}
+
+func (n *recordingEntryNotifier) FileNotify(string, int64, int64) fuse.Status {
+	return fuse.OK
+}
+
+func (n *recordingEntryNotifier) EntryNotify(directory, name string) fuse.Status {
+	n.calls = append(n.calls, entryNotifyCall{directory: directory, name: name})
+	if len(n.statuses) == 0 {
+		return fuse.OK
+	}
+	status := n.statuses[0]
+	n.statuses = n.statuses[1:]
+	return status
+}
+
+func TestInvalidateEntryWalksToKnownAncestor(t *testing.T) {
+	notifier := &recordingEntryNotifier{statuses: []fuse.Status{fuse.ENOENT, fuse.ENOENT, fuse.OK}}
+	invalidator := nodeContentInvalidator{paths: notifier}
+
+	if status := invalidator.invalidateEntry("suite/case/file.txt"); status != fuse.OK {
+		t.Fatalf("invalidateEntry() = %v, want OK", status)
+	}
+	want := []entryNotifyCall{
+		{directory: "suite/case", name: "file.txt"},
+		{directory: "suite", name: "case"},
+		{directory: "", name: "suite"},
+	}
+	if len(notifier.calls) != len(want) {
+		t.Fatalf("EntryNotify calls = %#v, want %#v", notifier.calls, want)
+	}
+	for index := range want {
+		if notifier.calls[index] != want[index] {
+			t.Fatalf("EntryNotify calls = %#v, want %#v", notifier.calls, want)
+		}
+	}
+}
+
+func TestInvalidateEntryStopsOnNonMissingFailure(t *testing.T) {
+	notifier := &recordingEntryNotifier{statuses: []fuse.Status{fuse.EIO}}
+	invalidator := nodeContentInvalidator{paths: notifier}
+
+	if status := invalidator.invalidateEntry("suite/case/file.txt"); status != fuse.EIO {
+		t.Fatalf("invalidateEntry() = %v, want EIO", status)
+	}
+	if len(notifier.calls) != 1 {
+		t.Fatalf("EntryNotify call count = %d, want 1", len(notifier.calls))
+	}
+}
 
 type failingUnmountServer struct{ err error }
 

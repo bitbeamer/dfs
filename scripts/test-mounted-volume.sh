@@ -72,6 +72,19 @@ host=$(printf '%s' "$host" | tr -cd 'A-Za-z0-9_-')
 test_root="$mountpoint/.dfs-mount-test-${host:-unknown}-$$-$(date +%s)"
 tests=0
 skipped=0
+# macOS limits Unix socket paths to 103 bytes and its default TMPDIR is long.
+# Keep this deliberately beneath /tmp so OpenSSH's hashed control name fits.
+ssh_control_dir=$(mktemp -d "/tmp/dfs-ssh.XXXXXX") || {
+  printf 'Could not create SSH control directory.\n' >&2
+  exit 2
+}
+ssh_options=(
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ControlMaster=auto
+  -o ControlPersist=15
+  -o "ControlPath=$ssh_control_dir/%C"
+)
 
 cleanup() {
   case "$test_root" in
@@ -85,6 +98,7 @@ cleanup() {
       printf 'Refusing unsafe cleanup path: %s\n' "$test_root" >&2
       ;;
   esac
+  rm -rf -- "$ssh_control_dir"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -123,17 +137,31 @@ peer_parts() {
 remote_content() {
   remote_host=$1
   remote_path=$2
+  command_timeout=${3:-10}
   remote_quoted=$(shell_quote "$remote_path")
-  run_with_timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" \
-    "test -f $remote_quoted && cat -- $remote_quoted" 2>/dev/null
+  remote_directory_quoted=$(shell_quote "$(dirname "$remote_path")")
+  run_with_timeout "$command_timeout" ssh "${ssh_options[@]}" "$remote_host" \
+    "ls -1A $remote_directory_quoted >/dev/null && test -f $remote_quoted && cat -- $remote_quoted" 2>/dev/null
+}
+
+remote_entry_exists() {
+  remote_host=$1
+  remote_path=$2
+  command_timeout=${3:-2}
+  remote_directory_quoted=$(shell_quote "$(dirname "$remote_path")")
+  remote_name_quoted=$(shell_quote "$(basename "$remote_path")")
+  run_with_timeout "$command_timeout" ssh "${ssh_options[@]}" "$remote_host" \
+    "ls -1A $remote_directory_quoted 2>/dev/null | grep -F -x -- $remote_name_quoted >/dev/null" 2>/dev/null
 }
 
 remote_absent() {
   remote_host=$1
   remote_path=$2
+  command_timeout=${3:-10}
   remote_quoted=$(shell_quote "$remote_path")
-  run_with_timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote_host" \
-    "test ! -e $remote_quoted" 2>/dev/null
+  remote_directory_quoted=$(shell_quote "$(dirname "$remote_path")")
+  run_with_timeout "$command_timeout" ssh "${ssh_options[@]}" "$remote_host" \
+    "ls -1A $remote_directory_quoted >/dev/null 2>&1 || true; test ! -e $remote_quoted" 2>/dev/null
 }
 
 # ConnectTimeout only covers opening SSH. A FUSE operation can hang after the
@@ -141,19 +169,20 @@ remote_absent() {
 # GNU timeout, which is not installed by default on macOS.
 run_with_timeout() {
   local timeout_seconds=$1
-  local command_pid watchdog_pid command_status
+  local command_pid command_status started
   shift
   "$@" &
   command_pid=$!
-  (
-    sleep "$timeout_seconds"
-    kill -TERM "$command_pid" 2>/dev/null || true
-  ) &
-  watchdog_pid=$!
+  started=$SECONDS
+  while kill -0 "$command_pid" 2>/dev/null; do
+    if (( SECONDS - started >= timeout_seconds )); then
+      kill -TERM "$command_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.1
+  done
   wait "$command_pid"
   command_status=$?
-  kill -TERM "$watchdog_pid" 2>/dev/null || true
-  wait "$watchdog_pid" 2>/dev/null || true
   return "$command_status"
 }
 
@@ -164,8 +193,15 @@ wait_for_content() {
   expected=$4
   started=$(date +%s)
   deadline=$((started + sync_timeout))
-  while [[ $(date +%s) -le $deadline ]]; do
-    actual=$(remote_content "$remote_host" "$remote_path")
+  while (( $(date +%s) < deadline )); do
+    remaining=$((deadline - $(date +%s)))
+    if ! remote_entry_exists "$remote_host" "$remote_path" 2; then
+      sleep 1
+      continue
+    fi
+    remaining=$((deadline - $(date +%s)))
+    (( remaining > 0 )) || break
+    actual=$(remote_content "$remote_host" "$remote_path" "$remaining")
     if [[ $? -eq 0 && "$actual" == "$expected" ]]; then
       elapsed=$(($(date +%s) - started))
       pass "$description on $remote_host (${elapsed}s)"
@@ -182,8 +218,10 @@ wait_for_absence() {
   remote_path=$3
   started=$(date +%s)
   deadline=$((started + sync_timeout))
-  while [[ $(date +%s) -le $deadline ]]; do
-    if remote_absent "$remote_host" "$remote_path"; then
+  while (( $(date +%s) < deadline )); do
+    remaining=$((deadline - $(date +%s)))
+    (( remaining > 5 )) && remaining=5
+    if remote_absent "$remote_host" "$remote_path" "$remaining"; then
       elapsed=$(($(date +%s) - started))
       pass "$description on $remote_host (${elapsed}s)"
       return 0
@@ -212,7 +250,7 @@ else
     peer_parts "$peer_spec" || fail "parse peer specification: $peer_spec"
     peer_mount=${peer_mount%/}
     remote_mount_quoted=$(shell_quote "$peer_mount")
-    if ! run_with_timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$peer_host" \
+    if ! run_with_timeout 10 ssh "${ssh_options[@]}" "$peer_host" \
       "test -d $remote_mount_quoted" 2>/dev/null; then
       fail "reach mounted peer $peer_host:$peer_mount"
     fi

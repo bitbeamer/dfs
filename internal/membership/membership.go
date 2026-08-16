@@ -323,12 +323,14 @@ func Trust(repositoryPath, peerID, signingPublicKey string) error {
 			return err
 		}
 	}
-	if existing := trusted[peerID]; existing != "" && signingPublicKey != "" && existing != signingPublicKey {
+	existing, found := trusted[peerID]
+	if existing != "" && signingPublicKey != "" && existing != signingPublicKey {
 		return errors.New("membership signing key does not match the trusted key")
 	}
-	if trusted[peerID] == "" || signingPublicKey != "" {
-		trusted[peerID] = signingPublicKey
+	if found && (signingPublicKey == "" || existing == signingPublicKey) {
+		return nil
 	}
+	trusted[peerID] = signingPublicKey
 	data, err := json.MarshalIndent(trusted, "", "  ")
 	if err != nil {
 		return err
@@ -338,15 +340,7 @@ func Trust(repositoryPath, peerID, signingPublicKey string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	temporary := path + ".new"
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
-		return err
-	}
-	return nil
+	return replacePrivateFile(path, data)
 }
 
 func LoadTrusted(repositoryPath string) (map[string]string, error) {
@@ -417,11 +411,17 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 	if err != nil {
 		return nil, err
 	}
+	revocationsChanged := false
 	for id := range revoked {
-		persistedRevoked[id] = true
+		if !persistedRevoked[id] {
+			persistedRevoked[id] = true
+			revocationsChanged = true
+		}
 	}
-	if err := saveRevoked(repositoryPath, persistedRevoked); err != nil {
-		return nil, err
+	if revocationsChanged {
+		if err := saveRevoked(repositoryPath, persistedRevoked); err != nil {
+			return nil, err
+		}
 	}
 	revoked = persistedRevoked
 	var accepted []Record
@@ -462,11 +462,17 @@ func AcceptedRevocations(repositoryPath, filesystemID string) (map[string]bool, 
 	if err != nil {
 		return nil, err
 	}
+	changed := false
 	for id := range revoked {
-		persisted[id] = true
+		if !persisted[id] {
+			persisted[id] = true
+			changed = true
+		}
 	}
-	if err := saveRevoked(repositoryPath, persisted); err != nil {
-		return nil, err
+	if changed {
+		if err := saveRevoked(repositoryPath, persisted); err != nil {
+			return nil, err
+		}
 	}
 	return persisted, nil
 }
@@ -546,15 +552,28 @@ func saveRevoked(repositoryPath string, revoked map[string]bool) error {
 		return err
 	}
 	data = append(data, '\n')
-	temporary := path + ".new"
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+	return replacePrivateFile(path, data)
+}
+
+func replacePrivateFile(path string, data []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.new")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	return nil
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func decodePublicKey(value string) (ed25519.PublicKey, error) {

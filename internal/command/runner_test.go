@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -36,5 +38,20 @@ func TestRunnerCancellationDoesNotWaitForChildProcessPipes(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("cancelled command waited for descendant pipes for %s", elapsed)
+	}
+}
+
+func TestRunnerCancellationAllowsTransactionalCleanup(t *testing.T) {
+	directory := t.TempDir()
+	lock := filepath.Join(directory, "index.lock")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := (Runner{Directory: directory}).Run(ctx, "sh", "-c",
+		"trap 'rm -f index.lock; exit 143' TERM; touch index.lock; while :; do sleep 1; done")
+	if err == nil {
+		t.Fatal("cancelled command unexpectedly succeeded")
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("transaction lock remains after cancellation: %v", err)
 	}
 }

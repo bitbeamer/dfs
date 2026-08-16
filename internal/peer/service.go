@@ -66,7 +66,7 @@ type attemptWindow struct {
 	Count   int
 }
 
-func Start(repo *repository.Repository, logger *slog.Logger, port int) (*Service, error) {
+func Start(repo *repository.Repository, logger *slog.Logger, port int, changed func(string, []string)) (*Service, error) {
 	if port == 0 {
 		port = DefaultPairingPort
 	} else if port < 0 {
@@ -76,14 +76,14 @@ func Start(repo *repository.Repository, logger *slog.Logger, port int) (*Service
 	if err != nil {
 		return nil, fmt.Errorf("listen for DFS pairing on TCP port %d: %w", port, err)
 	}
-	service, err := startService(repo, logger, listener, true)
+	service, err := startService(repo, logger, listener, true, changed)
 	if err != nil {
 		_ = listener.Close()
 	}
 	return service, err
 }
 
-func startService(repo *repository.Repository, logger *slog.Logger, listener net.Listener, advertise bool) (*Service, error) {
+func startService(repo *repository.Repository, logger *slog.Logger, listener net.Listener, advertise bool, changed func(string, []string)) (*Service, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -169,7 +169,7 @@ func startService(repo *repository.Repository, logger *slog.Logger, listener net
 			return nil, err
 		}
 		return json.Marshal(report)
-	}, &certificate, pairHandler)
+	}, &certificate, pairHandler, changed)
 	if err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("start DFS managed QUIC transport: %w", err)
