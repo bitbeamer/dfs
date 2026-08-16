@@ -407,17 +407,21 @@ dfs --repo ~/.local/share/dfs/repository storage enable archive
 ## Filesystem semantics
 
 Writable opens use private copy-on-write files under `.git/dfs/staging`. DFS
-publishes a verified transaction only after the final writable handle flushes
-or closes. `fsync` durably checkpoints a transaction without ending the open
+publishes a verified transaction only after the final writable handle closes.
+`flush` preserves the transaction until that close because macOS may share one
+FUSE handle across multiple application descriptors. `fsync` durably checkpoints
+a transaction without ending the open
 handle; later writes may advance it. A no-op writable open produces no commit.
 Advisory locks, atomic rename-overwrite, open-then-unlink, and renaming an open
 writer follow POSIX behavior supported by FUSE.
 
 Automatic metadata synchronization runs after completed transactions and every
-30 seconds. Peers can commit while disconnected. On reconnect, deterministic
-`.variant-*` paths retain competing contents, including edit/edit,
-move/rename, and modify/delete cases; repeated synchronization converges on the
-same Git tree.
+30 seconds. Each remote is probed and synchronized independently; an unavailable
+peer enters a bounded retry backoff without holding the repository lock or
+blocking synchronization and content hydration through healthy peers. Peers can
+commit while disconnected. On reconnect, deterministic `.variant-*` paths
+retain competing contents, including edit/edit, move/rename, and modify/delete
+cases; repeated synchronization converges on the same Git tree.
 
 ## Architecture and state boundaries
 

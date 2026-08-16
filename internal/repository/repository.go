@@ -22,12 +22,47 @@ import (
 
 const RelayRemote = "dfs-relay"
 
+const (
+	remoteProbeTimeout = 15 * time.Second
+	remoteRetryDelay   = time.Minute
+	remoteSyncTimeout  = 20 * time.Second
+	remoteSyncAttempts = 2
+)
+
 type Repository struct {
 	Config         config.Config
 	Store          *store.Store
 	runner         command.Runner
 	mu             sync.Mutex
+	syncStateMu    sync.Mutex
+	remoteRetry    map[string]remoteRetry
 	managedFetcher func(context.Context, *Repository, string, string) error
+}
+
+type remoteRetry struct {
+	until time.Time
+	err   string
+}
+
+type RemoteSyncFailure struct {
+	Remote string
+	Err    error
+}
+
+// RemoteSyncError reports peers that could not be synchronized after every
+// reachable remote was still processed. Callers responsible for background
+// maintenance may treat it as a degraded result rather than a failed local
+// transaction.
+type RemoteSyncError struct {
+	Failures []RemoteSyncFailure
+}
+
+func (e *RemoteSyncError) Error() string {
+	parts := make([]string, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		parts = append(parts, failure.Remote+": "+failure.Err.Error())
+	}
+	return "unavailable DFS remotes: " + strings.Join(parts, "; ")
 }
 
 type Remote struct {
@@ -142,7 +177,7 @@ func Open(path string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}}, nil
+	return &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}, remoteRetry: make(map[string]remoteRetry)}, nil
 }
 
 func (r *Repository) Close() error { return r.Store.Close() }
@@ -342,8 +377,13 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, err := r.commitPendingLocked(ctx, "Synchronize local changes"); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	remotes, err := r.remotesLocked(ctx)
+	r.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	// A DFS move is committed as an add/delete pair. Disable Git's heuristic
@@ -353,8 +393,94 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 	if metadataOnly {
 		args = append(args, "--no-content")
 	}
-	_, err := r.runner.Run(ctx, "git", args...)
-	return err
+	if len(remotes) == 0 {
+		r.mu.Lock()
+		_, err := r.runner.Run(ctx, "git", args...)
+		r.mu.Unlock()
+		return err
+	}
+
+	// Probe remotes concurrently without holding the worktree lock. A dead peer
+	// must not prevent a healthy peer from exchanging metadata, nor may its
+	// network timeout block FUSE hydration and writes that need the same lock.
+	type probeResult struct {
+		remote   Remote
+		err      error
+		deferred bool
+	}
+	results := make(chan probeResult, len(remotes))
+	now := time.Now()
+	for _, remote := range remotes {
+		if retry, waiting := r.remoteRetryState(remote.Name, now); waiting {
+			results <- probeResult{remote: remote, err: fmt.Errorf("retry after %s following: %s", retry.until.Format(time.RFC3339), retry.err), deferred: true}
+			continue
+		}
+		go func(remote Remote) {
+			probeCtx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
+			defer cancel()
+			_, probeErr := r.runner.Run(probeCtx, "git", "ls-remote", "--heads", remote.Name)
+			results <- probeResult{remote: remote, err: probeErr}
+		}(remote)
+	}
+
+	var failures []RemoteSyncFailure
+	for range remotes {
+		result := <-results
+		if result.err != nil {
+			if !result.deferred {
+				r.recordRemoteFailure(result.remote.Name, result.err)
+			}
+			failures = append(failures, RemoteSyncFailure{Remote: result.remote.Name, Err: result.err})
+			continue
+		}
+		r.clearRemoteFailure(result.remote.Name)
+		remoteArgs := append(append([]string(nil), args...), result.remote.Name)
+		var syncErr error
+		for attempt := 0; attempt < remoteSyncAttempts; attempt++ {
+			syncCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
+			r.mu.Lock()
+			_, syncErr = r.runner.Run(syncCtx, "git", remoteArgs...)
+			r.mu.Unlock()
+			cancel()
+			if syncErr == nil {
+				break
+			}
+		}
+		if syncErr != nil {
+			// The probe established that this peer is reachable. A concurrent
+			// bidirectional sync can still cause a transient Git lock or push
+			// race, so let the convergence loop retry it instead of imposing the
+			// unavailable-peer backoff.
+			failures = append(failures, RemoteSyncFailure{Remote: result.remote.Name, Err: syncErr})
+		}
+	}
+	if len(failures) > 0 {
+		sort.Slice(failures, func(i, j int) bool { return failures[i].Remote < failures[j].Remote })
+		return &RemoteSyncError{Failures: failures}
+	}
+	return nil
+}
+
+func (r *Repository) remoteRetryState(name string, now time.Time) (remoteRetry, bool) {
+	r.syncStateMu.Lock()
+	defer r.syncStateMu.Unlock()
+	retry, found := r.remoteRetry[name]
+	return retry, found && now.Before(retry.until)
+}
+
+func (r *Repository) recordRemoteFailure(name string, err error) {
+	r.syncStateMu.Lock()
+	defer r.syncStateMu.Unlock()
+	if r.remoteRetry == nil {
+		r.remoteRetry = make(map[string]remoteRetry)
+	}
+	r.remoteRetry[name] = remoteRetry{until: time.Now().Add(remoteRetryDelay), err: err.Error()}
+}
+
+func (r *Repository) clearRemoteFailure(name string) {
+	r.syncStateMu.Lock()
+	defer r.syncStateMu.Unlock()
+	delete(r.remoteRetry, name)
 }
 
 // TreeID returns the current worktree snapshot recorded by HEAD. Comparing

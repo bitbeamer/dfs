@@ -314,11 +314,16 @@ func (f *FileSystem) publishTransaction(transaction *writeTransaction) error {
 	}
 	signature := fmt.Sprintf("%x", hash.Sum(nil))
 	destination := f.full(transaction.path)
-	if err := os.Rename(transaction.stagingPath, destination); err != nil {
+	if err := f.repo.WithWorkTreeLock(func() error {
+		if err := os.Rename(transaction.stagingPath, destination); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(destination)); err != nil {
+			return fmt.Errorf("persist published transaction: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return err
-	}
-	if err := syncDirectory(filepath.Dir(destination)); err != nil {
-		return fmt.Errorf("persist published transaction: %w", err)
 	}
 	if err := os.Remove(transaction.recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove completed transaction record: %w", err)
@@ -446,26 +451,11 @@ func (s *stagedFile) Flush() fuse.Status {
 	if !s.pending {
 		return fuse.OK
 	}
-	s.filesystem.writesMu.Lock()
-	s.transaction.pendingRefs--
-	lastPending := s.transaction.pendingRefs == 0
-	var err error
-	if lastPending {
-		err = s.filesystem.checkpointTransactionLocked(s.transaction)
-	}
-	if err != nil {
-		s.transaction.pendingRefs++
-	}
-	s.filesystem.writesMu.Unlock()
-	if err != nil {
-		code = status(err)
-		s.filesystem.markFailure(s.transaction, code)
-		return code
-	}
-	s.pending = false
-	if s.filesystem.notifier != nil {
-		s.filesystem.notifier.EndWrite()
-	}
+	// Flush is issued once per userspace descriptor, but macOS can share one
+	// FUSE handle between several descriptors. Only Release proves that the
+	// kernel handle is gone, so publishing here could expose a transaction while
+	// another descriptor can still mutate it. Fsync remains the explicit durable
+	// checkpoint operation for callers that need publication before close.
 	return fuse.OK
 }
 
@@ -550,12 +540,17 @@ func (f *FileSystem) checkpointTransactionLocked(transaction *writeTransaction) 
 		return err
 	}
 	destination := f.full(transaction.path)
-	if err := os.Rename(checkpointPath, destination); err != nil {
+	if err := f.repo.WithWorkTreeLock(func() error {
+		if err := os.Rename(checkpointPath, destination); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(destination)); err != nil {
+			return fmt.Errorf("persist fsync checkpoint: %w", err)
+		}
+		return nil
+	}); err != nil {
 		_ = os.Remove(checkpointPath)
 		return err
-	}
-	if err := syncDirectory(filepath.Dir(destination)); err != nil {
-		return fmt.Errorf("persist fsync checkpoint: %w", err)
 	}
 	if transaction.inode != 0 {
 		attr.Ino = transaction.inode

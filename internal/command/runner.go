@@ -25,6 +25,11 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (string, e
 		r.Logger.Debug("command started", "command", command, "directory", r.Directory)
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	configureCancellation(cmd)
+	// A cancelled parent can otherwise remain stuck in Wait while a descendant
+	// keeps the stdout or stderr pipe open. Process-group cancellation handles
+	// normal descendants; WaitDelay also bounds helpers that detach themselves.
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = r.Directory
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

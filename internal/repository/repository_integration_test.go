@@ -2,6 +2,8 @@ package repository
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +12,110 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 )
+
+func TestSyncIsolatesUnavailableRemoteAndReleasesRepositoryLock(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	gitconfig := []byte("[user]\n\tname = DFS Test\n\temail = dfs@example.invalid\n")
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), gitconfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	source, err := Init(ctx, filepath.Join(home, "source"), "source", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	healthy, err := Join(ctx, source.Config.Repository, filepath.Join(home, "healthy"), "healthy", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer healthy.Close()
+	if err := source.AddRemote(ctx, "healthy", healthy.Config.Repository); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(home, "offline-probe-started")
+	helper := filepath.Join(home, "offline-remote")
+	script := fmt.Sprintf("#!/bin/sh\n: > %q\nsleep 4\nexit 1\n", marker)
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.runner.Run(ctx, "git", "config", "protocol.ext.allow", "always"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.AddRemote(ctx, "offline", "ext::"+helper+" %S"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source.Config.Repository, "new.txt"), []byte("healthy peer receives this\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- source.Sync(ctx, true) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("offline remote probe did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	operationDone := make(chan error, 1)
+	go func() {
+		_, operationErr := source.TreeID(ctx)
+		operationDone <- operationErr
+	}()
+	select {
+	case err := <-operationDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("repository operation waited for the unavailable remote probe")
+	}
+
+	err = <-syncDone
+	var degraded *RemoteSyncError
+	if !errors.As(err, &degraded) || len(degraded.Failures) != 1 || degraded.Failures[0].Remote != "offline" {
+		t.Fatalf("sync error = %v, want one unavailable offline remote", err)
+	}
+	if err := healthy.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(healthy.Config.Repository, "new.txt")); err != nil {
+		t.Fatalf("healthy remote did not receive namespace update: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(source.Config.Repository, "new.txt")); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = source.Sync(ctx, true)
+	if !errors.As(err, &degraded) {
+		t.Fatalf("backoff sync error = %v, want unavailable remote warning", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 3*time.Second {
+		t.Fatalf("unavailable remote backoff took %v", elapsed)
+	}
+	if err := healthy.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(healthy.Config.Repository, "new.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("healthy remote retained deleted path: %v", err)
+	}
+}
 
 func TestTwoPeerMetadataAndContentFlow(t *testing.T) {
 	if _, err := exec.LookPath("git-annex"); err != nil {

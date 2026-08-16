@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,8 +132,17 @@ func (s *Scheduler) sync(reason string) {
 	s.logger.Info("automatic sync started", "reason", reason)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	degradedRemotes := make(map[string]error)
 	passes, changedPaths, err := syncUntilConverged(ctx, 4, 2, s.repo.TreeID, s.repo.ChangedPaths, func(ctx context.Context) error {
-		return s.repo.Sync(ctx, true)
+		err := s.repo.Sync(ctx, true)
+		var degraded *repository.RemoteSyncError
+		if errors.As(err, &degraded) {
+			for _, failure := range degraded.Failures {
+				degradedRemotes[failure.Remote] = failure.Err
+			}
+			return nil
+		}
+		return err
 	})
 	if s.entries != nil {
 		for _, path := range changedPaths {
@@ -142,6 +152,16 @@ func (s *Scheduler) sync(reason string) {
 	if err != nil {
 		s.logger.Error("automatic sync failed", "reason", reason, "duration", time.Since(started), "error", err)
 		return
+	}
+	if len(degradedRemotes) > 0 {
+		remotes := make([]string, 0, len(degradedRemotes))
+		for remote := range degradedRemotes {
+			remotes = append(remotes, remote)
+		}
+		sort.Strings(remotes)
+		for _, remote := range remotes {
+			s.logger.Warn("remote synchronization deferred", "remote", remote, "error", degradedRemotes[remote])
+		}
 	}
 	if s.reconcile != nil {
 		if err := s.reconcile(ctx); err != nil {

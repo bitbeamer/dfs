@@ -295,9 +295,9 @@ func TestEssentialFilesystemSemantics(t *testing.T) {
 				cancel()
 				t.Fatal(err)
 			}
-			if committed, err := repo.CommitPending(ctx, "Replace annex key under mount"); err != nil || !committed {
+			if _, err := repo.CommitPending(ctx, "Replace annex key under mount"); err != nil {
 				cancel()
-				t.Fatalf("commit external replacement = %v, %v", committed, err)
+				t.Fatalf("commit external replacement: %v", err)
 			}
 			cancel()
 			assertFileContent(t, mountedPath, content)

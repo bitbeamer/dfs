@@ -160,6 +160,17 @@ func status(err error) fuse.Status {
 	}
 }
 
+func (f *FileSystem) mutateWorkTree(operation func() fuse.Status) fuse.Status {
+	code := fuse.EIO
+	if err := f.repo.WithWorkTreeLock(func() error {
+		code = operation()
+		return nil
+	}); err != nil {
+		return status(err)
+	}
+	return code
+}
+
 func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
 	if hidden(name) {
 		return nil, fuse.ENOENT
@@ -437,7 +448,7 @@ func (f *FileSystem) Mkdir(name string, mode uint32, context *fuse.Context) fuse
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Mkdir(clean(name), mode, context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Mkdir(clean(name), mode, context) })
 	if code == fuse.OK {
 		f.changed("mkdir", "path", clean(name))
 	}
@@ -448,7 +459,7 @@ func (f *FileSystem) Mknod(name string, mode uint32, dev uint32, context *fuse.C
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Mknod(clean(name), mode, dev, context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Mknod(clean(name), mode, dev, context) })
 	if code == fuse.OK {
 		f.changed("mknod", "path", clean(name))
 	}
@@ -463,7 +474,7 @@ func (f *FileSystem) Rename(oldName, newName string, context *fuse.Context) fuse
 	if oldPath == newPath {
 		return fuse.OK
 	}
-	code := f.FileSystem.Rename(oldPath, newPath, context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Rename(oldPath, newPath, context) })
 	if code == fuse.OK {
 		if err := f.renameWrite(oldPath, newPath); err != nil {
 			return status(err)
@@ -483,7 +494,7 @@ func (f *FileSystem) Rmdir(name string, context *fuse.Context) fuse.Status {
 	if hidden(name) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Rmdir(clean(name), context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Rmdir(clean(name), context) })
 	if code == fuse.OK {
 		if f.repo.Store != nil {
 			if err := f.repo.Store.RemoveFileState(clean(name)); err != nil {
@@ -501,7 +512,7 @@ func (f *FileSystem) Unlink(name string, context *fuse.Context) fuse.Status {
 		return fuse.EACCES
 	}
 	path := clean(name)
-	code := f.FileSystem.Unlink(path, context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Unlink(path, context) })
 	if code == fuse.OK {
 		f.unlinkWrite(path)
 		if f.repo.Store != nil {
@@ -519,7 +530,7 @@ func (f *FileSystem) Link(oldName, newName string, context *fuse.Context) fuse.S
 	if hidden(oldName) || hidden(newName) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Link(clean(oldName), clean(newName), context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Link(clean(oldName), clean(newName), context) })
 	if code == fuse.OK {
 		f.changed("link", "old_path", clean(oldName), "new_path", clean(newName))
 	}
@@ -530,7 +541,7 @@ func (f *FileSystem) Symlink(value, linkName string, context *fuse.Context) fuse
 	if hidden(linkName) {
 		return fuse.EACCES
 	}
-	code := f.FileSystem.Symlink(value, clean(linkName), context)
+	code := f.mutateWorkTree(func() fuse.Status { return f.FileSystem.Symlink(value, clean(linkName), context) })
 	if code == fuse.OK {
 		f.changed("symlink", "path", clean(linkName))
 	}

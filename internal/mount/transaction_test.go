@@ -49,7 +49,7 @@ func TestStagedFilePropagatesFlushAndFsyncErrors(t *testing.T) {
 	}
 }
 
-func TestFlushCheckpointsWriteAndUnblocksSync(t *testing.T) {
+func TestFlushDefersPublicationAndSyncUntilRelease(t *testing.T) {
 	root := t.TempDir()
 	filesystem := testFileSystem(t, root)
 	notifier := &countingNotifier{}
@@ -68,17 +68,17 @@ func TestFlushCheckpointsWriteAndUnblocksSync(t *testing.T) {
 	if code := file.Flush(); code != fuse.OK {
 		t.Fatalf("flush = %v", code)
 	}
-	if notifier.writers != 0 {
-		t.Fatalf("open writers after flush = %d, want 0", notifier.writers)
+	if notifier.writers != 1 {
+		t.Fatalf("open writers after flush = %d, want 1", notifier.writers)
 	}
-	if content, err := os.ReadFile(filepath.Join(root, "note.txt")); err != nil || string(content) != "first" {
-		t.Fatalf("checkpoint content = %q, %v", content, err)
+	if content, err := os.ReadFile(filepath.Join(root, "note.txt")); err != nil || len(content) != 0 {
+		t.Fatalf("flush published staged content = %q, %v", content, err)
 	}
 	if _, code := file.Write([]byte(" second"), 5); code != fuse.OK {
 		t.Fatalf("second write = %v", code)
 	}
 	if notifier.writers != 1 {
-		t.Fatalf("open writers after resumed write = %d, want 1", notifier.writers)
+		t.Fatalf("open writers after continued write = %d, want 1", notifier.writers)
 	}
 	file.Release()
 	if notifier.writers != 0 {

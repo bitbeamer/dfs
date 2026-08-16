@@ -437,7 +437,11 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 	}
 	wantedPrefix := strings.TrimPrefix(from, "dfs-peer-")
 	var peerIDs []string
-	for _, record := range mustRecords(repo.Config.Repository) {
+	records, err := membership.LoadAll(repo.Config.Repository)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
 		if record.Payload.PeerID == repo.Config.PeerID || trusted[record.Payload.PeerID] != record.Payload.SigningPublicKey {
 			continue
 		}
@@ -544,8 +548,15 @@ func trustedMember(repositoryPath, peerID string) (membership.Record, error) {
 	if err != nil {
 		return membership.Record{}, err
 	}
-	for _, record := range mustRecords(repositoryPath) {
-		revoked, _ := membership.AcceptedRevocations(repositoryPath, record.Payload.FileSystemID)
+	records, err := membership.LoadAll(repositoryPath)
+	if err != nil {
+		return membership.Record{}, fmt.Errorf("load DFS membership: %w", err)
+	}
+	for _, record := range records {
+		revoked, err := membership.AcceptedRevocations(repositoryPath, record.Payload.FileSystemID)
+		if err != nil {
+			return membership.Record{}, fmt.Errorf("load DFS membership revocations: %w", err)
+		}
 		if record.Payload.PeerID == peerID && trusted[peerID] == record.Payload.SigningPublicKey && !record.Payload.Revoked && !revoked[peerID] {
 			return record, nil
 		}
@@ -563,17 +574,16 @@ func verifyTrustedPublicKey(repositoryPath, filesystemID string, public ed25519.
 	if err != nil {
 		return err
 	}
-	for _, record := range mustRecords(repositoryPath) {
+	records, err := membership.LoadAll(repositoryPath)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
 		if record.Payload.FileSystemID == filesystemID && !revoked[record.Payload.PeerID] && trusted[record.Payload.PeerID] == wanted && record.Payload.SigningPublicKey == wanted {
 			return nil
 		}
 	}
 	return errors.New("client certificate is not in trusted DFS membership")
-}
-
-func mustRecords(repositoryPath string) []membership.Record {
-	records, _ := membership.LoadAll(repositoryPath)
-	return records
 }
 
 func base64Public(public ed25519.PublicKey) string {
