@@ -31,6 +31,7 @@ type FileSystem struct {
 	pathfs.FileSystem
 	repo             *repository.Repository
 	root             string
+	lifetime         stdcontext.Context
 	notifier         changeNotifier
 	logger           *slog.Logger
 	sizesMu          sync.Mutex
@@ -58,9 +59,16 @@ type contentInvalidator interface {
 }
 
 func NewFileSystem(repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
+	return NewFileSystemWithContext(stdcontext.Background(), repo, notifier, logger)
+}
+
+func NewFileSystemWithContext(ctx stdcontext.Context, repo *repository.Repository, notifier changeNotifier, logger *slog.Logger) *FileSystem {
+	if ctx == nil {
+		ctx = stdcontext.Background()
+	}
 	return &FileSystem{
 		FileSystem: pathfs.NewLoopbackFileSystem(repo.Config.Repository),
-		repo:       repo, root: repo.Config.Repository, notifier: notifier, logger: logger,
+		repo:       repo, root: repo.Config.Repository, lifetime: ctx, notifier: notifier, logger: logger,
 		sizes: make(map[string]uint64), writes: make(map[string]*writeTransaction),
 		attrs:       make(map[string]visibleState),
 		annexInodes: make(map[string]uint64),
@@ -121,7 +129,7 @@ func (f *FileSystem) hydrate(name string) error {
 		f.notifier.BeginWrite()
 		defer f.notifier.EndWrite()
 	}
-	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 24*time.Hour)
+	ctx, cancel := stdcontext.WithTimeout(f.lifetime, 24*time.Hour)
 	defer cancel()
 	err := f.repo.Fetch(ctx, path, "")
 	if err != nil {
@@ -219,7 +227,7 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 			size, ok := f.sizes[path]
 			f.sizesMu.Unlock()
 			if !ok {
-				ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 30*time.Second)
+				ctx, cancel := stdcontext.WithTimeout(f.lifetime, 30*time.Second)
 				value, sizeErr := f.repo.AnnexFileSize(ctx, path)
 				cancel()
 				if sizeErr == nil {

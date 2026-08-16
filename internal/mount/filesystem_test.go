@@ -108,6 +108,35 @@ func TestReadDoesNotWriteAccessMetadataPerRequest(t *testing.T) {
 	}
 }
 
+func TestHydrationStopsWhenMountLifetimeIsCanceled(t *testing.T) {
+	root := t.TempDir()
+	filesystem := testFileSystem(t, root)
+	lifetime, cancel := context.WithCancel(context.Background())
+	filesystem.lifetime = lifetime
+	started := make(chan struct{})
+	filesystem.repo.SetManagedFetcher(func(ctx context.Context, _ *repository.Repository, _, _ string) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	finished := make(chan error, 1)
+	go func() { finished <- filesystem.hydrate("unavailable.bin") }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("hydration did not start")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if err == nil {
+			t.Fatal("canceled hydration succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hydration did not stop after mount cancellation")
+	}
+}
+
 func TestOnlyGitMetadataIsHidden(t *testing.T) {
 	tests := []struct {
 		path   string

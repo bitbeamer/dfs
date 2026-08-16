@@ -435,6 +435,8 @@ writer follow POSIX behavior supported by FUSE.
 Opening a file updates its cache-recency record once. Sequential reads do not
 write SQLite state for every FUSE block, so large cached files stream at local
 filesystem speed instead of being limited by metadata transactions.
+Daemon shutdown cancels in-flight content hydration before beginning FUSE
+unmount, preventing a sleeping or unreachable peer from trapping mount teardown.
 
 Automatic metadata synchronization runs after completed transactions and every
 30 seconds. Each remote is probed and synchronized independently; an unavailable

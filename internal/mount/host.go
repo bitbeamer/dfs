@@ -168,7 +168,9 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		}
 	}()
 
-	filesystem := NewFileSystem(repo, scheduler, logger.With("component", "filesystem"))
+	operationCtx, cancelOperations := context.WithCancel(ctx)
+	defer cancelOperations()
+	filesystem := NewFileSystemWithContext(operationCtx, repo, scheduler, logger.With("component", "filesystem"))
 	// The annex working tree may replace a regular file with a symlink after a
 	// transaction is committed. Let go-fuse own stable inode identities instead
 	// of exposing those internal inode changes to applications.
@@ -244,6 +246,10 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		close(serveDone)
 	}()
 	shutdown, shutdownReason := waitForMountStop(ctx, options.Signals, serveDone)
+	// Cancel FUSE operations before asking the kernel to unmount. In particular,
+	// an on-demand content fetch must not keep macFUSE teardown blocked after the
+	// daemon has received SIGTERM.
+	cancelOperations()
 	close(heartbeatStop)
 	<-heartbeatDone
 	<-observationDone
