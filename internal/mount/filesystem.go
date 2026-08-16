@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -138,7 +139,25 @@ func status(err error) fuse.Status {
 	if err == nil {
 		return fuse.OK
 	}
-	return fuse.ToStatus(err)
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return fuse.ToStatus(errno)
+	}
+	switch {
+	case errors.Is(err, stdcontext.DeadlineExceeded):
+		return fuse.ToStatus(syscall.ETIMEDOUT)
+	case errors.Is(err, stdcontext.Canceled):
+		return fuse.EINTR
+	case errors.Is(err, os.ErrNotExist):
+		return fuse.ENOENT
+	case errors.Is(err, os.ErrPermission):
+		return fuse.EACCES
+	default:
+		// go-fuse maps an arbitrary Go error to ENOSYS, which incorrectly tells
+		// applications that DFS does not implement ordinary reads. Command and
+		// transport failures are I/O errors instead.
+		return fuse.EIO
+	}
 }
 
 func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
@@ -153,7 +172,7 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 	if code != fuse.OK {
 		return attr, code
 	}
-	locked := annexSymlink(f.full(name))
+	annexTarget, locked := annexLinkTarget(f.full(name))
 	if locked {
 		// Loopback GetAttr describes the git-annex symlink here. Symlink modes
 		// differ by platform (typically 0777 on Linux and 0755 on macOS), so
@@ -171,6 +190,8 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 			if targetAttr := attrFromInfo(info); targetAttr != nil {
 				attr.Ino = targetAttr.Ino
 			}
+		} else if size, ok := annexSizeFromTarget(annexTarget); ok {
+			attr.Size = size
 		} else {
 			f.sizesMu.Lock()
 			size, ok := f.sizes[path]
@@ -195,6 +216,21 @@ func (f *FileSystem) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fu
 		f.applyStableAnnexInode(path, attr)
 	}
 	return attr, code
+}
+
+func annexSizeFromTarget(target string) (uint64, bool) {
+	key := filepath.Base(filepath.FromSlash(target))
+	start := strings.Index(key, "-s")
+	if start < 0 {
+		return 0, false
+	}
+	rest := key[start+2:]
+	end := strings.Index(rest, "--")
+	if end <= 0 {
+		return 0, false
+	}
+	size, err := strconv.ParseUint(rest[:end], 10, 64)
+	return size, err == nil
 }
 
 func (f *FileSystem) applyStableAnnexInode(path string, attr *fuse.Attr) {

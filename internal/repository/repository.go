@@ -197,9 +197,19 @@ func (r *Repository) ConfigureSSHCommand(ctx context.Context, sshCommand string)
 	if sshCommand == "" {
 		return errors.New("SSH command cannot be empty")
 	}
+	_, annexOptions, found := strings.Cut(sshCommand, " ")
+	if !found || strings.TrimSpace(annexOptions) == "" {
+		return errors.New("SSH command must include transport options")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, err := r.runner.Run(ctx, "git", "config", "core.sshCommand", sshCommand)
+	if _, err := r.runner.Run(ctx, "git", "config", "core.sshCommand", sshCommand); err != nil {
+		return err
+	}
+	// git-annex uses its own SSH/rsync transport for content transfers and does
+	// not consistently inherit core.sshCommand. Give it the same identity,
+	// pinned host keys, and timeouts as Git metadata operations.
+	_, err := r.runner.Run(ctx, "git", "config", "annex.ssh-options", strings.TrimSpace(annexOptions))
 	return err
 }
 

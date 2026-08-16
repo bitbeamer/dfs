@@ -1,6 +1,8 @@
 package mount
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -15,6 +17,28 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/fuse/nodefs"
 )
+
+func TestStatusDoesNotReportGenericFailuresAsUnimplemented(t *testing.T) {
+	if got := status(errors.New("transfer failed")); got != fuse.EIO {
+		t.Fatalf("generic error status = %v, want EIO", got)
+	}
+	if got := status(context.DeadlineExceeded); got != fuse.ToStatus(syscall.ETIMEDOUT) {
+		t.Fatalf("deadline status = %v, want ETIMEDOUT", got)
+	}
+	if got := status(syscall.EACCES); got != fuse.EACCES {
+		t.Fatalf("errno status = %v, want EACCES", got)
+	}
+}
+
+func TestAnnexSizeFromTarget(t *testing.T) {
+	target := ".git/annex/objects/2W/V5/SHA256E-s2--4355/SHA256E-s2--4355"
+	if size, ok := annexSizeFromTarget(target); !ok || size != 2 {
+		t.Fatalf("annex size = %d, %v", size, ok)
+	}
+	if _, ok := annexSizeFromTarget(".git/annex/objects/key"); ok {
+		t.Fatal("invalid annex target has a size")
+	}
+}
 
 type attrFile struct {
 	nodefs.File

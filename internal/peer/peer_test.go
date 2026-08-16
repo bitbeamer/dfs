@@ -297,9 +297,15 @@ func TestEnsureRepositoryTransportPreservesPinnedHostKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := gitOutput(t, repo.Config.Repository, "config", "--get", "core.sshCommand")
-	for _, expected := range []string{knownHosts, "StrictHostKeyChecking=yes", transportKeyFile} {
+	for _, expected := range []string{knownHosts, "StrictHostKeyChecking=yes", "ConnectTimeout=5", transportKeyFile} {
 		if !strings.Contains(command, expected) {
 			t.Fatalf("SSH command %q does not contain %q", command, expected)
+		}
+	}
+	annexOptions := gitOutput(t, repo.Config.Repository, "config", "--get", "annex.ssh-options")
+	for _, expected := range []string{knownHosts, "StrictHostKeyChecking=yes", "ConnectTimeout=5", transportKeyFile} {
+		if !strings.Contains(annexOptions, expected) {
+			t.Fatalf("git-annex SSH options %q do not contain %q", annexOptions, expected)
 		}
 	}
 }

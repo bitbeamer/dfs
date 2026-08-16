@@ -238,7 +238,10 @@ func RevokePeerAuthorization(remoteName string) error {
 }
 
 func transportSSHCommand(privateKey, knownHosts string) string {
-	parts := []string{"ssh", "-i", shellQuote(privateKey), "-o", "IdentitiesOnly=no", "-o", "BatchMode=yes"}
+	parts := []string{
+		"ssh", "-i", shellQuote(privateKey), "-o", "IdentitiesOnly=no", "-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
+	}
 	if knownHosts != "" {
 		parts = append(parts, "-o", "UserKnownHostsFile="+shellQuote(knownHosts), "-o", "StrictHostKeyChecking=yes")
 	}
