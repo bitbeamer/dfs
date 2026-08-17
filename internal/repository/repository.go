@@ -123,16 +123,21 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 	if cacheLimit > 0 {
 		cfg.CacheLimit = cacheLimit
 	}
-	if err := config.Save(cfg); err != nil {
+	if _, err := runner.Run(ctx, "git", "commit", "--allow-empty", "-m", "Initialize DFS repository"); err != nil {
 		return nil, err
 	}
-	if _, err := runner.Run(ctx, "git", "commit", "--allow-empty", "-m", "Initialize DFS repository"); err != nil {
+	filesystemID, err := rootFileSystemID(ctx, runner)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FileSystemID = filesystemID
+	if err := config.Save(cfg); err != nil {
 		return nil, err
 	}
 	return Open(path)
 }
 
-func Join(ctx context.Context, remote, path, name string, cacheLimit int64) (*Repository, error) {
+func Join(ctx context.Context, remote, path, name string, cacheLimit int64, expectedFileSystemID ...string) (*Repository, error) {
 	if err := CheckDependencies(); err != nil {
 		return nil, err
 	}
@@ -172,6 +177,15 @@ func Join(ctx context.Context, remote, path, name string, cacheLimit int64) (*Re
 		return nil, err
 	}
 	cfg := config.Default(name, path)
+	if len(expectedFileSystemID) > 0 && strings.TrimSpace(expectedFileSystemID[0]) != "" {
+		cfg.FileSystemID = strings.TrimSpace(expectedFileSystemID[0])
+	} else {
+		filesystemID, err := rootFileSystemID(ctx, runner)
+		if err != nil {
+			return nil, err
+		}
+		cfg.FileSystemID = filesystemID
+	}
 	if cacheLimit > 0 {
 		cfg.CacheLimit = cacheLimit
 	}
@@ -191,6 +205,10 @@ func Open(path string) (*Repository, error) {
 		return nil, err
 	}
 	repo := &Repository{Config: cfg, Store: state, runner: command.Runner{Directory: cfg.Repository}, remoteRetry: make(map[string]remoteRetry), remoteChecked: make(map[string]bool)}
+	if _, err := repo.FileSystemID(context.Background()); err != nil {
+		_ = state.Close()
+		return nil, err
+	}
 	if err := repo.migrateLegacyTransport(context.Background()); err != nil {
 		_ = state.Close()
 		return nil, err
@@ -233,13 +251,28 @@ func (r *Repository) SetLogger(logger *slog.Logger) {
 
 func (r *Repository) SaveConfig() error { return config.Save(r.Config) }
 
-// FileSystemID returns a stable identity shared by every clone of this DFS
-// repository. The initial commit is immutable shared Git metadata, unlike the
-// peer-local configuration under .git/dfs.
+// FileSystemID returns the stable identity shared by every clone of this DFS
+// repository. New repositories persist the initial commit ID in private
+// configuration so later Git history maintenance cannot change the identity.
 func (r *Repository) FileSystemID(ctx context.Context) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out, err := r.runner.Run(ctx, "git", "rev-list", "--max-parents=0", "HEAD")
+	if strings.TrimSpace(r.Config.FileSystemID) != "" {
+		return r.Config.FileSystemID, nil
+	}
+	filesystemID, err := rootFileSystemID(ctx, r.runner)
+	if err != nil {
+		return "", err
+	}
+	r.Config.FileSystemID = filesystemID
+	if err := r.SaveConfig(); err != nil {
+		return "", fmt.Errorf("persist DFS filesystem identity: %w", err)
+	}
+	return filesystemID, nil
+}
+
+func rootFileSystemID(ctx context.Context, runner command.Runner) (string, error) {
+	out, err := runner.Run(ctx, "git", "rev-list", "--max-parents=0", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("determine DFS filesystem identity: %w", err)
 	}
@@ -349,7 +382,10 @@ func (r *Repository) commitPendingLocked(ctx context.Context, message string) (b
 	}
 	// git-annex handles new and modified user files. Git then records deletions,
 	// renames, pointer updates, and ordinary control files.
-	if _, err := r.runner.Run(ctx, "git", "annex", "add", "."); err != nil {
+	// git-annex normally skips dotfiles and files below dot-directories. The
+	// subsequent git add must never turn those user files into ordinary Git
+	// blobs, so override that default for every DFS commit.
+	if _, err := r.runner.Run(ctx, "git", "-c", "annex.dotfiles=true", "annex", "add", "."); err != nil {
 		return false, err
 	}
 	if _, err := r.runner.Run(ctx, "git", "add", "-A"); err != nil {

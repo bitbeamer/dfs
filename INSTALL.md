@@ -98,7 +98,7 @@ cd ~/dfs
 ./scripts/install-cachyos.sh --pair-port 7843 \
   ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 
-DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+DFS_INSTANCE=$(sed -n 's/.*"filesystem_id": *"\([0-9a-f]*\)".*/\1/p' ~/.local/share/dfs/repository/.git/dfs/config.json | cut -c1-12)
 systemctl --user --no-pager --full status "dfs-core-$DFS_INSTANCE" "dfs-mount-$DFS_INSTANCE"
 ~/.local/bin/dfs --repo ~/.local/share/dfs/repository health
 ```
@@ -110,12 +110,15 @@ cd ~/dfs
 ./scripts/install-macos.sh --pair-port 7843 \
   ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
 
-DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+DFS_INSTANCE=$(sed -n 's/.*"filesystem_id": *"\([0-9a-f]*\)".*/\1/p' ~/.local/share/dfs/repository/.git/dfs/config.json | cut -c1-12)
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
 "$HOME/Library/Application Support/DFS/bin/dfs" \
   --repo ~/.local/share/dfs/repository health
 ```
+
+DFS persists the logical filesystem ID in `.git/dfs/config.json`; service names
+remain stable even if administrators later perform Git history maintenance.
 
 The installer puts the daemon in a signed `DFS.app` helper with a stable bundle
 identifier and keeps `~/Library/Application Support/DFS/bin/dfs` as a

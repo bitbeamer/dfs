@@ -59,7 +59,7 @@ func TestLoadMigratesLegacyStateIntoGitDirectory(t *testing.T) {
 	if loaded.Name != "legacy" {
 		t.Fatalf("loaded peer name = %q", loaded.Name)
 	}
-	if loaded.Version != 3 || loaded.PeerID == "" || loaded.Hostname == "" || loaded.NetworkName != filepath.Base(repository) {
+	if loaded.Version != 4 || loaded.PeerID == "" || loaded.Hostname == "" || loaded.NetworkName != filepath.Base(repository) {
 		t.Fatalf("migrated identity = version %d, peer %q, network %q", loaded.Version, loaded.PeerID, loaded.NetworkName)
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
@@ -88,7 +88,7 @@ func TestLoadUpgradesPeerIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Version != 3 || loaded.PeerID == "" || loaded.Hostname == "" || loaded.NetworkName != "family-files" {
+	if loaded.Version != 4 || loaded.PeerID == "" || loaded.Hostname == "" || loaded.NetworkName != "family-files" {
 		t.Fatalf("upgraded config = %#v", loaded)
 	}
 	reloaded, err := Load(repository)

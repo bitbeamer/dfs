@@ -20,6 +20,7 @@ const (
 
 type Config struct {
 	Version      int           `json:"version"`
+	FileSystemID string        `json:"filesystem_id,omitempty"`
 	Name         string        `json:"name"`
 	Hostname     string        `json:"hostname"`
 	PeerID       string        `json:"peer_id"`
@@ -33,7 +34,7 @@ type Config struct {
 func Default(name, repository string) Config {
 	hostname, _ := hostnameProvider()
 	return Config{
-		Version:      3,
+		Version:      4,
 		Name:         name,
 		Hostname:     canonicalHostname(hostname),
 		PeerID:       randomID(),
@@ -105,8 +106,8 @@ func Load(repository string) (Config, error) {
 	}
 	cfg.Repository = repository
 	upgraded := false
-	if cfg.Version < 3 {
-		cfg.Version = 3
+	if cfg.Version < 4 {
+		cfg.Version = 4
 		upgraded = true
 	}
 	if cfg.Hostname == "" {

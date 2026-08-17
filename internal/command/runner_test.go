@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -53,5 +54,22 @@ func TestRunnerCancellationAllowsTransactionalCleanup(t *testing.T) {
 	}
 	if _, err := os.Stat(lock); !os.IsNotExist(err) {
 		t.Fatalf("transaction lock remains after cancellation: %v", err)
+	}
+}
+
+func TestConfigureCancellationAllowsStreamingCommandCleanup(t *testing.T) {
+	directory := t.TempDir()
+	lock := filepath.Join(directory, "receive.tmp")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c",
+		"trap 'rm -f receive.tmp; exit 143' TERM; touch receive.tmp; while :; do sleep 1; done")
+	cmd.Dir = directory
+	ConfigureCancellation(cmd)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("cancelled streaming command unexpectedly succeeded")
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("streaming command temporary file remains after cancellation: %v", err)
 	}
 }

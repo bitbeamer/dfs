@@ -167,7 +167,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := managed.PairClone(ctx, endpoint, invitation.CertificateSHA256, start.SessionID, start.CompletionSecret, bundlePath); err != nil {
 		return nil, fmt.Errorf("clone paired DFS repository over QUIC: %w", err)
 	}
-	repo, err := repository.Join(ctx, bundlePath, destination, name, cacheLimit)
+	repo, err := repository.Join(ctx, bundlePath, destination, name, cacheLimit, invitation.FileSystemID)
 	if err != nil {
 		return nil, fmt.Errorf("clone paired DFS repository: %w", err)
 	}

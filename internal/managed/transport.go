@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	processcommand "github.com/bitbeamer/dfs/internal/command"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
 	quic "github.com/quic-go/quic-go"
@@ -390,13 +391,18 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		pinRefBefore = gitRefValue(stream.Context(), s.repo.Config.Repository, membership.PinRef)
 	}
 	command := exec.CommandContext(stream.Context(), service, s.repo.Config.Repository)
+	processcommand.ConfigureCancellation(command)
 	command.Stdin, command.Stdout, command.Stderr = input, stream, io.Discard
 	if err := command.Start(); err != nil {
 		writeResponse(stream, Response{Error: err.Error()})
 		return
 	}
 	if err := writeResponse(stream, Response{OK: true}); err != nil {
-		_ = command.Process.Kill()
+		if command.Cancel != nil {
+			_ = command.Cancel()
+		} else {
+			_ = command.Process.Kill()
+		}
 		_ = command.Wait()
 		return
 	}

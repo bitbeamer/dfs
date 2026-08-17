@@ -25,11 +25,7 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (string, e
 		r.Logger.Debug("command started", "command", command, "directory", r.Directory)
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	configureCancellation(cmd)
-	// A cancelled parent can otherwise remain stuck in Wait while a descendant
-	// keeps the stdout or stderr pipe open. Process-group cancellation handles
-	// normal descendants; WaitDelay also bounds helpers that detach themselves.
-	cmd.WaitDelay = 2 * time.Second
+	ConfigureCancellation(cmd)
 	cmd.Dir = r.Directory
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -68,6 +64,18 @@ func (r Runner) Run(ctx context.Context, name string, args ...string) (string, e
 		_, _ = io.Copy(r.Stderr, bytes.NewReader(stderr.Bytes()))
 	}
 	return stdout.String(), nil
+}
+
+// ConfigureCancellation lets long-running Git services terminate their whole
+// process group gracefully when their context is cancelled. This gives Git's
+// receive-pack/index-pack children an opportunity to remove transactional
+// temporary files before Cmd.Wait enforces the hard deadline.
+func ConfigureCancellation(cmd *exec.Cmd) {
+	configureCancellation(cmd)
+	// A cancelled parent can otherwise remain stuck in Wait while a descendant
+	// keeps the stdout or stderr pipe open. Process-group cancellation handles
+	// normal descendants; WaitDelay also bounds helpers that detach themselves.
+	cmd.WaitDelay = 2 * time.Second
 }
 
 func Exists(name string) bool {

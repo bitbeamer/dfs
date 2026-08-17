@@ -10,10 +10,20 @@ usage() {
   printf '       %s --uninstall <repository>\n' "$0" >&2
 }
 
+filesystem_identity() {
+  local repository=$1 configured
+  configured=$(sed -n 's/^[[:space:]]*"filesystem_id":[[:space:]]*"\([0-9a-f][0-9a-f]*\)".*/\1/p' "$repository/.git/dfs/config.json" 2>/dev/null | head -n 1)
+  if [[ "$configured" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s\n' "$configured"
+  else
+    git -C "$repository" rev-list --max-parents=0 HEAD | sort | head -n 1
+  fi
+}
+
 if [[ "${1:-}" == "--uninstall" ]]; then
   [[ $# -eq 2 ]] || { usage; exit 2; }
   repository=$(realpath "$2")
-  filesystem_id=$(git -C "$repository" rev-list --max-parents=0 HEAD | sort | head -n 1)
+  filesystem_id=$(filesystem_identity "$repository")
   instance=${filesystem_id:0:12}
   [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
   mount_unit_name="dfs-mount-$instance.service"
@@ -45,7 +55,7 @@ source_binary=${3:-./bin/dfs}
 source_binary=$(realpath "$source_binary")
 mkdir -p "$mountpoint" "$unit_dir" "$(dirname "$install_path")"
 mountpoint=$(realpath "$mountpoint")
-filesystem_id=$(git -C "$repository" rev-list --max-parents=0 HEAD | sort | head -n 1)
+filesystem_id=$(filesystem_identity "$repository")
 instance=${filesystem_id:0:12}
 [[ "$instance" =~ ^[0-9a-f]{12}$ ]] || { printf 'Cannot determine DFS filesystem ID for %s.\n' "$repository" >&2; exit 1; }
 unit_name="dfs-mount-$instance.service"

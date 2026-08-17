@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -229,6 +230,105 @@ func TestHealthStatsReportNamespaceAndStorageWithoutHydration(t *testing.T) {
 	}
 	if len(withoutContent.Pinned) != 1 || withoutContent.Pinned[0].Status != "hydrating" || withoutContent.Pinned[0].MissingFiles != 1 {
 		t.Fatalf("missing pin hydration status = %+v", withoutContent.Pinned)
+	}
+}
+
+func TestCommitPendingAnnexesDotfilesAndFilesBelowDotDirectories(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Dotfile Test\nemail = dotfile@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repo, err := Init(ctx, filepath.Join(home, "repository"), "dotfiles", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	paths := []string{".hidden.bin", ".hidden-directory/content.bin"}
+	payload := make([]byte, 2<<20)
+	for _, path := range paths {
+		fullPath := filepath.Join(repo.Config.Repository, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := repo.CommitPending(ctx, "Add hidden content"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		key, err := repo.LookupKey(ctx, path)
+		if err != nil || key == "" {
+			t.Fatalf("hidden path %q was not annexed: key=%q error=%v", path, key, err)
+		}
+		blobSize, err := repo.runner.Run(ctx, "git", "cat-file", "-s", "HEAD:"+path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(blobSize), 10, 64)
+		if err != nil || size >= int64(len(payload)) {
+			t.Fatalf("hidden path %q ordinary Git blob size = %q, want annex pointer smaller than %d", path, blobSize, len(payload))
+		}
+	}
+}
+
+func TestFileSystemIdentitySurvivesHistoryMaintenance(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Identity Test\nemail = identity@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repoPath := filepath.Join(home, "repository")
+	repo, err := Init(ctx, repoPath, "identity", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := repo.FileSystemID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := repo.runner.Run(ctx, "git", "commit-tree", "HEAD^{tree}", "-m", "Replacement root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.runner.Run(ctx, "git", "reset", "--hard", strings.TrimSpace(replacement)); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := repo.FileSystemID(ctx); err != nil || current != original {
+		t.Fatalf("filesystem identity after history maintenance = %q, %v; want %q", current, err, original)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if current, err := reopened.FileSystemID(ctx); err != nil || current != original {
+		t.Fatalf("persisted filesystem identity = %q, %v; want %q", current, err, original)
+	}
+	joined, err := Join(ctx, repoPath, filepath.Join(home, "joined"), "joined", 10<<20, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer joined.Close()
+	if current, err := joined.FileSystemID(ctx); err != nil || current != original {
+		t.Fatalf("joined filesystem identity = %q, %v; want %q", current, err, original)
 	}
 }
 

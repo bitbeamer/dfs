@@ -203,6 +203,10 @@ stays in dedicated Git metadata refs. DFS internal state never enters the Git
 worktree or mounted logical filesystem; `.dfs/` and `.gitattributes` are not
 used as internal-state transports.
 
+The logical filesystem ID is persisted in that peer-private configuration when
+the repository is initialized or joined. It therefore remains stable across
+Git history maintenance and continues to select the same managed service.
+
 Changing a machine's hostname invalidates its DFS identity. DFS refuses to
 mount that repository rather than silently transferring the old identity; the
 renamed machine must be removed and admitted as a new peer. Letter case and the
@@ -357,7 +361,7 @@ dfs --repo ~/.local/share/dfs/repository health --cluster \
 For a repository, derive the managed instance ID with:
 
 ```sh
-DFS_INSTANCE=$(git -C ~/.local/share/dfs/repository rev-list --max-parents=0 HEAD | sort | head -1 | cut -c1-12)
+DFS_INSTANCE=$(sed -n 's/.*"filesystem_id": *"\([0-9a-f]*\)".*/\1/p' ~/.local/share/dfs/repository/.git/dfs/config.json | cut -c1-12)
 ```
 
 On systemd (the core owns health and networking; the mount is a frontend):
