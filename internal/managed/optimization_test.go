@@ -47,6 +47,21 @@ func TestKnownNonHolderCacheDoesNotRewriteRankings(t *testing.T) {
 	}
 }
 
+func TestContentCandidatesRetryStableOrderWhenEverySourceWasUnavailable(t *testing.T) {
+	original := unavailableContent
+	unavailableContent = &contentAvailability{entries: make(map[string]time.Time)}
+	t.Cleanup(func() { unavailableContent = original })
+	peerIDs := []string{"first", "second"}
+	unavailableContent.mark("repo", "first", "key")
+	if got, want := contentCandidates("repo", "key", peerIDs), []string{"second"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate after one miss = %v, want %v", got, want)
+	}
+	unavailableContent.mark("repo", "second", "key")
+	if got := contentCandidates("repo", "key", peerIDs); !reflect.DeepEqual(got, peerIDs) {
+		t.Fatalf("all-missed retry order = %v, want stable %v", got, peerIDs)
+	}
+}
+
 func TestBenchmarkPayloadIsDeterministic(t *testing.T) {
 	const offset = int64(7919)
 	payload := make([]byte, 4096)

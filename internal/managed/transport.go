@@ -684,11 +684,9 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	if err != nil {
 		return 0, err
 	}
+	peerIDs = contentCandidates(repo.Config.Repository, key, peerIDs)
 	var failures []string
 	for _, peerID := range peerIDs {
-		if unavailableContent.isKnown(repo.Config.Repository, peerID, key) {
-			continue
-		}
 		connection, stream, reader, response, openErr := Open(ctx, repo, peerID, Request{
 			Operation: "annex-range", Key: key, Offset: offset, Length: length,
 		})
@@ -744,6 +742,8 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 			}
 		}
 		peerIDs = filtered
+	} else {
+		peerIDs = contentCandidates(repo.Config.Repository, key, peerIDs)
 	}
 	if len(peerIDs) == 0 {
 		return errors.New("no trusted managed content source is available")
@@ -754,9 +754,6 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 	}
 	var failures []string
 	for _, peerID := range peerIDs {
-		if wantedPrefix == "" && unavailableContent.isKnown(repo.Config.Repository, peerID, key) {
-			continue
-		}
 		temporary, err := os.CreateTemp(stateDirectory, "managed-content-*")
 		if err != nil {
 			return err
@@ -781,6 +778,21 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 		failures = append(failures, peerID+": "+fetchErr.Error())
 	}
 	return fmt.Errorf("managed content fetch failed: %s", strings.Join(failures, "; "))
+}
+
+func contentCandidates(repositoryPath, key string, peerIDs []string) []string {
+	available := make([]string, 0, len(peerIDs))
+	for _, peerID := range peerIDs {
+		if !unavailableContent.isKnown(repositoryPath, peerID, key) {
+			available = append(available, peerID)
+		}
+	}
+	if len(available) == 0 {
+		// Availability observations race with newly published annex objects.
+		// Never let advisory negative caching eliminate every source.
+		return peerIDs
+	}
+	return available
 }
 
 func optimizedPeerIDs(ctx context.Context, repo *repository.Repository, profile string) ([]string, error) {
