@@ -47,6 +47,35 @@ func TestLoadMissingState(t *testing.T) {
 	}
 }
 
+func TestSaveReplacesPriorRun(t *testing.T) {
+	repositoryPath := t.TempDir()
+	first := State{PeerID: "local", OptimizedAt: time.Now().Add(-time.Hour).UTC(), Measurements: []Measurement{{PeerID: "old"}}}
+	second := State{PeerID: "local", OptimizedAt: time.Now().UTC(), Measurements: []Measurement{{PeerID: "new"}}}
+	if err := Save(repositoryPath, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(repositoryPath, second); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Measurements) != 1 || loaded.Measurements[0].PeerID != "new" {
+		t.Fatalf("replacement state = %#v", loaded)
+	}
+}
+
+func TestLoadCurrentRejectsAnotherPeersState(t *testing.T) {
+	repositoryPath := t.TempDir()
+	if err := Save(repositoryPath, State{PeerID: "other", OptimizedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadCurrent(repositoryPath, "filesystem", "local"); err == nil {
+		t.Fatal("accepted another peer's optimization state")
+	}
+}
+
 func TestFingerprintIsOrderIndependentAndEndpointSensitive(t *testing.T) {
 	left := []Member{{PeerID: "a", Endpoint: "quic://a:1"}, {PeerID: "b", Endpoint: "quic://b:1"}}
 	right := []Member{left[1], left[0]}

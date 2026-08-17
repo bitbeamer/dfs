@@ -150,6 +150,9 @@ func LoadCurrent(repositoryPath, filesystemID, localPeerID string) (State, error
 	if err != nil {
 		return State{}, err
 	}
+	if state.PeerID != localPeerID {
+		return State{}, errors.New("DFS optimization state belongs to another peer")
+	}
 	members, err := CurrentMembers(repositoryPath, filesystemID, localPeerID)
 	if err != nil {
 		return State{}, err

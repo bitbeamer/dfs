@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/bitbeamer/dfs/internal/optimization"
 )
@@ -28,6 +29,21 @@ func TestRankSourcesUsesProfileAndKeepsOfflinePeersLast(t *testing.T) {
 	}
 	if got, want := ids(rankSources(measurements, true)), []string{"bulk", "latency", "degraded", "offline"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("bulk ranking = %v, want %v", got, want)
+	}
+}
+
+func TestKnownNonHolderCacheDoesNotRewriteRankings(t *testing.T) {
+	availability := &contentAvailability{entries: make(map[string]time.Time)}
+	availability.mark("repo", "peer", "key")
+	if !availability.isKnown("repo", "peer", "key") {
+		t.Fatal("known non-holder was not cached")
+	}
+	if availability.isKnown("repo", "other", "key") {
+		t.Fatal("non-holder state leaked to another peer")
+	}
+	availability.clear("repo", "peer", "key")
+	if availability.isKnown("repo", "peer", "key") {
+		t.Fatal("successful source did not clear non-holder state")
 	}
 }
 

@@ -792,9 +792,11 @@ func optimizedPeerIDs(ctx context.Context, repo *repository.Repository, profile 
 	if err != nil {
 		return nil, err
 	}
-	state, err := optimization.Load(repo.Config.Repository)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("load DFS source optimization: %w", err)
+	state, err := optimization.LoadCurrent(repo.Config.Repository, filesystemID, repo.Config.PeerID)
+	if err != nil {
+		// Optimization is advisory: missing, corrupt, or peer-mismatched state
+		// must never make content unavailable.
+		state = optimization.State{}
 	}
 	return optimization.OrderedPeerIDs(state, profile, members, repo.Config.PeerID), nil
 }
