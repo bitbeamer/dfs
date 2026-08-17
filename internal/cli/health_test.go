@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/optimization"
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
@@ -76,6 +77,32 @@ func TestClusterFlagReplacesMeshFlag(t *testing.T) {
 		}
 		if command.Flags().Lookup("mesh") != nil {
 			t.Errorf("%s command still exposes --mesh", name)
+		}
+	}
+}
+
+func TestOptimizeExposesLocalAndClusterScopes(t *testing.T) {
+	root := New()
+	command, _, err := root.Find([]string{"optimize"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"cluster", "json"} {
+		if command.Flags().Lookup(flag) == nil {
+			t.Errorf("optimize command has no --%s flag", flag)
+		}
+	}
+}
+
+func TestHealthDisplaysStableSourceProfilesAndOfflineFallback(t *testing.T) {
+	state := optimization.State{OptimizedAt: time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC), Stale: true,
+		Interactive: []optimization.RankedSource{{PeerID: "fast", PeerName: "zeus", Status: "MEASURED"}, {PeerID: "away", PeerName: "iris", Status: "OFFLINE"}},
+		Bulk:        []optimization.RankedSource{{PeerID: "away", PeerName: "iris", Status: "OFFLINE"}, {PeerID: "fast", PeerName: "zeus", Status: "MEASURED"}}}
+	var output bytes.Buffer
+	printOptimizationState(&output, "cachyos", state)
+	for _, wanted := range []string{"cachyos source priorities", "STALE", "interactive", "1. zeus", "2. iris [offline]", "bulk"} {
+		if !strings.Contains(output.String(), wanted) {
+			t.Fatalf("optimization output does not contain %q:\n%s", wanted, output.String())
 		}
 	}
 }

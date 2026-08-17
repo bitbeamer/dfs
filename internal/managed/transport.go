@@ -28,6 +28,7 @@ import (
 
 	processcommand "github.com/bitbeamer/dfs/internal/command"
 	"github.com/bitbeamer/dfs/internal/membership"
+	"github.com/bitbeamer/dfs/internal/optimization"
 	"github.com/bitbeamer/dfs/internal/repository"
 	quic "github.com/quic-go/quic-go"
 )
@@ -207,6 +208,20 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 		s.serveContent(stream, request.Key, 0, 0)
 	case "annex-range":
 		s.serveContent(stream, request.Key, request.Offset, request.Length)
+	case "benchmark":
+		serveBenchmark(stream, request.Offset, request.Length)
+	case "optimize":
+		state, err := OptimizeLocal(stream.Context(), s.repo, nil)
+		if err != nil {
+			writeResponse(stream, Response{Error: err.Error()})
+			return
+		}
+		payload, err := json.Marshal(state)
+		if err != nil {
+			writeResponse(stream, Response{Error: "encode optimization result"})
+			return
+		}
+		writeResponse(stream, Response{OK: true, Payload: payload})
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
@@ -665,24 +680,22 @@ func FetchContent(ctx context.Context, repo *repository.Repository, peerID, key 
 }
 
 func FetchRange(ctx context.Context, repo *repository.Repository, key string, offset, length int64, output io.Writer) (int64, error) {
-	trusted, err := membership.LoadTrusted(repo.Config.Repository)
-	if err != nil {
-		return 0, err
-	}
-	records, err := membership.LoadAll(repo.Config.Repository)
+	peerIDs, err := optimizedPeerIDs(ctx, repo, "interactive")
 	if err != nil {
 		return 0, err
 	}
 	var failures []string
-	for _, record := range records {
-		peerID := record.Payload.PeerID
-		if peerID == repo.Config.PeerID || trusted[peerID] != record.Payload.SigningPublicKey {
+	for _, peerID := range peerIDs {
+		if unavailableContent.isKnown(repo.Config.Repository, peerID, key) {
 			continue
 		}
 		connection, stream, reader, response, openErr := Open(ctx, repo, peerID, Request{
 			Operation: "annex-range", Key: key, Offset: offset, Length: length,
 		})
 		if openErr != nil {
+			if isUnavailableContent(openErr) {
+				unavailableContent.mark(repo.Config.Repository, peerID, key)
+			}
 			failures = append(failures, peerID+": "+openErr.Error())
 			continue
 		}
@@ -701,6 +714,7 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 		}
 		if copyErr == nil {
 			if _, copyErr = io.Copy(output, &buffered); copyErr == nil {
+				unavailableContent.clear(repo.Config.Repository, peerID, key)
 				return response.TotalSize, nil
 			}
 		}
@@ -717,23 +731,19 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 	if err != nil {
 		return err
 	}
-	trusted, err := membership.LoadTrusted(repo.Config.Repository)
-	if err != nil {
-		return err
-	}
 	wantedPrefix := strings.TrimPrefix(from, "dfs-peer-")
-	var peerIDs []string
-	records, err := membership.LoadAll(repo.Config.Repository)
+	peerIDs, err := optimizedPeerIDs(ctx, repo, "bulk")
 	if err != nil {
 		return err
 	}
-	for _, record := range records {
-		if record.Payload.PeerID == repo.Config.PeerID || trusted[record.Payload.PeerID] != record.Payload.SigningPublicKey {
-			continue
+	if wantedPrefix != "" {
+		filtered := peerIDs[:0]
+		for _, peerID := range peerIDs {
+			if strings.HasPrefix(peerID, wantedPrefix) {
+				filtered = append(filtered, peerID)
+			}
 		}
-		if wantedPrefix == "" || strings.HasPrefix(record.Payload.PeerID, wantedPrefix) {
-			peerIDs = append(peerIDs, record.Payload.PeerID)
-		}
+		peerIDs = filtered
 	}
 	if len(peerIDs) == 0 {
 		return errors.New("no trusted managed content source is available")
@@ -744,12 +754,18 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 	}
 	var failures []string
 	for _, peerID := range peerIDs {
+		if wantedPrefix == "" && unavailableContent.isKnown(repo.Config.Repository, peerID, key) {
+			continue
+		}
 		temporary, err := os.CreateTemp(stateDirectory, "managed-content-*")
 		if err != nil {
 			return err
 		}
 		temporaryPath := temporary.Name()
 		_, fetchErr := FetchContent(ctx, repo, peerID, key, temporary)
+		if isUnavailableContent(fetchErr) {
+			unavailableContent.mark(repo.Config.Repository, peerID, key)
+		}
 		closeErr := temporary.Close()
 		if fetchErr == nil {
 			fetchErr = closeErr
@@ -759,11 +775,69 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 		}
 		_ = os.Remove(temporaryPath)
 		if fetchErr == nil {
+			unavailableContent.clear(repo.Config.Repository, peerID, key)
 			return nil
 		}
 		failures = append(failures, peerID+": "+fetchErr.Error())
 	}
 	return fmt.Errorf("managed content fetch failed: %s", strings.Join(failures, "; "))
+}
+
+func optimizedPeerIDs(ctx context.Context, repo *repository.Repository, profile string) ([]string, error) {
+	filesystemID, err := repo.FileSystemID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	members, err := optimization.CurrentMembers(repo.Config.Repository, filesystemID, repo.Config.PeerID)
+	if err != nil {
+		return nil, err
+	}
+	state, err := optimization.Load(repo.Config.Repository)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load DFS source optimization: %w", err)
+	}
+	return optimization.OrderedPeerIDs(state, profile, members, repo.Config.PeerID), nil
+}
+
+const unavailableContentTTL = 5 * time.Minute
+
+var unavailableContent = &contentAvailability{entries: make(map[string]time.Time)}
+
+type contentAvailability struct {
+	mu      sync.Mutex
+	entries map[string]time.Time
+}
+
+func (availability *contentAvailability) key(repositoryPath, peerID, key string) string {
+	return repositoryPath + "\x00" + peerID + "\x00" + key
+}
+
+func (availability *contentAvailability) isKnown(repositoryPath, peerID, key string) bool {
+	availability.mu.Lock()
+	defer availability.mu.Unlock()
+	cacheKey := availability.key(repositoryPath, peerID, key)
+	observed, found := availability.entries[cacheKey]
+	if found && time.Since(observed) >= unavailableContentTTL {
+		delete(availability.entries, cacheKey)
+		return false
+	}
+	return found
+}
+
+func (availability *contentAvailability) mark(repositoryPath, peerID, key string) {
+	availability.mu.Lock()
+	defer availability.mu.Unlock()
+	availability.entries[availability.key(repositoryPath, peerID, key)] = time.Now()
+}
+
+func (availability *contentAvailability) clear(repositoryPath, peerID, key string) {
+	availability.mu.Lock()
+	defer availability.mu.Unlock()
+	delete(availability.entries, availability.key(repositoryPath, peerID, key))
+}
+
+func isUnavailableContent(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "annex content is unavailable")
 }
 
 func Probe(ctx context.Context, repo *repository.Repository, peerID string) error {

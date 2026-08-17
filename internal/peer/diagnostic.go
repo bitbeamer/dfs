@@ -14,6 +14,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/managed"
+	"github.com/bitbeamer/dfs/internal/optimization"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
@@ -42,6 +43,7 @@ type DiagnosticReport struct {
 	ConfiguredPeers      int                    `json:"configured_peers"`
 	ReconciliationStatus string                 `json:"reconciliation_status"`
 	Stats                repository.HealthStats `json:"stats"`
+	Optimization         *optimization.State    `json:"optimization,omitempty"`
 	Issues               []HealthIssue          `json:"issues,omitempty"`
 	Remotes              []RemoteDiagnostic     `json:"remotes"`
 }
@@ -103,6 +105,9 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	report := DiagnosticReport{Version: 2, ObservedAt: time.Now().UTC(), FileSystemID: filesystemID,
 		NetworkName: repo.Config.NetworkName, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
 		TreeID: treeID, ConfiguredPeers: len(remotes), Stats: stats, ReconciliationStatus: "ready"}
+	if state, stateErr := optimization.LoadCurrent(repo.Config.Repository, filesystemID, repo.Config.PeerID); stateErr == nil {
+		report.Optimization = &state
+	}
 	if state, stateErr := readRuntimeState(repo.Config.Repository); stateErr == nil {
 		report.Endpoint = state.Endpoint
 		if endpoint, parseErr := url.Parse(state.Endpoint); parseErr == nil {

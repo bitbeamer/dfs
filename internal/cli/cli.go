@@ -21,6 +21,7 @@ import (
 	dfscore "github.com/bitbeamer/dfs/internal/daemon"
 	"github.com/bitbeamer/dfs/internal/managed"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
+	"github.com/bitbeamer/dfs/internal/optimization"
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 	dfssetup "github.com/bitbeamer/dfs/internal/setup"
@@ -51,7 +52,7 @@ func New() *cobra.Command {
 	root.AddCommand(
 		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
 		app.storageCommand(), app.daemonCommand(),
-		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.syncCommand(), app.statusCommand(),
+		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.optimizeCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
 		app.cacheCommand(), app.historyCommand(), app.restoreCommand(), app.conflictsCommand(),
 		app.doctorCommand(),
@@ -739,6 +740,135 @@ func (a *App) healthCommand() *cobra.Command {
 	return a.newHealthCommand("health", false)
 }
 
+func (a *App) optimizeCommand() *cobra.Command {
+	var cluster, asJSON bool
+	cmd := &cobra.Command{
+		Use: "optimize", Args: cobra.NoArgs,
+		Short: "Measure peer transfer performance and persist source priorities",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
+			progress := func(update managed.OptimizationProgress) {
+				if asJSON {
+					return
+				}
+				if update.Stage == "peer" {
+					fmt.Fprintf(a.Out, "Optimizing %s...\n", optimizationPeerName(update.PeerName, update.PeerID))
+					return
+				}
+				fmt.Fprintf(a.Out, "  %-16s %-11s sample %d/%d\n", optimizationPeerName(update.PeerName, update.PeerID), update.Stage, update.Sample, update.Samples)
+			}
+			if cluster {
+				result, optimizeErr := managed.OptimizeCluster(ctx, repo, progress)
+				if asJSON {
+					return writeOptimizationJSON(a.Out, result)
+				}
+				printClusterOptimization(a.Out, result)
+				return optimizeErr
+			}
+			state, optimizeErr := managed.OptimizeLocal(ctx, repo, progress)
+			if asJSON {
+				return writeOptimizationJSON(a.Out, state)
+			}
+			if optimizeErr == nil {
+				printOptimizationState(a.Out, "Current peer", state)
+			}
+			return optimizeErr
+		},
+	}
+	cmd.Flags().BoolVar(&cluster, "cluster", false, "optimize source priorities on every responding cluster peer")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the optimization result as JSON")
+	return cmd
+}
+
+func writeOptimizationJSON(output io.Writer, value any) error {
+	encoder := json.NewEncoder(output)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func printClusterOptimization(output io.Writer, result managed.ClusterOptimization) {
+	fmt.Fprintln(output, "\nDFS CLUSTER OPTIMIZATION")
+	fmt.Fprintln(output, "\nDirected measurements")
+	matrix := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(matrix, "FROM\tTO\tSTATUS\tTTFB MED/P95\tINTERACTIVE MED/P10\tBULK MED/P10")
+	for _, outcome := range result.Peers {
+		from := optimizationPeerName(outcome.PeerName, outcome.PeerID)
+		if outcome.Error != "" {
+			fmt.Fprintf(matrix, "%s\t-\tOFFLINE\t-\t-\t-\n", from)
+			continue
+		}
+		for _, item := range outcome.State.Measurements {
+			fmt.Fprintf(matrix, "%s\t%s\t%s\t%.1f/%.1f ms\t%.1f/%.1f Mbps\t%.1f/%.1f Mbps\n",
+				from, optimizationPeerName(item.PeerName, item.PeerID), item.Status, item.TTFBMedianMS, item.TTFBP95MS,
+				item.InteractiveMedianMbps, item.InteractiveP10Mbps, item.BulkMedianMbps, item.BulkP10Mbps)
+		}
+	}
+	_ = matrix.Flush()
+	for _, outcome := range result.Peers {
+		name := optimizationPeerName(outcome.PeerName, outcome.PeerID)
+		if outcome.Error != "" {
+			fmt.Fprintf(output, "\n%s: OFFLINE (%s)\n", name, compactHealthDetail(outcome.Error))
+			continue
+		}
+		printOptimizationState(output, name, outcome.State)
+	}
+}
+
+func printOptimizationState(output io.Writer, heading string, state optimization.State) {
+	status := "CURRENT"
+	if state.Stale {
+		status = "STALE"
+	}
+	fmt.Fprintf(output, "\n%s source priorities (%s, measured %s)\n", heading, status, formatHealthTime(state.OptimizedAt))
+	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "PROFILE\tORDER")
+	fmt.Fprintf(table, "interactive\t%s\n", rankedSourceNames(state.Interactive))
+	fmt.Fprintf(table, "bulk\t%s\n", rankedSourceNames(state.Bulk))
+	_ = table.Flush()
+	if len(state.Measurements) > 0 {
+		measurements := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(measurements, "SOURCE\tSTATUS\tTTFB MED/P95\tINTERACTIVE MED/P10\tBULK MED/P10\tSAMPLES/FAILURES")
+		for _, item := range state.Measurements {
+			fmt.Fprintf(measurements, "%s\t%s\t%.1f/%.1f ms\t%.1f/%.1f Mbps\t%.1f/%.1f Mbps\t%d/%d\n",
+				optimizationPeerName(item.PeerName, item.PeerID), item.Status, item.TTFBMedianMS, item.TTFBP95MS,
+				item.InteractiveMedianMbps, item.InteractiveP10Mbps, item.BulkMedianMbps, item.BulkP10Mbps, item.Samples, item.Failures)
+		}
+		_ = measurements.Flush()
+	}
+}
+
+func rankedSourceNames(sources []optimization.RankedSource) string {
+	if len(sources) == 0 {
+		return "not measured"
+	}
+	names := make([]string, 0, len(sources))
+	for index, source := range sources {
+		name := optimizationPeerName(source.PeerName, source.PeerID)
+		if source.Status != "MEASURED" {
+			name += " [" + strings.ToLower(source.Status) + "]"
+		}
+		names = append(names, fmt.Sprintf("%d. %s", index+1, name))
+	}
+	return strings.Join(names, "  ")
+}
+
+func optimizationPeerName(name, peerID string) string {
+	if name != "" {
+		return name
+	}
+	peerID = strings.TrimPrefix(peerID, "dfs-peer-")
+	if len(peerID) > 12 {
+		peerID = peerID[:12]
+	}
+	return peerID
+}
+
 type dependencyCheck struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
@@ -762,6 +892,11 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 				return errors.Join(environmentErr, err)
 			}
 			report, healthErr := dfscore.CheckHealth(repositoryPath)
+			if healthErr == nil && report.Operational != nil {
+				if state, stateErr := optimization.LoadCurrent(repositoryPath, report.Operational.FileSystemID, report.Operational.PeerID); stateErr == nil {
+					report.Operational.Optimization = &state
+				}
+			}
 			var clusterReport *peer.MeshReport
 			var clusterErr error
 			if cluster && healthErr == nil {
@@ -870,6 +1005,9 @@ func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
 		config.FormatSize(report.Stats.RangeCacheBytes), config.FormatSize(report.Stats.DiskAvailableBytes),
 		config.FormatSize(report.Stats.DiskTotalBytes))
 	printPinnedHealth(output, "", report.Stats.Pinned)
+	if report.Optimization != nil {
+		printOptimizationState(output, "Current peer", *report.Optimization)
+	}
 	if len(report.Remotes) > 0 {
 		fmt.Fprintln(output, "\nPeers")
 		table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
@@ -915,6 +1053,16 @@ func printMeshHealth(output io.Writer, report peer.MeshReport) {
 			config.FormatSize(node.Stats.DiskAvailableBytes), node.ReconciliationStatus, formatHealthTime(node.ObservedAt))
 	}
 	_ = table.Flush()
+	var optimized bool
+	for _, participant := range report.Peers {
+		if node, found := reports[participant.PeerID]; found && node.Optimization != nil {
+			if !optimized {
+				fmt.Fprintln(output, "\nSource priorities")
+				optimized = true
+			}
+			printOptimizationState(output, meshPeerLabel(participant), *node.Optimization)
+		}
+	}
 	var pinnedRows int
 	for _, node := range report.Reports {
 		pinnedRows += len(node.Stats.Pinned)

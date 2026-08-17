@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/membership"
+	"github.com/bitbeamer/dfs/internal/optimization"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
 
@@ -56,7 +57,7 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverKey, serverRecord := managedTestRecord(t, serverRepo, filesystemID, "quic://127.0.0.1:1")
-	_, clientRecord := managedTestRecord(t, clientRepo, filesystemID, "quic://127.0.0.1:1")
+	clientKey, clientRecord := managedTestRecord(t, clientRepo, filesystemID, "quic://127.0.0.1:1")
 	for _, repo := range []*repository.Repository{serverRepo, clientRepo} {
 		for _, record := range []membership.Record{serverRecord, clientRecord} {
 			if err := membership.Save(repo.Config.Repository, record); err != nil {
@@ -103,6 +104,62 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	for _, repo := range []*repository.Repository{serverRepo, clientRepo} {
 		if err := membership.Save(repo.Config.Repository, serverRecord); err != nil {
 			t.Fatal(err)
+		}
+	}
+	clientServer, err := Start(clientRepo, "127.0.0.1:0", nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientServer.Close()
+	clientRecord.Payload.QUICEndpoint = "quic://" + clientServer.Addr().String()
+	clientRecord.Payload.Generation++
+	clientRecord.Payload.UpdatedAt = time.Now().UTC()
+	clientRecord, err = membership.Sign(clientRecord.Payload, clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRecord, err = membership.Approve(clientRecord, serverRepo.Config.PeerID, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range []*repository.Repository{serverRepo, clientRepo} {
+		if err := membership.Save(repo.Config.Repository, clientRecord); err != nil {
+			t.Fatal(err)
+		}
+	}
+	localState, err := OptimizeLocal(ctx, clientRepo, nil)
+	if err != nil {
+		t.Fatalf("optimize current peer: %v", err)
+	}
+	if len(localState.Interactive) != 1 || localState.Interactive[0].PeerID != serverRepo.Config.PeerID || localState.Interactive[0].Status != "MEASURED" {
+		t.Fatalf("local interactive ranking = %#v", localState.Interactive)
+	}
+	cancelledContext, cancelOptimization := context.WithCancel(ctx)
+	cancelOptimization()
+	if _, err := OptimizeLocal(cancelledContext, clientRepo, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled optimization error = %v", err)
+	}
+	afterCancellation, err := optimization.Load(clientRepo.Config.Repository)
+	if err != nil || !afterCancellation.OptimizedAt.Equal(localState.OptimizedAt) {
+		t.Fatalf("cancelled optimization replaced stable state: %v, %#v", err, afterCancellation)
+	}
+	if _, err := os.Stat(optimization.Path(serverRepo.Config.Repository)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local optimization changed remote state: %v", err)
+	}
+	clusterState, err := OptimizeCluster(ctx, clientRepo, nil)
+	if err != nil {
+		t.Fatalf("optimize cluster: %v", err)
+	}
+	if len(clusterState.Peers) != 2 {
+		t.Fatalf("cluster optimization peers = %#v", clusterState.Peers)
+	}
+	for _, repo := range []*repository.Repository{serverRepo, clientRepo} {
+		if _, err := optimization.Load(repo.Config.Repository); err != nil {
+			t.Fatalf("load persisted optimization for %s: %v", repo.Config.Name, err)
+		}
+		status, statusErr := exec.CommandContext(ctx, "git", "-C", repo.Config.Repository, "status", "--porcelain", "--untracked-files=all").Output()
+		if statusErr != nil || len(status) != 0 {
+			t.Fatalf("optimization leaked into %s namespace: %v, %q", repo.Config.Name, statusErr, status)
 		}
 	}
 	binary := filepath.Join(home, "dfs")

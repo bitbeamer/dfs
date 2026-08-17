@@ -51,6 +51,9 @@ organizing files therefore does not require their content to be present locally.
 - Stream requested ranges of uncached files over authenticated QUIC, retaining
   resumable sparse partials privately and promoting only verified complete
   objects into git-annex.
+- Measure directed QUIC performance with `dfs optimize` and retain stable
+  interactive-read and bulk-hydration source priorities locally; add
+  `--cluster` to optimize every responding peer.
 - Diagnose dependencies and every directed authenticated QUIC path with
   `health` and `health --cluster`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
@@ -287,6 +290,36 @@ safety checks to git-annex and refuses to remove content protected by either
 scope. Open or pinned files and copy-safety rules can temporarily keep usage
 above the configured limit.
 
+### Optimize content sources
+
+DFS uses two stable source orders when more than one peer may hold content:
+`interactive` favors low time-to-first-byte for ordinary range reads, while
+`bulk` favors sustained throughput for explicit fetches and automatic pin
+hydration. Run optimization only on this peer, or coordinate it across every
+responding peer:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository optimize
+dfs --repo ~/.local/share/dfs/repository optimize --cluster
+dfs --repo ~/.local/share/dfs/repository optimize --cluster --json
+```
+
+The command performs repeated, bounded, authenticated QUIC measurements using
+deterministic in-memory data. It does not read or hydrate user content and does
+not create benchmark files. Local optimization replaces only the current
+peer's private `.git/dfs/optimization.json`; cluster optimization asks each
+responding peer to replace its own result. The terminal view shows live sample
+progress, median and tail measurements, the directed cluster matrix, and final
+orders. Offline or unmeasured trusted peers remain deterministic last-resort
+sources at the bottom of both profiles.
+
+Source orders do not adapt silently: reads, restarts, failures, and a peer
+returning online leave them unchanged until the next explicit optimization.
+Membership or endpoint changes mark a result stale and append new eligible
+sources deterministically without rewriting it. Revoked peers are excluded,
+known non-holders are temporarily skipped, failed transfers safely try the
+next source, and an explicit `fetch --from` selection is still honored.
+
 ## Inspect history and recover a path
 
 ```sh
@@ -316,7 +349,9 @@ displays the daemon's timestamped operational observation.
 That observation includes network identity and role, instance port, logical file
 count and size, repository/metadata/private-state sizes, physical cache and disk use,
 local content holdings, pins, reconciliation state, outgoing reachability, and
-actionable degraded-state guidance. The daemon refreshes it periodically without
+actionable degraded-state guidance. When optimization has been run, it also
+shows both source profiles, measurement status, and timestamp; `health
+--cluster` shows those values for every responding peer. The daemon refreshes it periodically without
 hydrating missing content. `health --cluster` actively queries every configured or
 discovered member in parallel, reports the same metrics for each responding
 peer, checks every directed connection, and compares online namespace tree IDs.

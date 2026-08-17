@@ -273,6 +273,23 @@ resumable sparse partials under the repository's private
 complete content is verified before atomic git-annex promotion. Explicit fetch
 and pin operations still hydrate the entire selected content.
 
+When several peers can supply content, measure and persist source priorities
+after installation or after a material network change:
+
+```sh
+dfs --repo ~/.local/share/dfs/repository optimize
+dfs --repo ~/.local/share/dfs/repository optimize --cluster
+```
+
+Without `--cluster`, only the current peer benchmarks its eligible sources and
+updates its private result. With `--cluster`, every responding peer performs
+the same directed QUIC measurements and updates its own result. DFS retains an
+interactive range-read order and a bulk hydration order until the corresponding
+command is run again. Benchmarks use validated in-memory bytes and create no
+user, Git, or annex content. `health` displays the local orders and timestamp;
+`health --cluster` displays them for all responding peers and marks stale,
+offline, or unmeasured sources.
+
 Health counts locally available content by logical path, while cache usage is
 physical and deduplicated: it combines unique annex objects with only the byte
 ranges retained in sparse partials and displays both components. Duplicating an
