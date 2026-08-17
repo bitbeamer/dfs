@@ -205,6 +205,12 @@ DFS then clones over authenticated QUIC, reconciles reciprocal membership,
 installs the platform service, mounts `~/dfs_storage`, and verifies health. No
 long invitation or bearer secret is copied between machines.
 
+The default setup repository is `~/.local/share/dfs/repository`. After setup,
+ordinary commands such as `dfs health`, `dfs optimize --cluster`, and `dfs pin Photos` find it automatically. DFS first honors `--repo`, then `DFS_REPO`, then
+an enclosing repository, and only then tries the setup default. Additional
+instances are never selected by guessing their names; use `--repo`, `DFS_REPO`,
+or run the command inside the intended repository.
+
 Every completed step is recorded privately and atomically. If setup is
 interrupted or a dependency is temporarily unavailable, retry it without a new
 join request while the recorded request is still valid:
@@ -244,9 +250,9 @@ health state, and managed port:
 Verify the peer:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository health
-dfs --repo ~/.local/share/dfs/repository health --cluster
-dfs --repo ~/.local/share/dfs/repository peer list
+dfs health
+dfs health --cluster
+dfs peer list
 ```
 
 `health` checks required commands and the platform FUSE dependency, then reports
@@ -277,8 +283,8 @@ When several peers can supply content, measure and persist source priorities
 after installation or after a material network change:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository optimize
-dfs --repo ~/.local/share/dfs/repository optimize --cluster
+dfs optimize
+dfs optimize --cluster
 ```
 
 Without `--cluster`, only the current peer benchmarks its eligible sources and

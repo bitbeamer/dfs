@@ -190,10 +190,7 @@ func ResolveRepository(repository string) (string, error) {
 		return "", err
 	}
 	for {
-		if _, err := os.Stat(Path(current)); err == nil {
-			return current, nil
-		}
-		if _, err := os.Stat(filepath.Join(current, LegacyDirectory, FileName)); err == nil {
+		if isRepository(current) {
 			return current, nil
 		}
 		parent := filepath.Dir(current)
@@ -202,7 +199,27 @@ func ResolveRepository(repository string) (string, error) {
 		}
 		current = parent
 	}
-	return "", errors.New("not inside a DFS repository; pass --repo or set DFS_REPO")
+	defaultRepository, err := DefaultRepositoryPath()
+	if err == nil && isRepository(defaultRepository) {
+		return defaultRepository, nil
+	}
+	return "", errors.New("no DFS repository found; pass --repo, set DFS_REPO, run inside a repository, or run dfs setup")
+}
+
+func DefaultRepositoryPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".local", "share", "dfs", "repository"), nil
+}
+
+func isRepository(repository string) bool {
+	if _, err := os.Stat(Path(repository)); err == nil {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(repository, LegacyDirectory, FileName))
+	return err == nil
 }
 
 func migrateLegacyState(repository string) error {

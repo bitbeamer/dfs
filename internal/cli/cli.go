@@ -48,7 +48,7 @@ func New() *cobra.Command {
 	}
 	root.SetOut(app.Out)
 	root.SetErr(app.Err)
-	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (or set DFS_REPO)")
+	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (otherwise use DFS_REPO, the current tree, or the setup default)")
 	root.AddCommand(
 		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
 		app.storageCommand(), app.daemonCommand(),
@@ -154,7 +154,8 @@ func (a *App) setupCommand() *cobra.Command {
 		},
 	}
 	home, _ := os.UserHomeDir()
-	command.Flags().StringVar(&repositoryPath, "repository", filepath.Join(home, ".local", "share", "dfs", "repository"), "private DFS repository path")
+	defaultRepository, _ := config.DefaultRepositoryPath()
+	command.Flags().StringVar(&repositoryPath, "repository", defaultRepository, "private DFS repository path")
 	command.Flags().StringVar(&mountpoint, "mountpoint", filepath.Join(home, "dfs_storage"), "mounted DFS volume path")
 	command.Flags().StringVar(&name, "name", "", "peer name (defaults to hostname)")
 	command.Flags().StringVar(&limit, "cache-limit", "100GiB", "maximum local content cache")

@@ -166,6 +166,14 @@ The new peer then joins over QUIC, completes reciprocal registration, installs
 the platform user service, mounts the default `~/dfs_storage`, and verifies
 health. No invitation secret is copied between machines.
 
+Setup stores the first/default repository at
+`~/.local/share/dfs/repository`. Ordinary commands automatically use that path
+when no repository was selected explicitly and the current directory is not
+inside another DFS repository. Resolution order is `--repo`, `DFS_REPO`, the
+current directory or one of its parents, then the setup default. DFS never
+guesses among additional `repository-*` instances; select those with `--repo`,
+`DFS_REPO`, or by running the command inside that repository.
+
 If setup is interrupted, continue or roll it back:
 
 ```sh
@@ -267,15 +275,15 @@ rm ~/dfs_storage/Archive/old.pdf
 Control local or cluster-wide content placement explicitly:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository fetch Documents/report.pdf
-dfs --repo ~/.local/share/dfs/repository pin Photos/Vacation
-dfs --repo ~/.local/share/dfs/repository pin --cluster Shared/Reference
-dfs --repo ~/.local/share/dfs/repository unpin Photos/Vacation
-dfs --repo ~/.local/share/dfs/repository unpin --cluster Shared/Reference
-dfs --repo ~/.local/share/dfs/repository evict Movies/large.mkv
-dfs --repo ~/.local/share/dfs/repository cache status
-dfs --repo ~/.local/share/dfs/repository cache set-limit 75GiB
-dfs --repo ~/.local/share/dfs/repository cache prune
+dfs fetch Documents/report.pdf
+dfs pin Photos/Vacation
+dfs pin --cluster Shared/Reference
+dfs unpin Photos/Vacation
+dfs unpin --cluster Shared/Reference
+dfs evict Movies/large.mkv
+dfs cache status
+dfs cache set-limit 75GiB
+dfs cache prune
 ```
 
 `fetch` caches content temporarily. `pin` creates a peer-local policy;
@@ -299,9 +307,9 @@ hydration. Run optimization only on this peer, or coordinate it across every
 responding peer:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository optimize
-dfs --repo ~/.local/share/dfs/repository optimize --cluster
-dfs --repo ~/.local/share/dfs/repository optimize --cluster --json
+dfs optimize
+dfs optimize --cluster
+dfs optimize --cluster --json
 ```
 
 The command performs repeated, bounded, authenticated QUIC measurements using
@@ -323,10 +331,10 @@ next source, and an explicit `fetch --from` selection is still honored.
 ## Inspect history and recover a path
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository status
-dfs --repo ~/.local/share/dfs/repository history Documents/report.pdf
-dfs --repo ~/.local/share/dfs/repository restore <commit> Documents/report.pdf
-dfs --repo ~/.local/share/dfs/repository conflicts
+dfs status
+dfs history Documents/report.pdf
+dfs restore <commit> Documents/report.pdf
+dfs conflicts
 ```
 
 Restore creates a new commit and never rewrites shared history. Git history
@@ -337,10 +345,10 @@ dropped.
 ## Check health and cluster connectivity
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository health
-dfs --repo ~/.local/share/dfs/repository health --json
-dfs --repo ~/.local/share/dfs/repository health --cluster
-dfs --repo ~/.local/share/dfs/repository health --cluster --json
+dfs health
+dfs health --json
+dfs health --cluster
+dfs health --cluster --json
 ```
 
 `health` checks all required commands and the platform FUSE dependency, validates

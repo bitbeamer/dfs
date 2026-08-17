@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -129,6 +130,75 @@ func TestValidateHostnameTreatsLocalSuffixAsEquivalent(t *testing.T) {
 	hostnameProvider = func() (string, error) { return "ZEUS.local.", nil }
 	cfg := Config{Hostname: "zeus", PeerID: "peer"}
 	if err := ValidateHostname(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveRepositoryFallsBackToSetupDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	workingDirectory := t.TempDir()
+	t.Chdir(workingDirectory)
+	defaultRepository := filepath.Join(home, ".local", "share", "dfs", "repository")
+	writeRepositoryMarker(t, defaultRepository)
+
+	resolved, err := ResolveRepository("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != defaultRepository {
+		t.Fatalf("resolved repository = %q, want default %q", resolved, defaultRepository)
+	}
+}
+
+func TestResolveRepositoryPrecedence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaultRepository := filepath.Join(home, ".local", "share", "dfs", "repository")
+	writeRepositoryMarker(t, defaultRepository)
+	enclosing := filepath.Join(t.TempDir(), "enclosing")
+	writeRepositoryMarker(t, enclosing)
+	child := filepath.Join(enclosing, "nested", "directory")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(child)
+
+	resolved, err := ResolveRepository("")
+	if err != nil || resolved != enclosing {
+		t.Fatalf("enclosing resolution = %q, %v; want %q", resolved, err, enclosing)
+	}
+	environment := filepath.Join(t.TempDir(), "environment")
+	t.Setenv("DFS_REPO", environment)
+	resolved, err = ResolveRepository("")
+	if err != nil || resolved != environment {
+		t.Fatalf("environment resolution = %q, %v; want %q", resolved, err, environment)
+	}
+	explicit := filepath.Join(t.TempDir(), "explicit")
+	resolved, err = ResolveRepository(explicit)
+	if err != nil || resolved != explicit {
+		t.Fatalf("explicit resolution = %q, %v; want %q", resolved, err, explicit)
+	}
+}
+
+func TestResolveRepositoryDoesNotGuessNonDefaultInstances(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("DFS_REPO", "")
+	t.Chdir(t.TempDir())
+	writeRepositoryMarker(t, filepath.Join(home, ".local", "share", "dfs", "repository-archive"))
+
+	if _, err := ResolveRepository(""); err == nil || !strings.Contains(err.Error(), "no DFS repository found") {
+		t.Fatalf("ResolveRepository error = %v", err)
+	}
+}
+
+func writeRepositoryMarker(t *testing.T, repository string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(Path(repository)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(Path(repository), []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
