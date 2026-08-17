@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -52,4 +53,18 @@ func (s *Service) Health(ctx context.Context) (HealthSnapshot, error) {
 			MissingFiles: pin.MissingFiles, MissingBytes: pin.MissingBytes})
 	}
 	return result, nil
+}
+
+func (s *Service) Capacity(ctx context.Context) (FilesystemCapacity, error) {
+	if err := ctx.Err(); err != nil {
+		return FilesystemCapacity{}, classify("capacity", "", err)
+	}
+	var stats syscall.Statfs_t
+	if err := syscall.Statfs(s.root, &stats); err != nil {
+		return FilesystemCapacity{}, classify("capacity", "", err)
+	}
+	return FilesystemCapacity{
+		Blocks: uint64(stats.Blocks), FreeBlocks: uint64(stats.Bfree), AvailBlocks: uint64(stats.Bavail),
+		Files: uint64(stats.Files), FreeFiles: uint64(stats.Ffree), BlockSize: uint32(stats.Bsize), NameLength: 255,
+	}, nil
 }

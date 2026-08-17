@@ -137,6 +137,18 @@ func (f *FileSystem) changed(reason string, attributes ...any) {
 	}
 }
 
+func (f *FileSystem) StatFs(string) *fuse.StatfsOut {
+	capacity, err := f.core.Capacity(f.lifetime)
+	if err != nil {
+		return nil
+	}
+	return &fuse.StatfsOut{
+		Blocks: capacity.Blocks, Bfree: capacity.FreeBlocks, Bavail: capacity.AvailBlocks,
+		Files: capacity.Files, Ffree: capacity.FreeFiles, Bsize: capacity.BlockSize,
+		Frsize: capacity.BlockSize, NameLen: capacity.NameLength,
+	}
+}
+
 func (f *FileSystem) withMutation(operation func() error) fuse.Status {
 	if f.notifier != nil {
 		f.notifier.BeginWrite()

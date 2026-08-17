@@ -310,7 +310,7 @@ dfs --repo ~/.local/share/dfs/repository health --cluster --json
 the private `.git/dfs/health.json` heartbeat, owner process, and mountpoint, then
 displays the daemon's timestamped operational observation.
 That observation includes network identity and role, instance port, logical file
-count and size, repository/metadata/private-state sizes, cache and disk use,
+count and size, repository/metadata/private-state sizes, physical cache and disk use,
 local content holdings, pins, reconciliation state, outgoing reachability, and
 actionable degraded-state guidance. The daemon refreshes it periodically without
 hydrating missing content. `health --cluster` actively queries every configured or
@@ -320,6 +320,12 @@ The human-readable view is a compact peer and connection summary with shortened,
 deduplicated errors; `--json` retains environment, service, and optional cluster
 objects with complete diagnostic details. The command exits unsuccessfully when
 dependencies are missing or the cluster is incomplete or inconsistent.
+
+Content holdings count logical paths whose annex object is locally available;
+duplicate paths can therefore share one deduplicated object. Cache usage is
+physical unique annex-object content plus the byte ranges actually retained in
+the sparse range cache, and reports both components separately. A duplicate of
+an already-local file does not consume the file's logical size again.
 
 `health --cluster` asks every known mounted peer to test every configured peer in both directions:
 `desktop -> laptop` and `laptop -> desktop` are separate rows. Each read-only

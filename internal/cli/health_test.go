@@ -16,14 +16,14 @@ func TestPrintNodeHealthIncludesOperationalDetailsAndActions(t *testing.T) {
 		NetworkName: "Home", PeerName: "iris", Role: "member", InstancePort: 7843,
 		MembershipMembers: 3, ConfiguredPeers: 2, ReconciliationStatus: "ready",
 		Stats: repository.HealthStats{LogicalFiles: 4, LogicalBytes: 1024, ContentFiles: 2, ContentBytes: 512,
-			CacheBytes: 600, CacheLimitBytes: 2048, RepositoryBytes: 4096, MetadataBytes: 3000,
+			CacheBytes: 600, AnnexCacheBytes: 500, RangeCacheBytes: 100, CacheLimitBytes: 2048, RepositoryBytes: 4096, MetadataBytes: 3000,
 			PrivateStateBytes: 1000, DiskAvailableBytes: 1 << 30, DiskTotalBytes: 2 << 30,
 			Pinned: []repository.PinnedPathHealth{{Path: "Media", Scope: "cluster", Status: "hydrating", Kind: "directory", LogicalFiles: 2, LogicalBytes: 768}}},
 		Issues: []peer.HealthIssue{{Code: "PEER_UNREACHABLE", Severity: "warning", Detail: "offline", Action: "open UDP"}},
 	}
 	var output bytes.Buffer
 	printNodeHealth(&output, report)
-	for _, wanted := range []string{"Status: DEGRADED", "Namespace: 4 files", "Content: 2 local files", "Storage: repo 4.0 KiB", "Pinned content", "Media", "CLUSTER", "HYDRATING", "768 B", "Action: open UDP"} {
+	for _, wanted := range []string{"Status: DEGRADED", "Namespace: 4 files", "Content: 2 locally available paths", "Storage: repo 4.0 KiB", "annex 500 B, ranges 100 B", "Pinned content", "Media", "CLUSTER", "HYDRATING", "768 B", "Action: open UDP"} {
 		if !strings.Contains(output.String(), wanted) {
 			t.Fatalf("health output does not contain %q:\n%s", wanted, output.String())
 		}

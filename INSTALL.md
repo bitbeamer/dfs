@@ -248,7 +248,7 @@ dfs --repo ~/.local/share/dfs/repository peer list
 
 `health` checks required commands and the platform FUSE dependency, then reports
 the independent core plus filesystem identity, logical size and file count,
-instance port, role, repository and metadata size, cache and disk use, content
+instance port, role, repository and metadata size, physical cache and disk use, content
 holdings, pins, reconciliation, and timestamped peer observations.
 `health --cluster` actively collects those details from all responding members,
 compares namespace convergence, and verifies every directed peer edge. Use
@@ -269,6 +269,12 @@ resumable sparse partials under the repository's private
 `.git/dfs/range-cache`. Concurrent reads of duplicate annex content coalesce;
 complete content is verified before atomic git-annex promotion. Explicit fetch
 and pin operations still hydrate the entire selected content.
+
+Health counts locally available content by logical path, while cache usage is
+physical and deduplicated: it combines unique annex objects with only the byte
+ranges retained in sparse partials and displays both components. Duplicating an
+already-local file therefore adds another logical path without consuming the
+file's full size again.
 
 `health --cluster` verifies authenticated QUIC for every directed peer pair.
 An unavailable member is reported without delaying healthy-peer operations or

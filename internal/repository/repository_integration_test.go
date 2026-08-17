@@ -193,6 +193,30 @@ func TestHealthStatsReportNamespaceAndStorageWithoutHydration(t *testing.T) {
 	if stats.RepositoryBytes <= 0 || stats.MetadataBytes <= 0 || stats.DiskAvailableBytes <= 0 {
 		t.Fatalf("storage stats = %+v", stats)
 	}
+	rangeDirectory := filepath.Join(repo.Config.Repository, ".git", "dfs", "range-cache")
+	if err := os.MkdirAll(rangeDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"key":"test-key","size":1073741824,"ranges":[{"start":0,"end":4194304}]}`)
+	if err := os.WriteFile(filepath.Join(rangeDirectory, "test.json"), metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rangeDirectory, "test.partial"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(rangeDirectory, "test.partial"), 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	withRange, err := repo.HealthStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withRange.RangeCacheBytes != 4<<20 || withRange.CacheBytes != withRange.AnnexCacheBytes+4<<20 {
+		t.Fatalf("range cache stats = %+v", withRange)
+	}
+	if withRange.PrivateStateBytes-stats.PrivateStateBytes > 1<<20 || withRange.MetadataBytes-stats.MetadataBytes > 1<<20 {
+		t.Fatalf("sparse range apparent size leaked into metadata stats: before=%+v after=%+v", stats, withRange)
+	}
 	if _, err := repo.runner.Run(ctx, "git", "annex", "drop", "--force", "--", "item.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -271,6 +295,57 @@ func TestDirectionalPushPublishesThroughPeerInbox(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(receiver.Config.Repository, "event.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("received inbox retained deleted file: %v", err)
+	}
+}
+
+func TestDirectionalPushRetriesTransientReceiveFailure(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	defer makeTreeWritable(home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\n\tname = DFS Test\n\temail = dfs@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	source, err := Init(ctx, filepath.Join(home, "source"), "source", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	receiver, err := Join(ctx, source.Config.Repository, filepath.Join(home, "receiver"), "receiver", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	marker := filepath.Join(home, "first-receive-failed")
+	helper := filepath.Join(home, "transient-receive")
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = git-receive-pack ] && [ ! -e %q ]; then\n  : > %q\n  exit 1\nfi\nexec \"$1\" \"$2\"\n", marker, marker)
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.runner.Run(ctx, "git", "config", "protocol.ext.allow", "always"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.AddRemote(ctx, "receiver", "ext::"+helper+" %S "+receiver.Config.Repository); err != nil {
+		t.Fatal(err)
+	}
+	source.clearRemoteFailure("receiver")
+	if err := os.WriteFile(filepath.Join(source.Config.Repository, "retried.txt"), []byte("retry me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SyncDirectional(ctx, true, false, true); err != nil {
+		t.Fatalf("directional push did not recover from transient receive failure: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("transient receive failure was not exercised: %v", err)
+	}
+	inbox := "refs/heads/dfs-incoming/" + source.Config.PeerID + "/main"
+	if _, err := receiver.runner.Run(ctx, "git", "rev-parse", "--verify", inbox); err != nil {
+		t.Fatalf("retried push did not publish receiver inbox: %v", err)
 	}
 }
 

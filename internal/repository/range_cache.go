@@ -340,17 +340,43 @@ type rangeCacheEntry struct {
 	updated  time.Time
 }
 
+func (r *Repository) rangeCacheUsage() (int64, error) {
+	paths, err := filepath.Glob(filepath.Join(r.Config.Repository, ".git", "dfs", "range-cache", "*.json"))
+	if err != nil {
+		return 0, err
+	}
+	var used int64
+	for _, metadataPath := range paths {
+		data, readErr := os.ReadFile(metadataPath)
+		if readErr != nil {
+			continue
+		}
+		var metadata rangeMetadata
+		if json.Unmarshal(data, &metadata) != nil {
+			continue
+		}
+		for _, extent := range mergeRanges(metadata.Ranges) {
+			used += extent.End - extent.Start
+		}
+	}
+	return used, nil
+}
+
 // pruneRangeCache keeps partial content inside the peer's configured cache
 // budget. In-flight objects are never removed; the oldest resumable partials
 // are discarded first.
 func (r *Repository) pruneRangeCache(currentKey string, incoming int64) error {
 	directory := filepath.Join(r.Config.Repository, ".git", "dfs", "range-cache")
+	annexUsed, err := directorySize(filepath.Join(r.Config.Repository, ".git", "annex", "objects"), nil)
+	if err != nil {
+		return err
+	}
 	paths, err := filepath.Glob(filepath.Join(directory, "*.json"))
 	if err != nil {
 		return err
 	}
 	var entries []rangeCacheEntry
-	var used int64
+	used := annexUsed
 	for _, metadataPath := range paths {
 		data, readErr := os.ReadFile(metadataPath)
 		if readErr != nil {

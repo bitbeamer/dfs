@@ -861,12 +861,13 @@ func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
 	fmt.Fprintf(output, "Namespace: %d files, %s logical  Reconciliation: %s  Members: %d (%d configured peers)\n",
 		report.Stats.LogicalFiles, config.FormatSize(report.Stats.LogicalBytes), report.ReconciliationStatus,
 		report.MembershipMembers, report.ConfiguredPeers)
-	fmt.Fprintf(output, "Content: %d local files, %s  Pins: %d (%d missing)\n",
+	fmt.Fprintf(output, "Content: %d locally available paths, %s logical  Pins: %d (%d missing)\n",
 		report.Stats.ContentFiles, config.FormatSize(report.Stats.ContentBytes), report.Stats.PinnedPaths, report.Stats.MissingPinnedFiles)
-	fmt.Fprintf(output, "Storage: repo %s (metadata %s, private %s)  Cache: %s/%s  Disk free: %s/%s\n",
+	fmt.Fprintf(output, "Storage: repo %s (metadata %s, private %s)  Cache: %s/%s (annex %s, ranges %s)  Disk free: %s/%s\n",
 		config.FormatSize(report.Stats.RepositoryBytes), config.FormatSize(report.Stats.MetadataBytes),
 		config.FormatSize(report.Stats.PrivateStateBytes), config.FormatSize(report.Stats.CacheBytes),
-		config.FormatSize(report.Stats.CacheLimitBytes), config.FormatSize(report.Stats.DiskAvailableBytes),
+		config.FormatSize(report.Stats.CacheLimitBytes), config.FormatSize(report.Stats.AnnexCacheBytes),
+		config.FormatSize(report.Stats.RangeCacheBytes), config.FormatSize(report.Stats.DiskAvailableBytes),
 		config.FormatSize(report.Stats.DiskTotalBytes))
 	printPinnedHealth(output, "", report.Stats.Pinned)
 	if len(report.Remotes) > 0 {

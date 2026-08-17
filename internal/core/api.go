@@ -64,6 +64,7 @@ type History interface {
 
 type Health interface {
 	Health(context.Context) (HealthSnapshot, error)
+	Capacity(context.Context) (FilesystemCapacity, error)
 }
 
 type Events interface {
@@ -218,6 +219,19 @@ type HealthSnapshot struct {
 	MissingPinnedFiles int64
 	DiskAvailableBytes int64
 	Pins               []PinHealth
+}
+
+// FilesystemCapacity describes the backing storage available to a frontend.
+// Values are physical storage counters, not logical namespace size or DFS
+// cache quotas.
+type FilesystemCapacity struct {
+	Blocks      uint64
+	FreeBlocks  uint64
+	AvailBlocks uint64
+	Files       uint64
+	FreeFiles   uint64
+	BlockSize   uint32
+	NameLength  uint32
 }
 
 type PinHealth struct {

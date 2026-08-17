@@ -570,9 +570,15 @@ func (r *Repository) SyncDirectional(ctx context.Context, metadataOnly, pull, pu
 		inbox := fmt.Sprintf("refs/heads/dfs-incoming/%s/main", r.Config.PeerID)
 		for _, remote := range available {
 			go func(remote Remote) {
-				pushCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
-				defer cancel()
-				_, pushErr := r.runner.Run(pushCtx, "git", "push", "--porcelain", remote.Name, "refs/heads/main:"+inbox)
+				var pushErr error
+				for attempt := 0; attempt < remoteSyncAttempts; attempt++ {
+					pushCtx, cancel := context.WithTimeout(ctx, remoteSyncTimeout)
+					_, pushErr = r.runner.Run(pushCtx, "git", "push", "--porcelain", remote.Name, "refs/heads/main:"+inbox)
+					cancel()
+					if pushErr == nil {
+						break
+					}
+				}
 				pushResults <- RemoteSyncFailure{Remote: remote.Name, Err: pushErr}
 			}(remote)
 		}
@@ -1035,7 +1041,7 @@ func (r *Repository) CacheUsage() (int64, error) {
 
 func (r *Repository) cacheUsageLocked() (int64, error) {
 	root := filepath.Join(r.Config.Repository, ".git", "annex", "objects")
-	var size int64
+	var annexBytes int64
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1048,14 +1054,18 @@ func (r *Repository) cacheUsageLocked() (int64, error) {
 			if err != nil {
 				return err
 			}
-			size += info.Size()
+			annexBytes += info.Size()
 		}
 		return nil
 	})
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return r.rangeCacheUsage()
 	}
-	return size, err
+	if err != nil {
+		return 0, err
+	}
+	rangeBytes, err := r.rangeCacheUsage()
+	return annexBytes + rangeBytes, err
 }
 
 func (r *Repository) CachedFiles(ctx context.Context) ([]CachedFile, error) {
@@ -1079,6 +1089,12 @@ func (r *Repository) CachedFiles(ctx context.Context) ([]CachedFile, error) {
 }
 
 func (r *Repository) Prune(ctx context.Context) ([]string, error) {
+	// Sparse ranges and hydrated annex objects share one configured cache
+	// budget. Reclaim inactive ranges first, then drop whole annex objects if
+	// the combined cache is still above its limit.
+	if err := r.pruneRangeCache("", 0); err != nil {
+		return nil, err
+	}
 	usage, err := r.CacheUsage()
 	if err != nil || usage <= r.Config.CacheLimit {
 		return nil, err

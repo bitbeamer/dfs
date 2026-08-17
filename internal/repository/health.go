@@ -23,6 +23,8 @@ type HealthStats struct {
 	PinnedPaths        int64              `json:"pinned_paths"`
 	MissingPinnedFiles int64              `json:"missing_pinned_files"`
 	CacheBytes         int64              `json:"cache_bytes"`
+	AnnexCacheBytes    int64              `json:"annex_cache_bytes"`
+	RangeCacheBytes    int64              `json:"range_cache_bytes"`
 	CacheLimitBytes    int64              `json:"cache_limit_bytes"`
 	RepositoryBytes    int64              `json:"repository_bytes"`
 	MetadataBytes      int64              `json:"metadata_bytes"`
@@ -109,18 +111,27 @@ func (r *Repository) HealthStats(ctx context.Context) (HealthStats, error) {
 		}
 	}
 	stats.Pinned = pinnedPathHealth(pinRecords, fileSizes, local, annexed)
-	stats.CacheBytes, err = directorySize(filepath.Join(r.Config.Repository, ".git", "annex", "objects"), nil)
+	objects := filepath.Clean(filepath.Join(r.Config.Repository, ".git", "annex", "objects"))
+	rangeCache := filepath.Clean(filepath.Join(r.Config.Repository, ".git", "dfs", "range-cache"))
+	stats.AnnexCacheBytes, err = directorySize(objects, nil)
 	if err != nil {
 		return HealthStats{}, err
 	}
-	objects := filepath.Clean(filepath.Join(r.Config.Repository, ".git", "annex", "objects"))
+	stats.RangeCacheBytes, err = r.rangeCacheUsage()
+	if err != nil {
+		return HealthStats{}, err
+	}
+	stats.CacheBytes = stats.AnnexCacheBytes + stats.RangeCacheBytes
 	stats.MetadataBytes, err = directorySize(filepath.Join(r.Config.Repository, ".git"), func(path string, entry fs.DirEntry) bool {
-		return entry.IsDir() && filepath.Clean(path) == objects
+		cleaned := filepath.Clean(path)
+		return entry.IsDir() && (cleaned == objects || cleaned == rangeCache)
 	})
 	if err != nil {
 		return HealthStats{}, err
 	}
-	stats.PrivateStateBytes, err = directorySize(filepath.Join(r.Config.Repository, ".git", "dfs"), nil)
+	stats.PrivateStateBytes, err = directorySize(filepath.Join(r.Config.Repository, ".git", "dfs"), func(path string, entry fs.DirEntry) bool {
+		return entry.IsDir() && filepath.Clean(path) == rangeCache
+	})
 	if err != nil {
 		return HealthStats{}, err
 	}

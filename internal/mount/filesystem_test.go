@@ -62,6 +62,14 @@ func TestStatusDoesNotReportGenericFailuresAsUnimplemented(t *testing.T) {
 	}
 }
 
+func TestStatFsReportsBackingFilesystemCapacity(t *testing.T) {
+	filesystem, _, _ := testFileSystem(t, t.TempDir())
+	stats := filesystem.StatFs("")
+	if stats == nil || stats.Blocks == 0 || stats.Bavail == 0 || stats.Bsize == 0 || stats.NameLen == 0 {
+		t.Fatalf("StatFs() = %+v, want usable backing filesystem capacity", stats)
+	}
+}
+
 func TestPrivateCoreStateIsNeverVisible(t *testing.T) {
 	filesystem, _, _ := testFileSystem(t, t.TempDir())
 	for _, path := range []string{".git", ".git/dfs", "folder/.git/config"} {
