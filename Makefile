@@ -1,8 +1,11 @@
 BINARY := bin/dfs
-.PHONY: build test test-integration test-mount clean
+.PHONY: build dev-upgrade test test-integration test-mount clean
 
 build:
 	go build -ldflags "-X github.com/bitbeamer/dfs/internal/cli.Version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o $(BINARY) ./cmd/dfs
+
+dev-upgrade:
+	./scripts/dev-upgrade.sh
 
 test:
 	go test ./...

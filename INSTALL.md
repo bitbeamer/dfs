@@ -69,6 +69,21 @@ make build
 
 ## Updating a managed installation from source
 
+For a normal development checkout on each peer, use the automated local
+workflow:
+
+```sh
+cd ~/dfs
+./scripts/dev-upgrade.sh --dry-run
+./scripts/dev-upgrade.sh
+```
+
+The script refuses dirty source state, updates directly from `origin/main`,
+builds a native candidate, previews the transaction, upgrades every local DFS
+service, and verifies the installed services and local health. It supports
+both ordinary Git checkouts and the project's local Jujutsu workflow. Use
+`--no-fetch` only to install the already checked-out commit.
+
 Build the new binary in the DFS source checkout before replacing the running
 version:
 

@@ -232,6 +232,16 @@ Each local filesystem receives filesystem-specific core and mount services,
 separate health/runtime data, separate logs, and the first available transport
 port. Installing or uninstalling one instance does not replace the others.
 
+Update a source-built development peer directly from `origin/main` with:
+
+```sh
+./scripts/dev-upgrade.sh --dry-run
+./scripts/dev-upgrade.sh
+```
+
+This builds natively, upgrades every local filesystem service transactionally,
+and verifies local service and health state. Run it independently on each peer.
+
 ```sh
 dfs service list
 dfs service show --filesystem "Home Files"
