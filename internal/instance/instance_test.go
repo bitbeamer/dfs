@@ -313,6 +313,64 @@ func TestRestartWaitsForLaunchdToUnloadBeforeStarting(t *testing.T) {
 	}
 }
 
+func TestRepairWaitsForLaunchdToUnloadBeforeRestoringState(t *testing.T) {
+	home := t.TempDir()
+	serviceID := "123456789abc"
+	binary := filepath.Join(home, "dfs")
+	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"core", "mount"} {
+		if err := os.WriteFile(filepath.Join(home, "io.bitbeamer.dfs."+kind+"."+serviceID+".plist"), []byte("plist"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded := map[string]bool{}
+	bootstrapped := map[string]bool{}
+	printCalls := map[string]int{}
+	for _, kind := range []string{"core", "mount"} {
+		loaded["gui/501/io.bitbeamer.dfs."+kind+"."+serviceID] = true
+	}
+	manager := &manager{platform: "darwin", launchdDir: home, domain: "gui/501", run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+		if name != "launchctl" || len(arguments) == 0 {
+			return nil, nil
+		}
+		switch arguments[0] {
+		case "print":
+			if len(arguments) != 2 {
+				return nil, errors.New("invalid print arguments")
+			}
+			label := arguments[1]
+			printCalls[label]++
+			if loaded[label] {
+				if !bootstrapped[label] {
+					loaded[label] = false
+				}
+				return nil, nil
+			}
+			return nil, errors.New("not loaded")
+		case "bootstrap":
+			if len(arguments) != 3 {
+				return nil, errors.New("invalid bootstrap arguments")
+			}
+			label := "gui/501/" + strings.TrimSuffix(filepath.Base(arguments[2]), ".plist")
+			loaded[label] = true
+			bootstrapped[label] = true
+		}
+		return nil, nil
+	}}
+	instance := Instance{Repository: "/repo", Mountpoint: "/mount", PairingPort: 7843, serviceID: serviceID,
+		CoreActive: true, MountActive: true, CoreEnabled: true, MountEnabled: true}
+	if err := manager.repair(context.Background(), []Instance{instance}, binary, filepath.Join(home, "installer")); err != nil {
+		t.Fatal(err)
+	}
+	for label := range loaded {
+		if !bootstrapped[label] || printCalls[label] < 3 {
+			t.Fatalf("launchd state for %s: bootstrapped=%t print_calls=%d", label, bootstrapped[label], printCalls[label])
+		}
+	}
+}
+
 func TestUninstallAndPurgeRejectsUnsafeTargetBeforeChangingServices(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -515,6 +515,9 @@ func (m *manager) repair(ctx context.Context, instances []Instance, binary, inst
 			continue
 		}
 		_, installErr := m.run(ctx, installer, "--pair-port", strconv.Itoa(instance.PairingPort), "--no-start", "--no-enable", instance.Repository, instance.Mountpoint, binary)
+		if installErr == nil && m.platform == "darwin" {
+			installErr = m.waitForLaunchdUnload(ctx, []Instance{instance})
+		}
 		if installErr == nil {
 			installErr = m.restoreState(ctx, instance)
 		}
@@ -587,6 +590,8 @@ func (m *manager) restoreDefinitions(ctx context.Context, snapshots []definition
 		if _, err := m.run(ctx, "systemctl", "--user", "daemon-reload"); err != nil {
 			failures = append(failures, err)
 		}
+	} else if err := m.waitForLaunchdUnload(ctx, []Instance{instance}); err != nil {
+		failures = append(failures, err)
 	}
 	if err := m.restoreState(ctx, instance); err != nil {
 		failures = append(failures, err)
