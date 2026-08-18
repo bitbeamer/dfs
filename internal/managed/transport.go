@@ -297,22 +297,7 @@ func (s *Server) servePairClone(stream *quic.Stream, payload json.RawMessage) {
 }
 
 func PairCall(ctx context.Context, address, certificateSHA256, operation string, input, output any) error {
-	address = strings.TrimPrefix(strings.TrimSpace(address), "quic://")
-	if address == "" {
-		return errors.New("pairing QUIC endpoint is empty")
-	}
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{PairALPN}, InsecureSkipVerify: true}
-	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		if len(rawCerts) != 1 {
-			return errors.New("pairing certificate is missing")
-		}
-		digest := sha256.Sum256(rawCerts[0])
-		if !strings.EqualFold(hex.EncodeToString(digest[:]), certificateSHA256) {
-			return errors.New("pairing certificate does not match invitation")
-		}
-		return nil
-	}
-	connection, err := quic.DialAddr(ctx, address, tlsConfig, &quic.Config{HandshakeIdleTimeout: 10 * time.Second})
+	connection, err := dialPairing(ctx, address, certificateSHA256)
 	if err != nil {
 		return err
 	}
@@ -342,6 +327,41 @@ func PairCall(ctx context.Context, address, certificateSHA256, operation string,
 		return errors.New(response.Error)
 	}
 	return json.Unmarshal(response.Payload, output)
+}
+
+// PairProbe verifies that a discovered pairing endpoint is still online and
+// presents the certificate advertised over mDNS. It does not create a stream
+// or mutate peer state.
+func PairProbe(ctx context.Context, address, certificateSHA256 string) error {
+	connection, err := dialPairing(ctx, address, certificateSHA256)
+	if err != nil {
+		return err
+	}
+	_ = connection.CloseWithError(0, "")
+	return nil
+}
+
+func dialPairing(ctx context.Context, address, certificateSHA256 string) (*quic.Conn, error) {
+	address = strings.TrimPrefix(strings.TrimSpace(address), "quic://")
+	if address == "" {
+		return nil, errors.New("pairing QUIC endpoint is empty")
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{PairALPN}, InsecureSkipVerify: true}
+	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) != 1 {
+			return errors.New("pairing certificate is missing")
+		}
+		digest := sha256.Sum256(rawCerts[0])
+		if !strings.EqualFold(hex.EncodeToString(digest[:]), certificateSHA256) {
+			return errors.New("pairing certificate does not match invitation")
+		}
+		return nil
+	}
+	connection, err := quic.DialAddr(ctx, address, tlsConfig, &quic.Config{HandshakeIdleTimeout: 10 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	return connection, nil
 }
 
 func PairClone(ctx context.Context, address, certificateSHA256, sessionID, completionSecret, destination string) error {

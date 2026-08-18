@@ -407,6 +407,7 @@ func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out i
 	if err != nil {
 		return "", "", err
 	}
+	offers = peer.ReachableOffers(ctx, offers, time.Second)
 	networks := peer.GroupOffers(offers)
 	if len(networks) == 0 {
 		return "", "", errors.New("no DFS filesystems discovered")

@@ -70,6 +70,28 @@ func TestOfferFromEvent(t *testing.T) {
 	}
 }
 
+func TestReachableOffersDropsStaleAdvertisements(t *testing.T) {
+	offers := []Offer{
+		{PeerName: "stale", Endpoint: "quic://192.0.2.1:7843", ProtocolVersion: ProtocolVersion, CertificateSHA256: "stale-cert"},
+		{PeerName: "online", Endpoint: "quic://192.0.2.2:7843", ProtocolVersion: ProtocolVersion, CertificateSHA256: "online-cert"},
+		{PeerName: "incompatible", Endpoint: "quic://192.0.2.3:7843", ProtocolVersion: ProtocolVersion + 1, CertificateSHA256: "other-cert"},
+	}
+	probed := make(chan string, len(offers))
+	got := reachableOffers(context.Background(), offers, time.Second, func(_ context.Context, endpoint, _ string) error {
+		probed <- endpoint
+		if endpoint == offers[1].Endpoint {
+			return nil
+		}
+		return errors.New("offline")
+	})
+	if len(got) != 1 || got[0].PeerName != "online" {
+		t.Fatalf("reachable offers = %#v, want only online peer", got)
+	}
+	if len(probed) != 2 {
+		t.Fatalf("probed %d compatible offers, want 2", len(probed))
+	}
+}
+
 func TestMDNSHostname(t *testing.T) {
 	for input, expected := range map[string]string{
 		"cachyos":     "cachyos.local.",

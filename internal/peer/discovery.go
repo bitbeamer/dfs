@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/pion/mdns/v2"
 )
 
@@ -110,6 +111,47 @@ func sortedOffers(unique map[string]Offer) []Offer {
 		}
 		return result[i].Endpoint < result[j].Endpoint
 	})
+	return result
+}
+
+// ReachableOffers removes cached mDNS offers whose authenticated pairing
+// endpoint is no longer running. Probes run concurrently so one stale peer
+// adds at most timeout to setup discovery.
+func ReachableOffers(ctx context.Context, offers []Offer, timeout time.Duration) []Offer {
+	return reachableOffers(ctx, offers, timeout, managed.PairProbe)
+}
+
+type offerProbe func(context.Context, string, string) error
+
+func reachableOffers(ctx context.Context, offers []Offer, timeout time.Duration, probe offerProbe) []Offer {
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	reachable := make([]bool, len(offers))
+	results := make(chan int, len(offers))
+	for index, offer := range offers {
+		go func(index int, offer Offer) {
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			if offer.ProtocolVersion == ProtocolVersion && offer.CertificateSHA256 != "" &&
+				probe(probeCtx, offer.Endpoint, offer.CertificateSHA256) == nil {
+				results <- index
+				return
+			}
+			results <- -1
+		}(index, offer)
+	}
+	for range offers {
+		if index := <-results; index >= 0 {
+			reachable[index] = true
+		}
+	}
+	result := make([]Offer, 0, len(offers))
+	for index, offer := range offers {
+		if reachable[index] {
+			result = append(result, offer)
+		}
+	}
 	return result
 }
 
