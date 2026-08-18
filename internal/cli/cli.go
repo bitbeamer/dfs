@@ -94,13 +94,13 @@ func (a *App) transportCommand() *cobra.Command {
 }
 
 func (a *App) setupCommand() *cobra.Command {
-	var repositoryPath, mountpoint, name, limit, installer, filesystem string
+	var repositoryPath, mountpoint, name, limit, installer, filesystem, networkName string
 	var pairingPort int
 	var discoveryTimeout time.Duration
-	var resume, abort, yes bool
+	var resume, abort, yes, create bool
 	command := &cobra.Command{
 		Use: "setup", Args: cobra.NoArgs,
-		Short: "Join, install, mount, and verify DFS as one recoverable transaction",
+		Short: "Create or join, install, mount, and verify DFS as one recoverable transaction",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cacheLimit, err := config.ParseSize(limit)
 			if err != nil {
@@ -117,22 +117,30 @@ func (a *App) setupCommand() *cobra.Command {
 			}
 			reader := bufio.NewReader(cmd.InOrStdin())
 			selectedFilesystem := strings.TrimSpace(filesystem)
-			if !resume {
+			if !resume && !create {
 				selectedFilesystem, err = selectDiscoveredFilesystem(cmd.Context(), reader, a.Out, selectedFilesystem, discoveryTimeout)
 				if err != nil {
 					return err
 				}
 			}
 			approve := func(state *dfssetup.State) error {
-				shortID := state.FileSystemID
-				if len(shortID) > 12 {
-					shortID = shortID[:12]
+				if state.Create {
+					if yes {
+						fmt.Fprintf(a.Out, "Approved creating DFS filesystem %q as %s on managed port %d\n", state.NetworkName, state.Name, state.PairingPort)
+						return nil
+					}
+					fmt.Fprintf(a.Out, "Create DFS filesystem %q as %s and install its managed mount on port %d? [y/N] ", state.NetworkName, state.Name, state.PairingPort)
+				} else {
+					shortID := state.FileSystemID
+					if len(shortID) > 12 {
+						shortID = shortID[:12]
+					}
+					if yes {
+						fmt.Fprintf(a.Out, "Approved joining DFS filesystem %s as %s on managed port %d\n", shortID, state.Name, state.PairingPort)
+						return nil
+					}
+					fmt.Fprintf(a.Out, "Join DFS filesystem %s as %s and install its managed mount on port %d? [y/N] ", shortID, state.Name, state.PairingPort)
 				}
-				if yes {
-					fmt.Fprintf(a.Out, "Approved joining DFS filesystem %s as %s on managed port %d\n", shortID, state.Name, state.PairingPort)
-					return nil
-				}
-				fmt.Fprintf(a.Out, "Join DFS filesystem %s as %s and install its managed mount on port %d? [y/N] ", shortID, state.Name, state.PairingPort)
 				answer, readErr := reader.ReadString('\n')
 				if readErr != nil && !errors.Is(readErr, io.EOF) {
 					return readErr
@@ -143,7 +151,7 @@ func (a *App) setupCommand() *cobra.Command {
 				}
 				return nil
 			}
-			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Repository: repositoryPath, Mountpoint: mountpoint,
+			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Create: create, NetworkName: networkName, Repository: repositoryPath, Mountpoint: mountpoint,
 				Name: name, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
 				PairingPort: pairingPort, Out: a.Out, Approve: approve})
 			if err != nil {
@@ -167,7 +175,10 @@ func (a *App) setupCommand() *cobra.Command {
 	command.Flags().BoolVar(&abort, "abort", false, "roll back the recorded setup transaction")
 	command.Flags().BoolVarP(&yes, "yes", "y", false, "approve setup without an interactive confirmation")
 	command.Flags().StringVar(&filesystem, "filesystem", "", "discovered filesystem ID or unambiguous name")
+	command.Flags().BoolVar(&create, "create", false, "create the first peer of a new DFS filesystem")
+	command.Flags().StringVar(&networkName, "network-name", "", "display name for a newly created DFS filesystem (defaults to the mountpoint name)")
 	command.MarkFlagsMutuallyExclusive("resume", "abort")
+	command.MarkFlagsMutuallyExclusive("create", "filesystem")
 	return command
 }
 

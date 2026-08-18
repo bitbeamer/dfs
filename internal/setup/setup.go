@@ -37,6 +37,7 @@ const (
 type State struct {
 	Version        int                         `json:"version"`
 	Phase          Phase                       `json:"phase"`
+	Create         bool                        `json:"create,omitempty"`
 	Invitation     string                      `json:"invitation,omitempty"`
 	Approval       peer.JoinRequestCredentials `json:"approval,omitempty"`
 	FileSystemID   string                      `json:"filesystem_id"`
@@ -58,6 +59,8 @@ type State struct {
 type Options struct {
 	Invitation   string
 	FileSystemID string
+	Create       bool
+	NetworkName  string
 	Repository   string
 	Mountpoint   string
 	Name         string
@@ -125,7 +128,7 @@ func Run(ctx context.Context, options Options) (*State, error) {
 				return nil, err
 			}
 		}
-		if state.Invitation == "" {
+		if !state.Create && state.Invitation == "" {
 			if err := awaitApproval(ctx, path, state, options.Out); err != nil {
 				return nil, err
 			}
@@ -156,8 +159,10 @@ func Run(ctx context.Context, options Options) (*State, error) {
 	}
 	if before(state.Phase, PhaseRepositoryPrepared) {
 		if _, err := os.Stat(config.Path(state.Repository)); err == nil {
-			if _, completeErr := peer.CompletePairing(ctx, state.Repository); completeErr != nil && !strings.Contains(completeErr.Error(), "no incomplete") {
-				return nil, fmt.Errorf("resume reciprocal pairing: %w", completeErr)
+			if !state.Create {
+				if _, completeErr := peer.CompletePairing(ctx, state.Repository); completeErr != nil && !strings.Contains(completeErr.Error(), "no incomplete") {
+					return nil, fmt.Errorf("resume reciprocal pairing: %w", completeErr)
+				}
 			}
 			repo, openErr := repository.Open(state.Repository)
 			if openErr != nil {
@@ -165,6 +170,29 @@ func Run(ctx context.Context, options Options) (*State, error) {
 			}
 			state.NetworkName = repo.Config.NetworkName
 			_ = repo.Close()
+		} else if state.Create {
+			if state.OwnsRepository {
+				if removeErr := os.RemoveAll(state.Repository); removeErr != nil {
+					return nil, fmt.Errorf("clear interrupted repository creation: %w", removeErr)
+				}
+			}
+			repo, initErr := repository.Init(ctx, state.Repository, state.Name, state.CacheLimit)
+			if initErr != nil {
+				return nil, fmt.Errorf("initialize DFS repository: %w", initErr)
+			}
+			if err := repo.SetNetworkName(state.NetworkName); err != nil {
+				_ = repo.Close()
+				return nil, fmt.Errorf("set DFS filesystem name: %w", err)
+			}
+			state.FileSystemID, err = repo.FileSystemID(ctx)
+			if err != nil {
+				_ = repo.Close()
+				return nil, err
+			}
+			state.PeerID = repo.Config.PeerID
+			if closeErr := repo.Close(); closeErr != nil {
+				return nil, closeErr
+			}
 		} else {
 			if state.OwnsRepository {
 				if removeErr := os.RemoveAll(state.Repository); removeErr != nil {
@@ -303,6 +331,9 @@ func loadOrCreate(options Options) (*State, string, error) {
 		return nil, "", err
 	}
 	filesystemID := strings.TrimSpace(options.FileSystemID)
+	if options.Create && (filesystemID != "" || strings.TrimSpace(options.Invitation) != "") {
+		return nil, "", errors.New("creating a DFS filesystem cannot use an invitation or existing filesystem ID")
+	}
 	if strings.TrimSpace(options.Invitation) != "" {
 		invitation, decodeErr := peer.DecodeInvitation(options.Invitation)
 		if decodeErr != nil {
@@ -310,7 +341,7 @@ func loadOrCreate(options Options) (*State, string, error) {
 		}
 		filesystemID = invitation.FileSystemID
 	}
-	if len(filesystemID) < 16 {
+	if !options.Create && len(filesystemID) < 16 {
 		return nil, "", errors.New("a discovered DFS filesystem must be selected")
 	}
 	if _, err := os.Stat(repositoryPath); err == nil {
@@ -329,13 +360,17 @@ func loadOrCreate(options Options) (*State, string, error) {
 			return nil, "", err
 		}
 	}
+	networkName := strings.TrimSpace(options.NetworkName)
+	if options.Create && networkName == "" {
+		networkName = filepath.Base(mountpoint)
+	}
 	pairingPort, err := choosePairingPort(options.PairingPort)
 	if err != nil {
 		return nil, "", err
 	}
-	state := &State{Version: 1, Phase: PhaseDiscovered, Invitation: strings.TrimSpace(options.Invitation), FileSystemID: filesystemID,
+	state := &State{Version: 1, Phase: PhaseDiscovered, Create: options.Create, Invitation: strings.TrimSpace(options.Invitation), FileSystemID: filesystemID,
 		PeerID: peerID, Name: name, Repository: repositoryPath, Mountpoint: mountpoint, CacheLimit: options.CacheLimit,
-		Timeout: int64(options.Timeout), PairingPort: pairingPort, OwnsRepository: true, UpdatedAt: time.Now().UTC()}
+		Timeout: int64(options.Timeout), NetworkName: networkName, PairingPort: pairingPort, OwnsRepository: true, UpdatedAt: time.Now().UTC()}
 	if err := save(path, state); err != nil {
 		return nil, "", err
 	}

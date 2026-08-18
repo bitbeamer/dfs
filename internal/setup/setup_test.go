@@ -10,7 +10,55 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/peer"
+	"github.com/bitbeamer/dfs/internal/repository"
 )
+
+func TestSetupCreatesFirstFilesystemThroughManagedFlow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+	t.Setenv("GIT_AUTHOR_NAME", "DFS Test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "dfs@example.invalid")
+	t.Setenv("GIT_COMMITTER_NAME", "DFS Test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "dfs@example.invalid")
+	repositoryPath := filepath.Join(home, "repository")
+	mountpoint := filepath.Join(home, "mount")
+	installer := filepath.Join(home, "install.sh")
+	binary := filepath.Join(home, "dfs")
+	if err := os.WriteFile(installer, []byte("#!/bin/sh\nmkdir -p \"$4\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := Run(context.Background(), Options{Create: true, NetworkName: "Home Files", Repository: repositoryPath,
+		Mountpoint: mountpoint, Name: "ares", CacheLimit: 1 << 20, Installer: installer, Binary: binary, Out: os.Stderr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != PhaseVerified || state.FileSystemID == "" || state.NetworkName != "Home Files" {
+		t.Fatalf("created setup state = %+v", state)
+	}
+	repo, err := repository.Open(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if repo.Config.NetworkName != "Home Files" || repo.Config.Name != "ares" || repo.Config.PeerID != state.PeerID {
+		t.Fatalf("created repository config = %+v", repo.Config)
+	}
+}
+
+func TestSetupCreationRejectsExistingFilesystemSelection(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+	_, err := Run(context.Background(), Options{Create: true, FileSystemID: strings.Repeat("a", 40),
+		Repository: filepath.Join(home, "repository"), Mountpoint: filepath.Join(home, "mount")})
+	if err == nil || !strings.Contains(err.Error(), "cannot use") {
+		t.Fatalf("creation selection error = %v", err)
+	}
+}
 
 func TestSetupPersistsApprovalAndIdentityForResume(t *testing.T) {
 	home := t.TempDir()

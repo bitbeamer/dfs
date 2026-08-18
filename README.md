@@ -115,22 +115,14 @@ upgrading managed daemons, firewalls, and live acceptance testing.
 
 ## Create the first filesystem
 
-Initialize the first peer, then install its managed mount service:
+Create, install, mount, and verify the first peer in one recoverable setup transaction:
 
 ```sh
-./bin/dfs init ~/.local/share/dfs/repository \
-  --name desktop --network-name "Home Files" --cache-limit 100GiB
-
-# CachyOS/Arch
-./scripts/install-cachyos.sh \
-  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
-
-# macOS
-./scripts/install-macos.sh \
-  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
+./bin/dfs setup --create --network-name "Home Files" \
+  --name desktop --cache-limit 100GiB
 ```
 
-The installer copies the binary and creates two filesystem-specific user
+Setup invokes the platform installer, which copies the binary and creates two filesystem-specific user
 services: an independent core daemon and a FUSE frontend. systemd or launchd
 starts the core first, then the mount, and restarts either after failure.
 

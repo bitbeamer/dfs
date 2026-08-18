@@ -156,26 +156,16 @@ print it.
 
 ## 2. Create a new filesystem (first peer only)
 
-If no DFS filesystem exists yet, initialize one and install its managed mount.
-Use a unique repository and mountpoint for every logical filesystem:
+If no DFS filesystem exists yet, create it through the same recoverable setup flow used to join later peers. Use a unique repository and mountpoint for every logical filesystem:
 
 ```sh
-./bin/dfs init ~/.local/share/dfs/repository \
-  --name desktop --network-name "Home Files" --cache-limit 100GiB
-
-# CachyOS/Arch
-./scripts/install-cachyos.sh \
-  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
-
-# macOS
-./scripts/install-macos.sh \
-  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
+./bin/dfs setup --create --network-name "Home Files" \
+  --name desktop --cache-limit 100GiB
 ```
 
 The installer creates a filesystem-specific core service and mount frontend,
 starts the core first, and waits for both health and mount readiness. The core
-advertises the filesystem to nearby peers. `dfs setup` currently joins an existing filesystem;
-creation of the first peer is the explicit `init` plus installer flow above.
+advertises the filesystem to nearby peers. The transaction can be resumed with `dfs setup --resume` or rolled back with `dfs setup --abort` if creation or installation is interrupted.
 
 The mount frontend is a thin FUSE adapter over DFS's in-process Go core API.
 There is no RPC or second process in the mounted read path, so cached annex
