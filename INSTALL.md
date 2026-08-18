@@ -189,9 +189,7 @@ dfs --repo ~/.local/share/dfs/repository pair requests
 dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
 ```
 
-DFS then clones over authenticated QUIC, reconciles reciprocal membership,
-installs the platform service, mounts `~/dfs_storage`, and verifies health. No
-long invitation or bearer secret is copied between machines.
+DFS then clones over authenticated QUIC, reconciles reciprocal membership, installs the platform service, mounts `~/dfs_storage`, and verifies every directed connection between responding members. Unavailable accepted members are recorded as `PENDING` and reconcile when they return. No long invitation or bearer secret is copied between machines.
 
 The default setup repository is `~/.local/share/dfs/repository`. After setup,
 ordinary commands such as `dfs health`, `dfs optimize --cluster`, and `dfs pin Photos` find it automatically. DFS first honors `--repo`, then `DFS_REPO`, then
@@ -221,6 +219,7 @@ or completed filesystem transactions do not collide. Resume and abort select
 the transaction using `--repository`; use the same non-default repository path
 you supplied initially. `--pair-port` selects an explicit local UDP port;
 otherwise DFS uses the first free port beginning at 7843. The
+`--verification-timeout` flag controls how long setup waits for online members to acknowledge the topology; acknowledgement state survives a timeout and `dfs setup --resume` retries only the remaining verification. The
 lower-level `network join` and installer scripts remain available for debugging
 and manual deployments.
 

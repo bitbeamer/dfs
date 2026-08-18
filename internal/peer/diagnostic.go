@@ -58,6 +58,7 @@ type HealthIssue struct {
 type MeshPeer struct {
 	PeerID   string `json:"peer_id"`
 	PeerName string `json:"peer_name"`
+	Online   bool   `json:"online"`
 }
 
 type MeshConnection struct {
@@ -75,6 +76,68 @@ type MeshReport struct {
 	NamespaceStatus string             `json:"namespace_status"`
 	Issues          []HealthIssue      `json:"issues,omitempty"`
 	Complete        bool               `json:"complete"`
+}
+
+type SetupAcknowledgement struct {
+	PeerID   string `json:"peer_id"`
+	PeerName string `json:"peer_name"`
+	Status   string `json:"status"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// EvaluateSetupAcknowledgements treats a diagnostic response as an explicit
+// acknowledgement from that peer. Every directed edge between responding
+// peers must be healthy. Members without a response are retained as PENDING so
+// an offline peer does not block setup and can reconcile when it returns.
+func EvaluateSetupAcknowledgements(report MeshReport) ([]SetupAcknowledgement, bool) {
+	reported := make(map[string]DiagnosticReport, len(report.Reports))
+	for _, node := range report.Reports {
+		reported[node.PeerID] = node
+	}
+	acknowledgements := make([]SetupAcknowledgement, 0, len(report.Peers))
+	byID := make(map[string]int, len(report.Peers))
+	online := make(map[string]bool, len(report.Peers))
+	ready := true
+	for _, member := range report.Peers {
+		acknowledgement := SetupAcknowledgement{PeerID: member.PeerID, PeerName: member.PeerName, Status: "PENDING", Detail: "peer is offline or unavailable"}
+		node, acknowledged := reported[member.PeerID]
+		online[member.PeerID] = member.Online || acknowledged
+		if acknowledged {
+			acknowledgement.Status = "READY"
+			acknowledgement.Detail = ""
+			if node.ReconciliationStatus != "ready" {
+				acknowledgement.Status = "INCOMPLETE"
+				acknowledgement.Detail = "membership reconciliation has not completed"
+				ready = false
+			}
+		} else if member.Online {
+			acknowledgement.Status = "INCOMPLETE"
+			acknowledgement.Detail = "online peer did not acknowledge the cluster topology"
+			ready = false
+		}
+		acknowledgements = append(acknowledgements, acknowledgement)
+		byID[member.PeerID] = len(acknowledgements) - 1
+	}
+	for _, connection := range report.Connections {
+		if !online[connection.FromPeerID] || !online[connection.ToPeerID] || connection.Status == "OK" {
+			continue
+		}
+		ready = false
+		if index, found := byID[connection.FromPeerID]; found {
+			acknowledgements[index].Status = "INCOMPLETE"
+			acknowledgements[index].Detail = fmt.Sprintf("directed connection to %s is %s", setupPeerName(report.Peers, connection.ToPeerID), connection.Status)
+		}
+	}
+	return acknowledgements, ready
+}
+
+func setupPeerName(peers []MeshPeer, peerID string) string {
+	for _, member := range peers {
+		if member.PeerID == peerID && member.PeerName != "" {
+			return member.PeerName
+		}
+	}
+	return peerID
 }
 
 // Diagnose probes all paired DFS remotes from this peer without changing any
@@ -210,7 +273,7 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 		return MeshReport{}, err
 	}
 	peers := map[string]MeshPeer{
-		repo.Config.PeerID: {PeerID: repo.Config.PeerID, PeerName: repo.Config.Name},
+		repo.Config.PeerID: {PeerID: repo.Config.PeerID, PeerName: repo.Config.Name, Online: true},
 	}
 	if records, membershipErr := acceptedMembership(ctx, repo, filesystemID); membershipErr == nil {
 		for _, record := range records {
@@ -220,7 +283,7 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	if offers, discoverErr := Discover(ctx, discoveryTimeout); discoverErr == nil {
 		for _, offer := range offers {
 			if offer.FileSystemID == filesystemID && offer.PeerID != repo.Config.PeerID {
-				peers[offer.PeerID] = MeshPeer{PeerID: offer.PeerID, PeerName: offer.PeerName}
+				peers[offer.PeerID] = MeshPeer{PeerID: offer.PeerID, PeerName: offer.PeerName, Online: true}
 			}
 		}
 	}
@@ -277,9 +340,9 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 		if report.PeerID != peerID {
 			delete(peers, peerID)
 			delete(reportErrors, peerID)
-			peers[report.PeerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
+			peers[report.PeerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName, Online: true}
 		} else {
-			peers[peerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName}
+			peers[peerID] = MeshPeer{PeerID: report.PeerID, PeerName: report.PeerName, Online: true}
 		}
 		reports[peerID] = report
 		reports[report.PeerID] = report

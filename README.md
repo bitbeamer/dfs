@@ -152,9 +152,7 @@ dfs --repo ~/.local/share/dfs/repository pair requests
 dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
 ```
 
-The new peer then joins over QUIC, completes reciprocal registration, installs
-the platform user service, mounts the default `~/dfs_storage`, and verifies
-health. No invitation secret is copied between machines.
+The new peer then joins over QUIC, completes reciprocal registration, installs the platform user service, mounts the default `~/dfs_storage`, and verifies every directed connection between online members. Each responding member must acknowledge the complete online topology; unavailable members are recorded as `PENDING` and reconcile when they return. No invitation secret is copied between machines.
 
 Setup stores the first/default repository at
 `~/.local/share/dfs/repository`. Ordinary commands automatically use that path
@@ -175,7 +173,7 @@ Setup progress, locks, and pairing state are private and repository-specific.
 For a non-default repository, pass the same `--repository` to the initial,
 resume, or abort command. `--mountpoint` selects another mountpoint and
 `--pair-port` selects a local managed transport port. Otherwise setup uses the
-first free UDP port beginning at 7843.
+first free UDP port beginning at 7843. `--verification-timeout` controls how long setup waits for online members to acknowledge the new topology; a timeout preserves the acknowledgements and resumes from verification with `dfs setup --resume`.
 
 `dfs network discover`, `dfs network join`, `dfs network complete`, `dfs init`, and the installer scripts are lower-level controls for manual recovery and diagnostics. Guided `dfs setup` creates the first peer with `--create` or joins an existing filesystem discovered on the LAN.
 

@@ -260,6 +260,17 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if string(diagnostic) != `{"peer":"server"}` {
 		t.Fatalf("diagnostic = %s", diagnostic)
 	}
+	if err := RequestReconcile(ctx, clientRepo, serverRepo.Config.PeerID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reason := <-received:
+		if reason != "peer requested membership reconciliation" {
+			t.Fatalf("reconciliation notification = %q", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote reconciliation request did not notify the scheduler")
+	}
 	var gitOutput bytes.Buffer
 	mode, err := GitProxy(ctx, clientRepo, serverRepo.Config.PeerID, "git-upload-pack", bytes.NewReader(nil), &gitOutput, io.Discard)
 	if err != nil {

@@ -202,6 +202,13 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 		}
 		writeResponse(stream, Response{OK: true, Size: int64(len(data))})
 		_, _ = stream.Write(data)
+	case "reconcile":
+		if s.changed == nil {
+			writeResponse(stream, Response{Error: "reconciliation unavailable"})
+			return
+		}
+		s.changed("peer requested membership reconciliation", nil)
+		writeResponse(stream, Response{OK: true})
 	case "git":
 		s.serveGit(stream, reader, request.Service)
 	case "annex-get":
@@ -225,6 +232,15 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
+}
+
+func RequestReconcile(ctx context.Context, repo *repository.Repository, peerID string) error {
+	connection, stream, _, _, err := Open(ctx, repo, peerID, Request{Operation: "reconcile"})
+	if err != nil {
+		return err
+	}
+	defer connection.CloseWithError(0, "")
+	return stream.Close()
 }
 
 type pairCloneRequest struct {

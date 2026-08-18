@@ -63,6 +63,42 @@ func TestSetupCreationRejectsExistingFilesystemSelection(t *testing.T) {
 	}
 }
 
+func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repositoryPath := filepath.Join(home, "repository")
+	repo, err := repository.InitWithIdentity(context.Background(), repositoryPath, "ares", 1<<20,
+		repository.GitIdentity{Name: "DFS Test", Email: "dfs@example.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID := repo.Config.PeerID
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(home, "state.json")
+	state := &State{Version: 1, Phase: PhaseMounted, Repository: repositoryPath, Mountpoint: filepath.Join(home, "mount"), PeerID: peerID,
+		VerificationTimeout: int64(20 * time.Millisecond), Timeout: int64(time.Millisecond)}
+	checker := func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error) {
+		return peer.MeshReport{
+			Peers:       []peer.MeshPeer{{PeerID: peerID, PeerName: "ares"}, {PeerID: "zeus-peer", PeerName: "zeus"}},
+			Reports:     []peer.DiagnosticReport{{PeerID: peerID, ReconciliationStatus: "ready"}, {PeerID: "zeus-peer", ReconciliationStatus: "ready"}},
+			Connections: []peer.MeshConnection{{FromPeerID: peerID, ToPeerID: "zeus-peer", Status: "OK"}, {FromPeerID: "zeus-peer", ToPeerID: peerID, Status: "NOT_CONFIGURED"}},
+		}, nil
+	}
+	err = verifySetupCluster(context.Background(), statePath, state, Options{Out: os.Stderr, CheckCluster: checker})
+	if err == nil || !strings.Contains(err.Error(), "retry with dfs setup --resume") {
+		t.Fatalf("incomplete cluster verification error = %v", err)
+	}
+	persisted, err := load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Phase != PhaseMounted || len(persisted.Acknowledgements) != 2 || persisted.Acknowledgements[1].Status != "INCOMPLETE" {
+		t.Fatalf("persisted resumable cluster state = %+v", persisted)
+	}
+}
+
 func TestSetupPersistsApprovalAndIdentityForResume(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

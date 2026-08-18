@@ -35,47 +35,52 @@ const (
 )
 
 type State struct {
-	Version        int                         `json:"version"`
-	Phase          Phase                       `json:"phase"`
-	Create         bool                        `json:"create,omitempty"`
-	Invitation     string                      `json:"invitation,omitempty"`
-	Approval       peer.JoinRequestCredentials `json:"approval,omitempty"`
-	FileSystemID   string                      `json:"filesystem_id"`
-	PeerID         string                      `json:"peer_id"`
-	Name           string                      `json:"name"`
-	GitName        string                      `json:"git_name,omitempty"`
-	GitEmail       string                      `json:"git_email,omitempty"`
-	Repository     string                      `json:"repository"`
-	Mountpoint     string                      `json:"mountpoint"`
-	CacheLimit     int64                       `json:"cache_limit_bytes"`
-	Timeout        int64                       `json:"discovery_timeout_nanoseconds"`
-	NetworkName    string                      `json:"network_name,omitempty"`
-	OfferingPeer   string                      `json:"offering_peer,omitempty"`
-	Installer      string                      `json:"installer,omitempty"`
-	Binary         string                      `json:"binary,omitempty"`
-	PairingPort    int                         `json:"pairing_port"`
-	OwnsRepository bool                        `json:"owns_repository"`
-	UpdatedAt      time.Time                   `json:"updated_at"`
+	Version             int                         `json:"version"`
+	Phase               Phase                       `json:"phase"`
+	Create              bool                        `json:"create,omitempty"`
+	Invitation          string                      `json:"invitation,omitempty"`
+	Approval            peer.JoinRequestCredentials `json:"approval,omitempty"`
+	FileSystemID        string                      `json:"filesystem_id"`
+	PeerID              string                      `json:"peer_id"`
+	Name                string                      `json:"name"`
+	GitName             string                      `json:"git_name,omitempty"`
+	GitEmail            string                      `json:"git_email,omitempty"`
+	Repository          string                      `json:"repository"`
+	Mountpoint          string                      `json:"mountpoint"`
+	CacheLimit          int64                       `json:"cache_limit_bytes"`
+	Timeout             int64                       `json:"discovery_timeout_nanoseconds"`
+	NetworkName         string                      `json:"network_name,omitempty"`
+	OfferingPeer        string                      `json:"offering_peer,omitempty"`
+	Installer           string                      `json:"installer,omitempty"`
+	Binary              string                      `json:"binary,omitempty"`
+	PairingPort         int                         `json:"pairing_port"`
+	VerificationTimeout int64                       `json:"verification_timeout_nanoseconds,omitempty"`
+	Acknowledgements    []peer.SetupAcknowledgement `json:"acknowledgements,omitempty"`
+	ClusterVerifiedAt   time.Time                   `json:"cluster_verified_at,omitempty"`
+	OwnsRepository      bool                        `json:"owns_repository"`
+	UpdatedAt           time.Time                   `json:"updated_at"`
 }
 
 type Options struct {
-	Invitation   string
-	FileSystemID string
-	Create       bool
-	NetworkName  string
-	Repository   string
-	Mountpoint   string
-	Name         string
-	GitName      string
-	GitEmail     string
-	CacheLimit   int64
-	Timeout      time.Duration
-	Resume       bool
-	Installer    string
-	Binary       string
-	PairingPort  int
-	Out          io.Writer
-	Approve      func(*State) error
+	Invitation          string
+	FileSystemID        string
+	Create              bool
+	NetworkName         string
+	Repository          string
+	Mountpoint          string
+	Name                string
+	GitName             string
+	GitEmail            string
+	CacheLimit          int64
+	Timeout             time.Duration
+	Resume              bool
+	Installer           string
+	Binary              string
+	PairingPort         int
+	VerificationTimeout time.Duration
+	Out                 io.Writer
+	Approve             func(*State) error
+	CheckCluster        func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error)
 }
 
 func StatePath(repositoryPath string) (string, error) {
@@ -96,6 +101,9 @@ func StatePath(repositoryPath string) (string, error) {
 }
 
 func Run(ctx context.Context, options Options) (*State, error) {
+	if options.Out == nil {
+		options.Out = io.Discard
+	}
 	path, err := StatePath(options.Repository)
 	if err != nil {
 		return nil, err
@@ -222,6 +230,18 @@ func Run(ctx context.Context, options Options) (*State, error) {
 		}
 	}
 	if before(state.Phase, PhaseMembershipReconciled) {
+		repo, openErr := repository.Open(state.Repository)
+		if openErr != nil {
+			return nil, openErr
+		}
+		reconcileErr := peer.ReconcileMembership(ctx, repo)
+		closeErr := repo.Close()
+		if reconcileErr != nil {
+			return nil, fmt.Errorf("reconcile DFS membership: %w", reconcileErr)
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
 		if err := advance(PhaseMembershipReconciled); err != nil {
 			return nil, err
 		}
@@ -247,6 +267,9 @@ func Run(ctx context.Context, options Options) (*State, error) {
 		command.Stdout, command.Stderr = options.Out, options.Out
 		if err := command.Run(); err != nil {
 			return nil, fmt.Errorf("verify installed DFS service: %w", err)
+		}
+		if err := verifySetupCluster(ctx, path, state, options); err != nil {
+			return nil, err
 		}
 		if err := advance(PhaseVerified); err != nil {
 			return nil, err
@@ -383,15 +406,94 @@ func loadOrCreate(options Options) (*State, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	verificationTimeout := options.VerificationTimeout
+	if verificationTimeout <= 0 {
+		verificationTimeout = time.Minute
+	}
 	state := &State{Version: 1, Phase: PhaseDiscovered, Create: options.Create, Invitation: strings.TrimSpace(options.Invitation), FileSystemID: filesystemID,
 		PeerID: peerID, Name: name, GitName: strings.TrimSpace(options.GitName), GitEmail: strings.TrimSpace(options.GitEmail), Repository: repositoryPath, Mountpoint: mountpoint, CacheLimit: options.CacheLimit,
-		Timeout: int64(options.Timeout), NetworkName: networkName, PairingPort: pairingPort, OwnsRepository: true, UpdatedAt: time.Now().UTC()}
+		Timeout: int64(options.Timeout), NetworkName: networkName, PairingPort: pairingPort, VerificationTimeout: int64(verificationTimeout), OwnsRepository: true, UpdatedAt: time.Now().UTC()}
 	if err := save(path, state); err != nil {
 		return nil, "", err
 	}
 	state.Phase = PhaseApprovalRequested
 	state.UpdatedAt = time.Now().UTC()
 	return state, path, save(path, state)
+}
+
+func verifySetupCluster(ctx context.Context, statePath string, state *State, options Options) error {
+	timeout := time.Duration(state.VerificationTimeout)
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	repo, err := repository.Open(state.Repository)
+	if err != nil {
+		return err
+	}
+	defer repo.Close()
+	checker := options.CheckCluster
+	if checker == nil {
+		checker = peer.CheckMesh
+	}
+	discoveryTimeout := time.Duration(state.Timeout)
+	if discoveryTimeout <= 0 || discoveryTimeout > 2*time.Second {
+		discoveryTimeout = 2 * time.Second
+	}
+	var last []peer.SetupAcknowledgement
+	for {
+		if err := peer.ReconcileMembership(verifyCtx, repo); err != nil {
+			return fmt.Errorf("reconcile DFS membership before cluster verification: %w", err)
+		}
+		report, checkErr := checker(verifyCtx, repo, discoveryTimeout, 5*time.Second)
+		if checkErr == nil {
+			acknowledgements, ready := peer.EvaluateSetupAcknowledgements(report)
+			localReady := false
+			for _, acknowledgement := range acknowledgements {
+				if acknowledgement.PeerID == state.PeerID && acknowledgement.Status == "READY" {
+					localReady = true
+					break
+				}
+			}
+			ready = ready && localReady
+			state.Acknowledgements = acknowledgements
+			state.UpdatedAt = time.Now().UTC()
+			if ready {
+				state.ClusterVerifiedAt = state.UpdatedAt
+			}
+			if err := save(statePath, state); err != nil {
+				return err
+			}
+			last = acknowledgements
+			if ready {
+				printSetupAcknowledgements(options.Out, acknowledgements)
+				return nil
+			}
+		}
+		select {
+		case <-verifyCtx.Done():
+			if len(last) > 0 {
+				printSetupAcknowledgements(options.Out, last)
+			}
+			if checkErr != nil {
+				return fmt.Errorf("verify directed DFS cluster: %w", checkErr)
+			}
+			return errors.New("online DFS members have not acknowledged every directed cluster connection; retry with dfs setup --resume")
+		case <-time.After(2 * time.Second):
+			fmt.Fprintln(options.Out, "Waiting for online DFS members to acknowledge the new cluster topology...")
+		}
+	}
+}
+
+func printSetupAcknowledgements(out io.Writer, acknowledgements []peer.SetupAcknowledgement) {
+	for _, acknowledgement := range acknowledgements {
+		if acknowledgement.Detail == "" {
+			fmt.Fprintf(out, "Cluster member %s: %s\n", acknowledgement.PeerName, acknowledgement.Status)
+		} else {
+			fmt.Fprintf(out, "Cluster member %s: %s (%s)\n", acknowledgement.PeerName, acknowledgement.Status, acknowledgement.Detail)
+		}
+	}
 }
 
 func awaitApproval(ctx context.Context, statePath string, state *State, out io.Writer) error {

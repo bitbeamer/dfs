@@ -96,7 +96,7 @@ func (a *App) transportCommand() *cobra.Command {
 func (a *App) setupCommand() *cobra.Command {
 	var repositoryPath, mountpoint, name, limit, installer, filesystem, networkName, gitName, gitEmail string
 	var pairingPort int
-	var discoveryTimeout time.Duration
+	var discoveryTimeout, verificationTimeout time.Duration
 	var resume, abort, yes, create bool
 	command := &cobra.Command{
 		Use: "setup", Args: cobra.NoArgs,
@@ -157,7 +157,7 @@ func (a *App) setupCommand() *cobra.Command {
 				return nil
 			}
 			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Create: create, NetworkName: selectedNetworkName, Repository: repositoryPath, Mountpoint: mountpoint,
-				Name: name, GitName: gitName, GitEmail: gitEmail, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
+				Name: name, GitName: gitName, GitEmail: gitEmail, CacheLimit: cacheLimit, Timeout: discoveryTimeout, VerificationTimeout: verificationTimeout, Resume: resume, Installer: installer,
 				PairingPort: pairingPort, Out: a.Out, Approve: approve})
 			if err != nil {
 				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup --resume or roll back with dfs setup --abort)", err)
@@ -173,6 +173,7 @@ func (a *App) setupCommand() *cobra.Command {
 	command.Flags().StringVar(&name, "name", "", "peer name (defaults to hostname)")
 	command.Flags().StringVar(&limit, "cache-limit", "100GiB", "maximum local content cache")
 	command.Flags().DurationVar(&discoveryTimeout, "timeout", 3*time.Second, "how long to discover the invited network")
+	command.Flags().DurationVar(&verificationTimeout, "verification-timeout", time.Minute, "how long online members have to acknowledge the cluster topology")
 	command.Flags().IntVar(&pairingPort, "pair-port", 0, "local managed transport port (defaults to the first free port from 7843)")
 	command.Flags().StringVar(&installer, "installer", "", "service installer script (advanced)")
 	_ = command.Flags().MarkHidden("installer")

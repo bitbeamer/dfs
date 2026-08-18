@@ -415,6 +415,63 @@ func TestEvaluateMeshChecksEveryDirection(t *testing.T) {
 	}
 }
 
+func TestEvaluateSetupAcknowledgementsAllowsOfflinePendingMembers(t *testing.T) {
+	report := MeshReport{
+		Peers: []MeshPeer{{PeerID: "a", PeerName: "ares"}, {PeerID: "z", PeerName: "zeus"}, {PeerID: "i", PeerName: "iris"}},
+		Reports: []DiagnosticReport{
+			{PeerID: "a", PeerName: "ares", ReconciliationStatus: "ready"},
+			{PeerID: "z", PeerName: "zeus", ReconciliationStatus: "ready"},
+		},
+		Connections: []MeshConnection{
+			{FromPeerID: "a", ToPeerID: "z", Status: "OK"}, {FromPeerID: "z", ToPeerID: "a", Status: "OK"},
+			{FromPeerID: "a", ToPeerID: "i", Status: "FAILED"}, {FromPeerID: "i", ToPeerID: "a", Status: "UNREPORTED"},
+		},
+	}
+	acknowledgements, ready := EvaluateSetupAcknowledgements(report)
+	if !ready || len(acknowledgements) != 3 {
+		t.Fatalf("setup acknowledgements = %#v, ready=%v", acknowledgements, ready)
+	}
+	statuses := make(map[string]string)
+	for _, acknowledgement := range acknowledgements {
+		statuses[acknowledgement.PeerName] = acknowledgement.Status
+	}
+	if statuses["ares"] != "READY" || statuses["zeus"] != "READY" || statuses["iris"] != "PENDING" {
+		t.Fatalf("setup statuses = %#v", statuses)
+	}
+}
+
+func TestEvaluateSetupAcknowledgementsRejectsIncompleteOnlineDirection(t *testing.T) {
+	report := MeshReport{
+		Peers: []MeshPeer{{PeerID: "a", PeerName: "ares"}, {PeerID: "z", PeerName: "zeus"}},
+		Reports: []DiagnosticReport{
+			{PeerID: "a", PeerName: "ares", ReconciliationStatus: "ready"},
+			{PeerID: "z", PeerName: "zeus", ReconciliationStatus: "ready"},
+		},
+		Connections: []MeshConnection{{FromPeerID: "a", ToPeerID: "z", Status: "OK"}, {FromPeerID: "z", ToPeerID: "a", Status: "NOT_CONFIGURED"}},
+	}
+	acknowledgements, ready := EvaluateSetupAcknowledgements(report)
+	if ready {
+		t.Fatalf("incomplete directed cluster accepted: %#v", acknowledgements)
+	}
+	if acknowledgements[1].Status != "INCOMPLETE" || !strings.Contains(acknowledgements[1].Detail, "ares") {
+		t.Fatalf("incomplete acknowledgement = %#v", acknowledgements[1])
+	}
+}
+
+func TestEvaluateSetupAcknowledgementsRequiresDiscoveredPeerResponse(t *testing.T) {
+	report := MeshReport{
+		Peers:   []MeshPeer{{PeerID: "a", PeerName: "ares", Online: true}, {PeerID: "z", PeerName: "zeus", Online: true}},
+		Reports: []DiagnosticReport{{PeerID: "a", PeerName: "ares", ReconciliationStatus: "ready"}},
+		Connections: []MeshConnection{
+			{FromPeerID: "a", ToPeerID: "z", Status: "FAILED"}, {FromPeerID: "z", ToPeerID: "a", Status: "UNREPORTED"},
+		},
+	}
+	acknowledgements, ready := EvaluateSetupAcknowledgements(report)
+	if ready || acknowledgements[1].Status != "INCOMPLETE" {
+		t.Fatalf("discovered peer acknowledgement = %#v, ready=%v", acknowledgements, ready)
+	}
+}
+
 func TestEvaluateMeshDetectsNamespaceDivergence(t *testing.T) {
 	peers := map[string]MeshPeer{
 		"aaaaaaaaaaaaaaaa": {PeerID: "aaaaaaaaaaaaaaaa", PeerName: "desktop"},
