@@ -26,7 +26,7 @@ func TestDiscoverSystemdInstancesUsesInstalledServiceDefinitions(t *testing.T) {
 	if err := os.MkdirAll(unitDirectory, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	unit := "[Service]\nExecStart=\"/home/otto/.local/bin/dfs\" --repo \"" + repository + "\" daemon --managed --pair-port 7849 --mountpoint \"" + mountpoint + "\"\n"
+	unit := "[Service]\nExecStart=\"/home/otto/.local/bin/dfs\" --repo \"" + repository + "\" internal core --managed --pair-port 7849 --mountpoint \"" + mountpoint + "\"\n"
 	if err := os.WriteFile(filepath.Join(unitDirectory, "dfs-core-"+serviceID+".service"), []byte(unit), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -50,11 +50,11 @@ func TestDiscoverSystemdInstancesUsesInstalledServiceDefinitions(t *testing.T) {
 }
 
 func TestSystemdArgumentParserHandlesGeneratedEscaping(t *testing.T) {
-	arguments, err := systemdExecArguments("[Service]\nExecStart=\"/path/dfs\" --repo \"/data/100%% files/repo\" daemon --mountpoint \"/mnt/quoted\\\"name\" --pair-port 7843\n")
+	arguments, err := systemdExecArguments("[Service]\nExecStart=\"/path/dfs\" --repo \"/data/100%% files/repo\" internal core --mountpoint \"/mnt/quoted\\\"name\" --pair-port 7843\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wanted := []string{"/path/dfs", "--repo", "/data/100% files/repo", "daemon", "--mountpoint", "/mnt/quoted\"name", "--pair-port", "7843"}
+	wanted := []string{"/path/dfs", "--repo", "/data/100% files/repo", "internal", "core", "--mountpoint", "/mnt/quoted\"name", "--pair-port", "7843"}
 	if !reflect.DeepEqual(arguments, wanted) {
 		t.Fatalf("arguments = %#v, want %#v", arguments, wanted)
 	}
@@ -72,7 +72,7 @@ func TestPlistProgramArguments(t *testing.T) {
 	}
 }
 
-func TestUpdatePreservesStoppedInstanceState(t *testing.T) {
+func TestRepairPreservesStoppedEnabledInstanceState(t *testing.T) {
 	home := t.TempDir()
 	binary := filepath.Join(home, "dfs")
 	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
@@ -83,12 +83,68 @@ func TestUpdatePreservesStoppedInstanceState(t *testing.T) {
 		calls = append(calls, strings.Join(append([]string{name}, arguments...), " "))
 		return nil, nil
 	}}
-	instance := Instance{Repository: "/repo", Mountpoint: "/mount", PairingPort: 7850, serviceID: "123456789abc"}
+	instance := Instance{Repository: "/repo", Mountpoint: "/mount", PairingPort: 7850, CoreEnabled: true, MountEnabled: true, serviceID: "123456789abc"}
 	if err := manager.update(context.Background(), []Instance{instance}, binary, filepath.Join(home, "installer")); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 2 || !strings.Contains(calls[0], "--pair-port 7850 /repo /mount "+binary) || !strings.Contains(calls[1], "systemctl --user stop dfs-mount-123456789abc.service dfs-core-123456789abc.service") {
+	if len(calls) != 3 || !strings.Contains(calls[0], "--pair-port 7850 --no-start --no-enable /repo /mount "+binary) ||
+		!strings.Contains(calls[1], "systemctl --user enable dfs-core-123456789abc.service") ||
+		!strings.Contains(calls[2], "systemctl --user enable dfs-mount-123456789abc.service") {
 		t.Fatalf("update calls = %#v", calls)
+	}
+	for _, call := range calls {
+		if strings.Contains(call, " start ") {
+			t.Fatalf("repair started a stopped service: %s", call)
+		}
+	}
+}
+
+func TestParseLaunchdDisabledState(t *testing.T) {
+	disabled := parseLaunchdDisabled(`disabled services = {
+		"io.bitbeamer.dfs.core.123456789abc" => true;
+		"io.bitbeamer.dfs.mount.123456789abc" => false;
+	}`)
+	if !disabled["io.bitbeamer.dfs.core.123456789abc"] || disabled["io.bitbeamer.dfs.mount.123456789abc"] {
+		t.Fatalf("disabled launch agents = %#v", disabled)
+	}
+}
+
+func TestUpgradeRollsBackExecutableWhenRepairFails(t *testing.T) {
+	home := t.TempDir()
+	installed := filepath.Join(home, "dfs")
+	candidate := filepath.Join(home, "candidate")
+	if err := os.WriteFile(installed, []byte("old executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidate, []byte("new executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installerCalls := 0
+	manager := &manager{platform: "linux", run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+		if name == candidate {
+			return []byte("dfs dev"), nil
+		}
+		if name == filepath.Join(home, "installer") {
+			installerCalls++
+			if installerCalls == 1 {
+				return nil, errors.New("new service failed health verification")
+			}
+		}
+		return nil, nil
+	}}
+	instance := Instance{Binary: installed, Repository: "/repo", Mountpoint: "/mount", PairingPort: 7843, serviceID: "123456789abc"}
+	if err := manager.upgrade(context.Background(), []Instance{instance}, candidate, filepath.Join(home, "installer")); err == nil {
+		t.Fatal("upgrade unexpectedly succeeded")
+	}
+	data, err := os.ReadFile(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old executable" {
+		t.Fatalf("installed executable after rollback = %q", data)
+	}
+	if installerCalls != 2 {
+		t.Fatalf("installer calls = %d, want failed upgrade plus rollback repair", installerCalls)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -85,15 +87,96 @@ func TestSetupFilesystemNamePrefersDisplayName(t *testing.T) {
 	}
 }
 
-func TestInstanceAdministrationCommandsAreExposed(t *testing.T) {
+func TestConsolidatedServiceCommandsAreExposed(t *testing.T) {
 	root := New()
-	for _, path := range [][]string{{"instance", "list"}, {"instance", "stop"}, {"instance", "update"}, {"instance", "uninstall"}} {
+	for _, path := range [][]string{{"service", "list"}, {"service", "show"}, {"service", "start"}, {"service", "stop"}, {"service", "restart"}, {"service", "repair"}, {"service", "uninstall"}, {"upgrade"}} {
 		command, _, err := root.Find(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if command.Name() != path[len(path)-1] {
 			t.Fatalf("command %v resolved to %s", path, command.Name())
+		}
+	}
+}
+
+func TestPublicCommandTreeUsesConsolidatedRoots(t *testing.T) {
+	root := New()
+	wanted := map[string]bool{"setup": true, "filesystem": true, "service": true, "upgrade": true, "peer": true, "content": true,
+		"cache": true, "storage": true, "sync": true, "health": true, "history": true}
+	for _, command := range root.Commands() {
+		if command.Hidden || command.Name() == "completion" || command.Name() == "help" {
+			continue
+		}
+		if !wanted[command.Name()] {
+			t.Errorf("unexpected public root %q", command.Name())
+		}
+		delete(wanted, command.Name())
+	}
+	for missing := range wanted {
+		t.Errorf("missing public root %q", missing)
+	}
+	for _, legacy := range []string{"init", "join", "instance", "network", "pair", "relay", "optimize", "fetch", "pin", "unpin", "evict", "status", "doctor", "restore", "conflicts"} {
+		if _, _, err := root.Find([]string{legacy}); err == nil {
+			t.Errorf("legacy root %q remains public", legacy)
+		}
+	}
+	for _, legacy := range []string{"transport", "daemon", "mount", "unmount"} {
+		command, _, err := root.Find([]string{legacy})
+		if err != nil || !command.Hidden {
+			t.Errorf("runtime compatibility root %q is not hidden", legacy)
+		}
+	}
+}
+
+func TestConsolidatedPublicLeafCommands(t *testing.T) {
+	root := New()
+	wanted := map[string][]string{
+		"setup":      {"abort", "create", "join", "resume"},
+		"filesystem": {"rename", "show"},
+		"service":    {"list", "repair", "restart", "show", "start", "stop", "uninstall"},
+		"peer":       {"approve", "check", "invite", "list", "optimize", "reject", "relay", "remove", "requests"},
+		"content":    {"evict", "fetch", "pin", "unpin"},
+		"cache":      {"limit", "prune", "show"},
+		"storage":    {"add", "copy", "enable", "list", "remove", "show"},
+		"history":    {"conflicts", "list", "restore"},
+	}
+	for parentName, expected := range wanted {
+		parent, _, err := root.Find([]string{parentName})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var actual []string
+		for _, child := range parent.Commands() {
+			if !child.Hidden && child.Name() != "help" {
+				actual = append(actual, child.Name())
+			}
+		}
+		sort.Strings(actual)
+		if !reflect.DeepEqual(actual, expected) {
+			t.Errorf("%s children = %#v, want %#v", parentName, actual, expected)
+		}
+	}
+}
+
+func TestMaterialMutationsExposeDryRun(t *testing.T) {
+	root := New()
+	paths := [][]string{
+		{"setup", "abort"}, {"setup", "create"}, {"setup", "join"}, {"setup", "resume"},
+		{"filesystem", "rename"}, {"service", "start"}, {"service", "stop"}, {"service", "restart"}, {"service", "repair"}, {"service", "uninstall"},
+		{"upgrade"}, {"peer", "approve"}, {"peer", "reject"}, {"peer", "remove"}, {"peer", "invite", "create"}, {"peer", "invite", "revoke"},
+		{"peer", "optimize"}, {"peer", "relay", "set"}, {"peer", "relay", "clear"}, {"content", "fetch"}, {"content", "pin"}, {"content", "unpin"},
+		{"content", "evict"}, {"cache", "limit"}, {"cache", "prune"}, {"storage", "add", "s3"}, {"storage", "enable"}, {"storage", "copy"},
+		{"storage", "remove"}, {"sync"}, {"history", "restore"},
+	}
+	for _, path := range paths {
+		command, _, err := root.Find(path)
+		if err != nil {
+			t.Errorf("find %v: %v", path, err)
+			continue
+		}
+		if command.Flags().Lookup("dry-run") == nil {
+			t.Errorf("%s has no --dry-run", command.CommandPath())
 		}
 	}
 }

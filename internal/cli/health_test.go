@@ -65,29 +65,27 @@ func TestPrintClusterHealthIsCompactAndUsesPeerNames(t *testing.T) {
 	}
 }
 
-func TestClusterFlagReplacesMeshFlag(t *testing.T) {
+func TestHealthUsesExplicitScopeFlag(t *testing.T) {
 	root := New()
-	for _, name := range []string{"health", "doctor"} {
-		command, _, err := root.Find([]string{name})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if command.Flags().Lookup("cluster") == nil {
-			t.Errorf("%s command has no --cluster flag", name)
-		}
-		if command.Flags().Lookup("mesh") != nil {
-			t.Errorf("%s command still exposes --mesh", name)
-		}
+	command, _, err := root.Find([]string{"health"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Flags().Lookup("scope") == nil {
+		t.Error("health command has no --scope flag")
+	}
+	if flag := command.Flags().Lookup("cluster"); flag == nil || !flag.Hidden {
+		t.Error("health command does not hide the legacy --cluster flag")
 	}
 }
 
 func TestOptimizeExposesLocalAndClusterScopes(t *testing.T) {
 	root := New()
-	command, _, err := root.Find([]string{"optimize"})
+	command, _, err := root.Find([]string{"peer", "optimize"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, flag := range []string{"cluster", "json"} {
+	for _, flag := range []string{"scope", "dry-run"} {
 		if command.Flags().Lookup(flag) == nil {
 			t.Errorf("optimize command has no --%s flag", flag)
 		}
@@ -123,31 +121,22 @@ func TestHealthIncludesMissingDependencyDiagnostics(t *testing.T) {
 	}
 }
 
-func TestDoctorIsDeprecatedHealthAlias(t *testing.T) {
+func TestDoctorIsRemovedFromPublicTree(t *testing.T) {
 	root := New()
-	doctor, _, err := root.Find([]string{"doctor"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if doctor.Deprecated == "" {
-		t.Fatal("doctor command is not marked deprecated")
-	}
-	for _, flag := range []string{"json", "cluster", "discovery-timeout", "peer-timeout"} {
-		if doctor.Flags().Lookup(flag) == nil {
-			t.Errorf("deprecated doctor alias has no --%s flag", flag)
-		}
+	if _, _, err := root.Find([]string{"doctor"}); err == nil {
+		t.Fatal("doctor remains in the public command tree")
 	}
 }
 
 func TestPinCommandsExposeClusterScope(t *testing.T) {
 	root := New()
 	for _, name := range []string{"pin", "unpin"} {
-		command, _, err := root.Find([]string{name})
+		command, _, err := root.Find([]string{"content", name})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if command.Flags().Lookup("cluster") == nil {
-			t.Errorf("%s command has no --cluster flag", name)
+		if command.Flags().Lookup("scope") == nil {
+			t.Errorf("%s command has no --scope flag", name)
 		}
 	}
 }

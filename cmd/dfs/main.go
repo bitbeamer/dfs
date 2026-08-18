@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -9,7 +10,10 @@ import (
 
 func main() {
 	if err := cli.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "dfs:", err)
+		var jsonError *cli.JSONCommandError
+		if !errors.As(err, &jsonError) {
+			fmt.Fprintln(os.Stderr, "dfs:", err)
+		}
 		os.Exit(1)
 	}
 }

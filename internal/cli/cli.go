@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,13 +34,21 @@ import (
 var Version = "dev"
 
 type App struct {
-	Out  io.Writer
-	Err  io.Writer
-	repo string
+	Out          io.Writer
+	Err          io.Writer
+	repo         string
+	filesystem   string
+	output       string
+	quiet        bool
+	yes          bool
+	destination  io.Writer
+	capture      bytes.Buffer
+	capturing    bool
+	filesystemID string
 }
 
 func New() *cobra.Command {
-	app := &App{Out: os.Stdout, Err: os.Stderr}
+	app := &App{Out: os.Stdout, Err: os.Stderr, destination: os.Stdout}
 	root := &cobra.Command{
 		Use:           "dfs",
 		Short:         "A quota-aware distributed filesystem built on Git and git-annex",
@@ -49,15 +58,62 @@ func New() *cobra.Command {
 	}
 	root.SetOut(app.Out)
 	root.SetErr(app.Err)
-	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (otherwise use DFS_REPO, the current tree, or the setup default)")
-	root.AddCommand(
-		app.setupCommand(), app.instanceCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
-		app.storageCommand(), app.daemonCommand(),
-		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.optimizeCommand(), app.syncCommand(), app.statusCommand(),
-		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
-		app.cacheCommand(), app.historyCommand(), app.restoreCommand(), app.conflictsCommand(),
-		app.doctorCommand(),
-	)
+	root.PersistentFlags().StringVar(&app.filesystem, "filesystem", "", "filesystem name, ID, mountpoint, or repository")
+	root.PersistentFlags().StringVar(&app.output, "output", "text", "output format: text or json")
+	root.PersistentFlags().BoolVar(&app.quiet, "quiet", false, "suppress successful text output")
+	root.PersistentFlags().BoolVarP(&app.yes, "yes", "y", false, "approve confirmed operations non-interactively")
+	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (internal recovery override)")
+	_ = root.PersistentFlags().MarkHidden("repo")
+	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		app.filesystemID = ""
+		if app.output != "text" && app.output != "json" {
+			return fmt.Errorf("unsupported output format %q; use text or json", app.output)
+		}
+		if app.output == "json" {
+			if flag := cmd.Flags().Lookup("json"); flag != nil {
+				if err := flag.Value.Set("true"); err != nil {
+					return err
+				}
+			}
+			app.capture.Reset()
+			app.Out = &app.capture
+			app.capturing = true
+		} else if app.quiet {
+			app.Out = io.Discard
+		}
+		return nil
+	}
+	root.PersistentPostRunE = func(cmd *cobra.Command, _ []string) error {
+		defer func() {
+			app.Out = app.destination
+			app.capturing = false
+		}()
+		if !app.capturing {
+			return nil
+		}
+		var result any
+		trimmed := bytes.TrimSpace(app.capture.Bytes())
+		if len(trimmed) > 0 {
+			if err := json.Unmarshal(trimmed, &result); err != nil {
+				result = map[string]any{"text": string(trimmed)}
+			}
+		}
+		scope := "filesystem"
+		path := cmd.CommandPath()
+		if strings.HasPrefix(path, "dfs service ") || path == "dfs upgrade" {
+			scope = "host"
+		} else if value, err := cmd.Flags().GetString("scope"); err == nil {
+			scope = value
+		}
+		envelope := map[string]any{"schema": "dfs.cli/v1", "command": path, "scope": scope, "result": result}
+		if app.filesystemID != "" {
+			envelope["filesystem_id"] = app.filesystemID
+		}
+		return json.NewEncoder(app.destination).Encode(envelope)
+	}
+	root.AddCommand(app.publicCommands()...)
+	root.AddCommand(app.internalCommand())
+	root.AddCommand(app.legacyRuntimeCommands()...)
 	return root
 }
 
@@ -99,7 +155,7 @@ func (a *App) instanceCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			selected, err := selectManagedInstances(instances, args, stopAll)
+			selected, err := selectManagedInstances(instances, args, stopAll, a.filesystem)
 			if err != nil {
 				return err
 			}
@@ -145,7 +201,7 @@ func (a *App) instanceCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			selected, err := selectManagedInstances(instances, args, uninstallAll)
+			selected, err := selectManagedInstances(instances, args, uninstallAll, a.filesystem)
 			if err != nil {
 				return err
 			}
@@ -165,7 +221,17 @@ func (a *App) instanceCommand() *cobra.Command {
 	return instancesCommand
 }
 
-func selectManagedInstances(instances []dfsinstance.Instance, args []string, all bool) ([]dfsinstance.Instance, error) {
+func selectManagedInstances(instances []dfsinstance.Instance, args []string, all bool, implicit ...string) ([]dfsinstance.Instance, error) {
+	selector := ""
+	if len(implicit) > 0 {
+		selector = strings.TrimSpace(implicit[0])
+	}
+	if selector != "" {
+		if len(args) != 0 {
+			return nil, errors.New("pass the service selector as an argument or --filesystem, not both")
+		}
+		args = []string{selector}
+	}
 	if all {
 		if len(args) != 0 {
 			return nil, errors.New("pass either one DFS instance selector or --all, not both")
@@ -566,7 +632,7 @@ func (a *App) networkCommand() *cobra.Command {
 	complete := &cobra.Command{
 		Use: "complete", Args: cobra.NoArgs, Short: "Retry completion of an interrupted peer pairing",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repositoryPath, err := config.ResolveRepository(a.repo)
+			repositoryPath, err := a.resolveRepository()
 			if err != nil {
 				return err
 			}
@@ -612,7 +678,7 @@ func (a *App) pairCommand() *cobra.Command {
 	list := &cobra.Command{
 		Use: "list", Args: cobra.NoArgs, Short: "List active pairing invitations",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repositoryPath, err := config.ResolveRepository(a.repo)
+			repositoryPath, err := a.resolveRepository()
 			if err != nil {
 				return err
 			}
@@ -637,7 +703,7 @@ func (a *App) pairCommand() *cobra.Command {
 	revoke := &cobra.Command{
 		Use: "revoke <invitation-id>", Args: cobra.ExactArgs(1), Short: "Revoke an unused or pending pairing invitation",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repositoryPath, err := config.ResolveRepository(a.repo)
+			repositoryPath, err := a.resolveRepository()
 			if err != nil {
 				return err
 			}
@@ -646,7 +712,7 @@ func (a *App) pairCommand() *cobra.Command {
 	}
 	requests := &cobra.Command{Use: "requests", Args: cobra.NoArgs, Short: "List pending peer join requests",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repositoryPath, err := config.ResolveRepository(a.repo)
+			repositoryPath, err := a.resolveRepository()
 			if err != nil {
 				return err
 			}
@@ -683,7 +749,7 @@ func (a *App) pairCommand() *cobra.Command {
 		}}
 	reject := &cobra.Command{Use: "reject <request-id>", Args: cobra.ExactArgs(1), Short: "Reject a pending peer join request",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repositoryPath, err := config.ResolveRepository(a.repo)
+			repositoryPath, err := a.resolveRepository()
 			if err != nil {
 				return err
 			}
@@ -697,14 +763,127 @@ func (a *App) pairCommand() *cobra.Command {
 	return pairing
 }
 
-func Execute() error { return New().Execute() }
+type JSONCommandError struct{ Err error }
+
+func (e *JSONCommandError) Error() string { return e.Err.Error() }
+func (e *JSONCommandError) Unwrap() error { return e.Err }
+
+func Execute() error {
+	root := New()
+	err := root.Execute()
+	if err == nil {
+		return nil
+	}
+	output, _ := root.PersistentFlags().GetString("output")
+	if output != "json" {
+		return err
+	}
+	command := publicCommandPath(root, os.Args[1:])
+	scope := "filesystem"
+	if strings.HasPrefix(command, "dfs service ") || command == "dfs service" || command == "dfs upgrade" {
+		scope = "host"
+	}
+	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": "dfs.cli/v1", "command": command, "scope": scope, "error": map[string]any{"code": errorCode(err), "message": err.Error()}})
+	return &JSONCommandError{Err: err}
+}
+
+func publicCommandPath(root *cobra.Command, arguments []string) string {
+	current := root
+	parts := []string{root.Name()}
+	for _, argument := range arguments {
+		if strings.HasPrefix(argument, "-") {
+			continue
+		}
+		for _, child := range current.Commands() {
+			if argument == child.Name() {
+				parts = append(parts, child.Name())
+				current = child
+				break
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func errorCode(err error) string {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "required"), strings.Contains(message, "requires"), strings.Contains(message, "unknown command"), strings.Contains(message, "unsupported"):
+		return "INVALID_ARGUMENT"
+	case strings.Contains(message, "not found"), strings.Contains(message, "no dfs"):
+		return "NOT_FOUND"
+	case strings.Contains(message, "not approved"):
+		return "NOT_CONFIRMED"
+	default:
+		return "OPERATION_FAILED"
+	}
+}
 
 func (a *App) open() (*repository.Repository, error) {
-	repo, err := repository.Open(a.repo)
+	repositoryPath, err := a.resolveRepository()
+	if err != nil {
+		return nil, err
+	}
+	repo, err := repository.Open(repositoryPath)
 	if err == nil {
 		repo.SetManagedFetcher(managed.FetchPath)
+		a.filesystemID = repo.Config.FileSystemID
 	}
 	return repo, err
+}
+
+func (a *App) resolveRepository() (string, error) {
+	if a.repo != "" || os.Getenv("DFS_REPO") != "" {
+		return config.ResolveRepository(a.repo)
+	}
+	selector := strings.TrimSpace(a.filesystem)
+	if selector == "" {
+		selector = strings.TrimSpace(os.Getenv("DFS_FILESYSTEM"))
+	}
+	instances, discoverErr := dfsinstance.Discover(context.Background())
+	if selector != "" {
+		if discoverErr != nil {
+			return "", discoverErr
+		}
+		instance, err := dfsinstance.Find(instances, selector)
+		if err != nil {
+			return "", err
+		}
+		return instance.Repository, nil
+	}
+	current, cwdErr := os.Getwd()
+	if cwdErr == nil {
+		for _, instance := range instances {
+			for _, base := range []string{instance.Repository, instance.Mountpoint} {
+				relative, err := filepath.Rel(base, current)
+				if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+					return instance.Repository, nil
+				}
+			}
+		}
+	}
+	if discoverErr == nil {
+		switch len(instances) {
+		case 1:
+			return instances[0].Repository, nil
+		case 0:
+			// Manual and developer repositories are still resolved below.
+		default:
+			var choices []string
+			for _, instance := range instances {
+				choices = append(choices, fmt.Sprintf("%s (%s)", instance.NetworkName, shortID(instance.FileSystemID)))
+			}
+			return "", fmt.Errorf("multiple DFS filesystems are installed; select one with --filesystem: %s", strings.Join(choices, ", "))
+		}
+	}
+	return config.ResolveRepository("")
+}
+
+func shortID(value string) string {
+	if len(value) > 12 {
+		return value[:12]
+	}
+	return value
 }
 
 func commandContext(command *cobra.Command) (context.Context, context.CancelFunc) {
@@ -1150,7 +1329,7 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 		Use: name, Args: cobra.NoArgs, Short: "Report environment, filesystem, storage, and peer health",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			environment, environmentErr := checkEnvironment(runtime.GOOS)
-			repositoryPath, err := config.ResolveRepository(a.repo)
+			repositoryPath, err := a.resolveRepository()
 			if err != nil {
 				return errors.Join(environmentErr, err)
 			}

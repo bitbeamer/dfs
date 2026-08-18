@@ -109,6 +109,15 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 	if err := membership.Sync(ctx, repo.Config.Repository, remoteNames); err != nil {
 		return fmt.Errorf("synchronize DFS membership metadata: %w", err)
 	}
+	if shared, err := membership.LoadFilesystemConfig(repo.Config.Repository, filesystemID); err == nil {
+		if shared.Name != repo.Config.NetworkName {
+			if err := repo.SetNetworkName(shared.Name); err != nil {
+				return fmt.Errorf("apply replicated filesystem name: %w", err)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load replicated filesystem configuration: %w", err)
+	}
 	accepted, err := acceptedMembership(ctx, repo, filesystemID)
 	if err != nil {
 		return err

@@ -3,10 +3,13 @@ set -euo pipefail
 
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 install_path="$HOME/.local/bin/dfs"
+installer_path="$HOME/.local/lib/dfs/install-cachyos.sh"
 pair_port=7843
+start_services=true
+enable_services=true
 
 usage() {
-  printf 'Usage: %s [--pair-port PORT] <repository> <mountpoint> [dfs-binary]\n' "$0" >&2
+  printf 'Usage: %s [--pair-port PORT] [--no-start] [--no-enable] <repository> <mountpoint> [dfs-binary]\n' "$0" >&2
   printf '       %s --uninstall <repository>\n' "$0" >&2
 }
 
@@ -35,11 +38,26 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "--pair-port" ]]; then
-  [[ $# -ge 3 ]] || { usage; exit 2; }
-  pair_port=$2
-  shift 2
-fi
+while (( $# > 0 )); do
+  case "$1" in
+    --pair-port)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      pair_port=$2
+      shift 2
+      ;;
+    --no-start)
+      start_services=false
+      shift
+      ;;
+    --no-enable)
+      enable_services=false
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 if (( $# < 2 || $# > 3 )); then
   usage
   exit 2
@@ -53,7 +71,7 @@ repository=$(realpath "$1")
 mountpoint=$2
 source_binary=${3:-./bin/dfs}
 source_binary=$(realpath "$source_binary")
-mkdir -p "$mountpoint" "$unit_dir" "$(dirname "$install_path")"
+mkdir -p "$mountpoint" "$unit_dir" "$(dirname "$install_path")" "$(dirname "$installer_path")"
 mountpoint=$(realpath "$mountpoint")
 filesystem_id=$(filesystem_identity "$repository")
 instance=${filesystem_id:0:12}
@@ -95,6 +113,10 @@ fi
 if [[ ! -e "$install_path" ]] || ! [[ "$source_binary" -ef "$install_path" ]]; then
   install -m 0755 "$source_binary" "$install_path"
 fi
+current_installer=$(realpath "$0")
+if [[ ! -e "$installer_path" ]] || ! [[ "$current_installer" -ef "$installer_path" ]]; then
+  install -m 0755 "$current_installer" "$installer_path"
+fi
 
 systemd_quote() {
   local value=$1
@@ -118,7 +140,7 @@ After=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=$binary_arg --repo $repository_arg daemon --managed --pair-port $pair_port --mountpoint $mountpoint_arg --log-level info --log-format json
+ExecStart=$binary_arg --repo $repository_arg internal core --managed --pair-port $pair_port --mountpoint $mountpoint_arg --log-level info --log-format json
 ExecStartPost=$binary_arg --repo $repository_arg health
 Restart=on-failure
 RestartSec=5s
@@ -139,7 +161,7 @@ Documentation=https://github.com/bitbeamer/dfs
 
 [Service]
 Type=simple
-ExecStart=$binary_arg --repo $repository_arg mount --managed --log-level info --log-format json $mountpoint_arg
+ExecStart=$binary_arg --repo $repository_arg internal mount --managed --log-level info --log-format json $mountpoint_arg
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -151,7 +173,16 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$core_unit_name"
-systemctl --user enable --now "$unit_name"
-systemctl --user --no-pager --full status "$unit_name"
-printf 'Installed %s and %s. Health: %s --repo %s health\n' "$core_unit_name" "$unit_name" "$install_path" "$repository"
+if [[ "$enable_services" == true ]]; then
+  systemctl --user enable "$core_unit_name" "$unit_name"
+else
+  systemctl --user disable "$core_unit_name" "$unit_name"
+fi
+if [[ "$start_services" == true ]]; then
+  systemctl --user start "$core_unit_name"
+  systemctl --user start "$unit_name"
+  systemctl --user --no-pager --full status "$unit_name"
+  printf 'Installed and started %s and %s. Health: %s --repo %s health\n' "$core_unit_name" "$unit_name" "$install_path" "$repository"
+else
+  printf 'Installed %s and %s without starting them.\n' "$core_unit_name" "$unit_name"
+fi

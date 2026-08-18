@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bitbeamer/dfs/internal/config"
 )
 
 func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
@@ -79,6 +81,93 @@ func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
 	accepted, err = Accepted(shared, filesystemID)
 	if err != nil || len(accepted) != 1 || accepted[0].Payload.PeerID != "alice-peer" {
 		t.Fatalf("locally persisted revocation was undone: %#v, %v", accepted, err)
+	}
+}
+
+func TestFilesystemNameIsSignedByAcceptedAdministrator(t *testing.T) {
+	repositoryPath := gitMembershipRepository(t)
+	filesystemID := strings.Repeat("f", 40)
+	private, public, err := EnsureKey(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := signedTestRecord(t, filesystemID, "admin-peer", "admin", public, private)
+	record, err = Approve(record, "admin-peer", private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(repositoryPath, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := Trust(repositoryPath, record.Payload.PeerID, public); err != nil {
+		t.Fatal(err)
+	}
+	first, err := SetFilesystemName(repositoryPath, filesystemID, record.Payload.PeerID, "Home Files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := SetFilesystemName(repositoryPath, filesystemID, record.Payload.PeerID, "Archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Generation != 1 || second.Generation != 2 {
+		t.Fatalf("filesystem name generations = %d, %d", first.Generation, second.Generation)
+	}
+	loaded, err := LoadFilesystemConfig(repositoryPath, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Name != "Archive" || loaded.IssuedBy != "admin-peer" {
+		t.Fatalf("loaded filesystem config = %#v", loaded)
+	}
+}
+
+func TestFilesystemNameReplicatesThroughDedicatedConfigurationRef(t *testing.T) {
+	first := gitMembershipRepository(t)
+	second := filepath.Join(t.TempDir(), "second")
+	if output, err := exec.Command("git", "clone", first, second).CombinedOutput(); err != nil {
+		t.Fatalf("clone second repository: %v\n%s", err, output)
+	}
+	gitMembershipRun(t, second, "config", "user.name", "Membership Test")
+	gitMembershipRun(t, second, "config", "user.email", "membership@example.invalid")
+	gitMembershipRun(t, first, "remote", "add", "second", second)
+	gitMembershipRun(t, second, "remote", "add", "first", first)
+	filesystemID := strings.Repeat("c", 40)
+	private, public, err := EnsureKey(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := signedTestRecord(t, filesystemID, "admin-peer", "admin", public, private)
+	admin, err = Approve(admin, "admin-peer", private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repositoryPath := range []string{first, second} {
+		if err := Save(repositoryPath, admin); err != nil {
+			t.Fatal(err)
+		}
+		if err := Trust(repositoryPath, admin.Payload.PeerID, public); err != nil {
+			t.Fatal(err)
+		}
+		if err := config.Save(config.Config{Version: 4, FileSystemID: filesystemID, PeerID: "admin-peer", Repository: repositoryPath}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := SetFilesystemName(first, filesystemID, "admin-peer", "Shared Archive"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Sync(context.Background(), first, []string{"second"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Sync(context.Background(), second, []string{"first"}); err != nil {
+		t.Fatal(err)
+	}
+	value, err := LoadFilesystemConfig(second, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Name != "Shared Archive" || value.IssuedBy != "admin-peer" {
+		t.Fatalf("replicated filesystem config = %#v", value)
 	}
 }
 
