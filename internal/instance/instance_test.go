@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,6 +23,10 @@ func TestDiscoverSystemdInstancesUsesInstalledServiceDefinitions(t *testing.T) {
 	}
 	config := `{"filesystem_id":"123456789abcdef0123456789abcdef012345678","name":"ares","network_name":"Home Files"}`
 	if err := os.WriteFile(filepath.Join(repository, ".git", "dfs", "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	health := `{"pid":4242,"repository":` + fmt.Sprintf("%q", repository) + `}`
+	if err := os.WriteFile(filepath.Join(repository, ".git", "dfs", "health.json"), []byte(health), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	unitDirectory := filepath.Join(home, "units")
@@ -46,7 +51,7 @@ func TestDiscoverSystemdInstancesUsesInstalledServiceDefinitions(t *testing.T) {
 		t.Fatalf("instances = %#v", instances)
 	}
 	instance := instances[0]
-	if instance.FileSystemID != "123456789abcdef0123456789abcdef012345678" || instance.NetworkName != "Home Files" || instance.Name != "ares" || instance.Repository != repository || instance.Mountpoint != mountpoint || instance.PairingPort != 7849 || !instance.CoreActive || instance.MountActive {
+	if instance.FileSystemID != "123456789abcdef0123456789abcdef012345678" || instance.NetworkName != "Home Files" || instance.Name != "ares" || instance.Repository != repository || instance.Mountpoint != mountpoint || instance.PairingPort != 7849 || instance.processID != 4242 || !instance.CoreActive || instance.MountActive {
 		t.Fatalf("discovered instance = %#v", instance)
 	}
 }
@@ -244,6 +249,34 @@ func TestUninstallAndPurgeRemovesFrozenAnnexRepository(t *testing.T) {
 	}
 	if _, err := os.Stat(setupState); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("purged setup state remains: %v", err)
+	}
+}
+
+func TestUninstallWaitsForCoreProcessBeforeRemovingDefinitions(t *testing.T) {
+	home := t.TempDir()
+	unitDirectory := filepath.Join(home, "units")
+	if err := os.MkdirAll(unitDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	serviceID := "123456789abc"
+	for _, kind := range []string{"mount", "core"} {
+		if err := os.WriteFile(filepath.Join(unitDirectory, "io.bitbeamer.dfs."+kind+"."+serviceID+".plist"), []byte("plist"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checks := 0
+	manager := &manager{platform: "darwin", launchdDir: unitDirectory, domain: "gui/501", run: func(context.Context, string, ...string) ([]byte, error) {
+		return nil, nil
+	}, alive: func(pid int) bool {
+		checks++
+		return pid == 1234 && checks == 1
+	}}
+	err := manager.uninstall(context.Background(), []Instance{{Repository: filepath.Join(home, "repository"), serviceID: serviceID, CoreActive: true, processID: 1234}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checks < 2 {
+		t.Fatalf("core process checked %d time(s), want shutdown wait", checks)
 	}
 }
 

@@ -410,7 +410,12 @@ func loadOrCreate(options Options) (*State, string, error) {
 		return nil, "", errors.New("a discovered DFS filesystem must be selected")
 	}
 	if _, err := os.Stat(repositoryPath); err == nil {
-		return nil, "", fmt.Errorf("repository destination already exists: %s", repositoryPath)
+		if !shutdownHealthRemnant(repositoryPath) {
+			return nil, "", fmt.Errorf("repository destination already exists: %s", repositoryPath)
+		}
+		if err := os.RemoveAll(repositoryPath); err != nil {
+			return nil, "", fmt.Errorf("remove stale DFS shutdown state: %w", err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
 	}
@@ -446,6 +451,29 @@ func loadOrCreate(options Options) (*State, string, error) {
 	state.Phase = PhaseApprovalRequested
 	state.UpdatedAt = time.Now().UTC()
 	return state, path, save(path, state)
+}
+
+func shutdownHealthRemnant(repositoryPath string) bool {
+	allowed := map[string]bool{
+		".": true, ".git": true, filepath.Join(".git", "dfs"): true,
+		filepath.Join(".git", "dfs", "health.json"):  true,
+		filepath.Join(".git", "dfs", "network.json"): true,
+	}
+	foundHealth := false
+	err := filepath.WalkDir(repositoryPath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(repositoryPath, path)
+		if err != nil || !allowed[relative] || entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("repository contains non-runtime data")
+		}
+		if relative == filepath.Join(".git", "dfs", "health.json") && !entry.IsDir() {
+			foundHealth = true
+		}
+		return nil
+	})
+	return err == nil && foundHealth
 }
 
 func verifySetupCluster(ctx context.Context, statePath string, state *State, options Options) error {

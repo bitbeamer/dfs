@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	dfssetup "github.com/bitbeamer/dfs/internal/setup"
 )
@@ -33,6 +35,7 @@ type Instance struct {
 	MountEnabled bool   `json:"mount_enabled"`
 	Platform     string `json:"platform"`
 	serviceID    string
+	processID    int
 }
 
 func (i Instance) Active() bool { return i.CoreActive || i.MountActive }
@@ -45,6 +48,7 @@ type manager struct {
 	launchdDir string
 	domain     string
 	run        commandRunner
+	alive      func(int) bool
 }
 
 func newManager() (*manager, error) {
@@ -59,7 +63,7 @@ func newManager() (*manager, error) {
 	return &manager{
 		platform: runtime.GOOS, systemdDir: filepath.Join(configHome, "systemd", "user"),
 		launchdDir: filepath.Join(home, "Library", "LaunchAgents"), domain: "gui/" + strconv.Itoa(os.Getuid()),
-		run: runCommand,
+		run: runCommand, alive: processAlive,
 	}, nil
 }
 
@@ -211,6 +215,14 @@ func instanceFromArguments(arguments []string, serviceID, platform string) (Inst
 		}
 		instance.Name = cfg.Name
 		instance.NetworkName = cfg.NetworkName
+	}
+	var health struct {
+		PID        int    `json:"pid"`
+		Repository string `json:"repository"`
+	}
+	data, err = os.ReadFile(filepath.Join(instance.Repository, ".git", "dfs", "health.json"))
+	if err == nil && json.Unmarshal(data, &health) == nil && filepath.Clean(health.Repository) == filepath.Clean(instance.Repository) {
+		instance.processID = health.PID
 	}
 	return instance, nil
 }
@@ -919,6 +931,10 @@ func (m *manager) uninstall(ctx context.Context, instances []Instance) error {
 			if stopFailed {
 				continue
 			}
+			if err := m.waitForProcessExit(ctx, instance.processID); err != nil {
+				failures = append(failures, fmt.Errorf("uninstall %s: %w", instanceLabel(instance), err))
+				continue
+			}
 			for _, kind := range []string{"mount", "core"} {
 				label := "io.bitbeamer.dfs." + kind + "." + instance.serviceID
 				if err := os.Remove(filepath.Join(m.launchdDir, label+".plist")); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -933,6 +949,37 @@ func (m *manager) uninstall(ctx context.Context, instances []Instance) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (m *manager) waitForProcessExit(ctx context.Context, pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	alive := m.alive
+	if alive == nil {
+		alive = processAlive
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for alive(pid) {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("core process %d did not stop: %w", pid, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+	return nil
+}
+
+func processAlive(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func resolveInstaller(platform, explicit string) (string, error) {

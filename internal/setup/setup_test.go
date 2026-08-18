@@ -86,6 +86,40 @@ func TestSetupDiscardsVerifiedStateAfterRepositoryPurge(t *testing.T) {
 	}
 }
 
+func TestSetupDiscardsShutdownHealthRemnant(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+	repositoryPath := filepath.Join(home, "repository")
+	healthPath := filepath.Join(repositoryPath, ".git", "dfs", "health.json")
+	if err := os.MkdirAll(filepath.Dir(healthPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(healthPath, []byte(`{"state":"stopped"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := loadOrCreate(Options{Create: true, Repository: repositoryPath, Mountpoint: filepath.Join(home, "mount"), NetworkName: "Replacement", CacheLimit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != PhaseApprovalRequested {
+		t.Fatalf("replacement setup state = %#v", state)
+	}
+	if _, err := os.Stat(repositoryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("shutdown health remnant was not removed: %v", err)
+	}
+}
+
+func TestSetupPreservesNonRuntimeRepositoryDirectory(t *testing.T) {
+	repositoryPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repositoryPath, "user-data"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if shutdownHealthRemnant(repositoryPath) {
+		t.Fatal("directory containing user data was classified as a shutdown remnant")
+	}
+}
+
 func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
