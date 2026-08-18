@@ -307,7 +307,7 @@ func (s *Scheduler) sync(reason string) {
 
 func isMaintenanceReason(reason string) bool {
 	switch reason {
-	case "startup", "periodic", "shutdown", "pin policy changed", maintenanceReceiveReason:
+	case "startup", "periodic", "shutdown", "pin policy changed", "peer requested membership reconciliation", maintenanceReceiveReason:
 		return true
 	default:
 		return false
