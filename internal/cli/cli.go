@@ -183,9 +183,7 @@ func (a *App) setupCommand() *cobra.Command {
 }
 
 func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out io.Writer, wanted string, timeout time.Duration) (string, error) {
-	discoveryCtx, cancel := context.WithTimeout(ctx, timeout+2*time.Second)
-	defer cancel()
-	offers, err := peer.Discover(discoveryCtx, timeout)
+	offers, err := discoverSetupNetworks(ctx, out, timeout, time.Second, peer.Discover)
 	if err != nil {
 		return "", err
 	}
@@ -227,6 +225,46 @@ func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out i
 		return "", errors.New("invalid DFS filesystem selection")
 	}
 	return networks[selected-1].FileSystemID, nil
+}
+
+type setupDiscoverer func(context.Context, time.Duration) ([]peer.Offer, error)
+
+type setupDiscoveryResult struct {
+	offers []peer.Offer
+	err    error
+}
+
+func discoverSetupNetworks(ctx context.Context, out io.Writer, timeout, progressInterval time.Duration, discover setupDiscoverer) ([]peer.Offer, error) {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	if progressInterval <= 0 {
+		progressInterval = time.Second
+	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, timeout+2*time.Second)
+	defer cancel()
+	fmt.Fprintf(out, "Searching for DFS filesystems on the local network (up to %s)...\n", timeout)
+	result := make(chan setupDiscoveryResult, 1)
+	go func() {
+		offers, err := discover(discoveryCtx, timeout)
+		result <- setupDiscoveryResult{offers: offers, err: err}
+	}()
+	started := time.Now()
+	ticker := time.NewTicker(progressInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case found := <-result:
+			if found.err == nil {
+				fmt.Fprintf(out, "Discovery finished: %d network offer(s) found.\n", len(found.offers))
+			}
+			return found.offers, found.err
+		case <-ticker.C:
+			fmt.Fprintf(out, "Still searching for DFS filesystems... %s elapsed\n", time.Since(started).Round(time.Second))
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func (a *App) networkCommand() *cobra.Command {
