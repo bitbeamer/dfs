@@ -46,6 +46,15 @@ func (a *App) setupGroupCommand() *cobra.Command {
 	)
 	join := root.RunE
 	root.RunE = func(cmd *cobra.Command, args []string) error {
+		for _, mode := range []string{"create", "resume", "abort"} {
+			enabled, err := cmd.Flags().GetBool(mode)
+			if err != nil {
+				return err
+			}
+			if enabled {
+				return join(cmd, args)
+			}
+		}
 		if a.output == "json" {
 			return errors.New("dfs setup with JSON output requires an explicit create, join, resume, or abort subcommand")
 		}

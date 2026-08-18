@@ -191,6 +191,34 @@ func TestServiceUninstallPurgeRequiresExplicitApproval(t *testing.T) {
 	}
 }
 
+func TestLegacySetupAbortSkipsCreateOrJoinPrompt(t *testing.T) {
+	command := New()
+	var stderr bytes.Buffer
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"setup", "--abort", "--repository", t.TempDir()})
+	err := command.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no DFS setup transaction is recorded") {
+		t.Fatalf("legacy setup abort error = %v", err)
+	}
+	if strings.Contains(stderr.String(), "Create or join") {
+		t.Fatalf("legacy setup abort prompted for setup mode: %q", stderr.String())
+	}
+}
+
+func TestSetupAbortYesSkipsConfirmation(t *testing.T) {
+	command := New()
+	var stderr bytes.Buffer
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"setup", "abort", "--data-dir", t.TempDir(), "--yes"})
+	err := command.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no DFS setup transaction is recorded") {
+		t.Fatalf("setup abort --yes error = %v", err)
+	}
+	if strings.Contains(stderr.String(), "Continue?") {
+		t.Fatalf("setup abort --yes prompted for confirmation: %q", stderr.String())
+	}
+}
+
 func TestPublicCommandHelpMatchesConsolidatedTree(t *testing.T) {
 	root := New()
 	wanted := map[string]string{

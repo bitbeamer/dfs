@@ -309,7 +309,7 @@ func (a *App) setupCommand() *cobra.Command {
 	var repositoryPath, mountpoint, name, limit, installer, filesystem, networkName, gitName, gitEmail string
 	var pairingPort int
 	var discoveryTimeout, verificationTimeout time.Duration
-	var resume, abort, yes, create bool
+	var resume, abort, create bool
 	command := &cobra.Command{
 		Use: "setup", Args: cobra.NoArgs,
 		Short: "Create or join, install, mount, and verify DFS as one recoverable transaction",
@@ -339,20 +339,20 @@ func (a *App) setupCommand() *cobra.Command {
 			if create {
 				selectedNetworkName = networkName
 			}
-			gitName, gitEmail, err = ensureGitIdentity(cmd.Context(), reader, a.Out, gitName, gitEmail, yes)
+			gitName, gitEmail, err = ensureGitIdentity(cmd.Context(), reader, a.Out, gitName, gitEmail, a.yes)
 			if err != nil {
 				return err
 			}
 			approve := func(state *dfssetup.State) error {
 				if state.Create {
-					if yes {
+					if a.yes {
 						fmt.Fprintf(a.Out, "Approved creating DFS filesystem %q as %s on managed port %d\n", state.NetworkName, state.Name, state.PairingPort)
 						return nil
 					}
 					fmt.Fprintf(a.Out, "Create DFS filesystem %q as %s and install its managed mount on port %d? [y/N] ", state.NetworkName, state.Name, state.PairingPort)
 				} else {
 					filesystemName := setupFilesystemName(state)
-					if yes {
+					if a.yes {
 						fmt.Fprintf(a.Out, "Approved joining DFS filesystem %q as %s on managed port %d\n", filesystemName, state.Name, state.PairingPort)
 						return nil
 					}
@@ -391,7 +391,6 @@ func (a *App) setupCommand() *cobra.Command {
 	_ = command.Flags().MarkHidden("installer")
 	command.Flags().BoolVar(&resume, "resume", false, "resume the recorded setup transaction")
 	command.Flags().BoolVar(&abort, "abort", false, "roll back the recorded setup transaction")
-	command.Flags().BoolVarP(&yes, "yes", "y", false, "approve setup without an interactive confirmation")
 	command.Flags().StringVar(&filesystem, "filesystem", "", "discovered filesystem ID or unambiguous name")
 	command.Flags().BoolVar(&create, "create", false, "create the first peer of a new DFS filesystem")
 	command.Flags().StringVar(&networkName, "network-name", "", "display name for a newly created DFS filesystem (defaults to the mountpoint name)")
