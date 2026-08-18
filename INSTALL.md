@@ -182,9 +182,7 @@ setup command:
 ./bin/dfs setup --name laptop --cache-limit 50GiB
 ```
 
-Select one of the discovered filesystems. DFS prints a short request ID and
-waits. On any existing online member, verify the peer name and ID, then approve
-the request:
+Setup prints the discovery window and elapsed progress, then lists filesystems by display name. Select one of them. DFS resolves the Git author identity from `--git-name` and `--git-email`, the author environment, or global Git configuration; interactive setup collects missing values and stores them only in the joined repository. It then prints a short request ID and waits. On any existing online member, verify the peer name and ID, then approve the request:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository pair requests

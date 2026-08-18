@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/peer"
+	dfssetup "github.com/bitbeamer/dfs/internal/setup"
 )
 
 func TestDiscoverSetupNetworksReportsProgress(t *testing.T) {
@@ -40,5 +42,45 @@ func TestDiscoverSetupNetworksHonorsCancellation(t *testing.T) {
 		})
 	if err == nil {
 		t.Fatal("cancelled setup discovery unexpectedly succeeded")
+	}
+}
+
+func TestEnsureGitIdentityCollectsAndValidatesMissingValues(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "")
+	t.Setenv("GIT_AUTHOR_EMAIL", "")
+	var output bytes.Buffer
+	name, email, err := ensureGitIdentity(context.Background(), bufio.NewReader(strings.NewReader("Otto\notto@example.com\n")), &output, "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "Otto" || email != "otto@example.com" {
+		t.Fatalf("identity = %q <%s>", name, email)
+	}
+	for _, wanted := range []string{"Git author name", "Git author email", "Git author identity: Otto <otto@example.com>"} {
+		if !strings.Contains(output.String(), wanted) {
+			t.Fatalf("identity output does not contain %q:\n%s", wanted, output.String())
+		}
+	}
+}
+
+func TestEnsureGitIdentityRejectsMissingNonInteractiveValues(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "")
+	t.Setenv("GIT_AUTHOR_EMAIL", "")
+	_, _, err := ensureGitIdentity(context.Background(), bufio.NewReader(strings.NewReader("")), &bytes.Buffer{}, "", "", true)
+	if err == nil || !strings.Contains(err.Error(), "--git-name") {
+		t.Fatalf("non-interactive identity error = %v", err)
+	}
+}
+
+func TestSetupFilesystemNamePrefersDisplayName(t *testing.T) {
+	state := &dfssetup.State{NetworkName: "Home Files", FileSystemID: strings.Repeat("a", 40)}
+	if got := setupFilesystemName(state); got != "Home Files" {
+		t.Fatalf("setup filesystem name = %q", got)
 	}
 }

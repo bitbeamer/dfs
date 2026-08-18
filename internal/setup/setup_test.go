@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,10 +18,6 @@ func TestSetupCreatesFirstFilesystemThroughManagedFlow(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
-	t.Setenv("GIT_AUTHOR_NAME", "DFS Test")
-	t.Setenv("GIT_AUTHOR_EMAIL", "dfs@example.invalid")
-	t.Setenv("GIT_COMMITTER_NAME", "DFS Test")
-	t.Setenv("GIT_COMMITTER_EMAIL", "dfs@example.invalid")
 	repositoryPath := filepath.Join(home, "repository")
 	mountpoint := filepath.Join(home, "mount")
 	installer := filepath.Join(home, "install.sh")
@@ -32,7 +29,7 @@ func TestSetupCreatesFirstFilesystemThroughManagedFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, err := Run(context.Background(), Options{Create: true, NetworkName: "Home Files", Repository: repositoryPath,
-		Mountpoint: mountpoint, Name: "ares", CacheLimit: 1 << 20, Installer: installer, Binary: binary, Out: os.Stderr})
+		Mountpoint: mountpoint, Name: "ares", GitName: "DFS Test", GitEmail: "dfs@example.invalid", CacheLimit: 1 << 20, Installer: installer, Binary: binary, Out: os.Stderr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +43,12 @@ func TestSetupCreatesFirstFilesystemThroughManagedFlow(t *testing.T) {
 	defer repo.Close()
 	if repo.Config.NetworkName != "Home Files" || repo.Config.Name != "ares" || repo.Config.PeerID != state.PeerID {
 		t.Fatalf("created repository config = %+v", repo.Config)
+	}
+	for key, wanted := range map[string]string{"user.name": "DFS Test", "user.email": "dfs@example.invalid"} {
+		output, err := exec.Command("git", "-C", repositoryPath, "config", "--local", "--get", key).Output()
+		if err != nil || strings.TrimSpace(string(output)) != wanted {
+			t.Fatalf("local Git %s = %q, %v", key, output, err)
+		}
 	}
 }
 

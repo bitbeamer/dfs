@@ -32,6 +32,8 @@ type PairOptions struct {
 	PeerID         string
 	StateDirectory string
 	PairingPort    int
+	GitName        string
+	GitEmail       string
 }
 
 const pairingResumeFile = "pairing-resume.json"
@@ -167,7 +169,8 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := managed.PairClone(ctx, endpoint, invitation.CertificateSHA256, start.SessionID, start.CompletionSecret, bundlePath); err != nil {
 		return nil, fmt.Errorf("clone paired DFS repository over QUIC: %w", err)
 	}
-	repo, err := repository.Join(ctx, bundlePath, destination, name, cacheLimit, invitation.FileSystemID)
+	repo, err := repository.JoinWithIdentity(ctx, bundlePath, destination, name, cacheLimit,
+		repository.GitIdentity{Name: options.GitName, Email: options.GitEmail}, invitation.FileSystemID)
 	if err != nil {
 		return nil, fmt.Errorf("clone paired DFS repository: %w", err)
 	}

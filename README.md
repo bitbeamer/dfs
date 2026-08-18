@@ -145,9 +145,7 @@ On the new device, from the DFS source checkout, run:
 ./bin/dfs setup --name laptop --cache-limit 50GiB
 ```
 
-`dfs setup` lists nearby filesystems and asks you to select one. It prints a
-short request ID and waits. On any existing online member, review and approve
-that exact signed request:
+`dfs setup` shows elapsed progress while it scans, lists nearby filesystems by display name, and asks you to select one. It resolves the Git author identity from `--git-name` and `--git-email`, the author environment, or global Git configuration; if either value is missing, interactive setup collects it and stores it only in this DFS repository. Setup then prints a short request ID and waits. On any existing online member, review and approve that exact signed request:
 
 ```sh
 dfs --repo ~/.local/share/dfs/repository pair requests
@@ -179,10 +177,7 @@ resume, or abort command. `--mountpoint` selects another mountpoint and
 `--pair-port` selects a local managed transport port. Otherwise setup uses the
 first free UDP port beginning at 7843.
 
-`dfs network discover`, `dfs network join`, `dfs network complete`, and the
-installer scripts are the lower-level controls for manual recovery and
-diagnostics. `dfs setup` currently joins an existing filesystem; creation of
-the first peer still uses `dfs init` and a platform installer.
+`dfs network discover`, `dfs network join`, `dfs network complete`, `dfs init`, and the installer scripts are lower-level controls for manual recovery and diagnostics. Guided `dfs setup` creates the first peer with `--create` or joins an existing filesystem discovered on the LAN.
 
 ### Pairing and membership security
 
@@ -552,8 +547,6 @@ a private transaction.
 
 - mDNS discovery is LAN-local. Routed discovery and relay-assisted invitations
   are not implemented.
-- Creating the first filesystem is still a separate `init` plus installer flow;
-  guided `dfs setup` currently covers joining an existing filesystem.
 - The conflict command reports conflicts but has no complete resolution UI.
 - Git history does not automatically retain old annex content.
 - Permissions, ownership, timestamps, and extended attributes are peer-local;

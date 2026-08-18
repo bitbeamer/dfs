@@ -81,6 +81,11 @@ type CachedFile struct {
 	Size int64
 }
 
+type GitIdentity struct {
+	Name  string
+	Email string
+}
+
 func CheckDependencies() error {
 	var missing []string
 	for _, name := range []string{"git", "git-annex"} {
@@ -95,6 +100,10 @@ func CheckDependencies() error {
 }
 
 func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository, error) {
+	return InitWithIdentity(ctx, path, name, cacheLimit, GitIdentity{})
+}
+
+func InitWithIdentity(ctx context.Context, path, name string, cacheLimit int64, identity GitIdentity) (*Repository, error) {
 	if err := CheckDependencies(); err != nil {
 		return nil, err
 	}
@@ -111,6 +120,9 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 	}
 	runner := command.Runner{Directory: path}
 	if _, err := runner.Run(ctx, "git", "init", "-b", "main"); err != nil {
+		return nil, err
+	}
+	if err := configureGitIdentity(ctx, runner, identity); err != nil {
 		return nil, err
 	}
 	if _, err := runner.Run(ctx, "git", "annex", "init", name); err != nil {
@@ -138,6 +150,10 @@ func Init(ctx context.Context, path, name string, cacheLimit int64) (*Repository
 }
 
 func Join(ctx context.Context, remote, path, name string, cacheLimit int64, expectedFileSystemID ...string) (*Repository, error) {
+	return JoinWithIdentity(ctx, remote, path, name, cacheLimit, GitIdentity{}, expectedFileSystemID...)
+}
+
+func JoinWithIdentity(ctx context.Context, remote, path, name string, cacheLimit int64, identity GitIdentity, expectedFileSystemID ...string) (*Repository, error) {
 	if err := CheckDependencies(); err != nil {
 		return nil, err
 	}
@@ -157,6 +173,9 @@ func Join(ctx context.Context, remote, path, name string, cacheLimit int64, expe
 		name, _ = os.Hostname()
 	}
 	runner.Directory = path
+	if err := configureGitIdentity(ctx, runner, identity); err != nil {
+		return nil, err
+	}
 	// A pairing bundle can be captured while git-annex has its synchronized
 	// branch checked out. DFS mutations and the directional fast path always
 	// publish refs/heads/main, so normalize every joined worktree back to that
@@ -193,6 +212,24 @@ func Join(ctx context.Context, remote, path, name string, cacheLimit int64, expe
 		return nil, err
 	}
 	return Open(path)
+}
+
+func configureGitIdentity(ctx context.Context, runner command.Runner, identity GitIdentity) error {
+	identity.Name = strings.TrimSpace(identity.Name)
+	identity.Email = strings.TrimSpace(identity.Email)
+	if identity.Name == "" && identity.Email == "" {
+		return nil
+	}
+	if identity.Name == "" || identity.Email == "" {
+		return errors.New("Git author name and email must both be provided")
+	}
+	if _, err := runner.Run(ctx, "git", "config", "user.name", identity.Name); err != nil {
+		return fmt.Errorf("configure repository Git author name: %w", err)
+	}
+	if _, err := runner.Run(ctx, "git", "config", "user.email", identity.Email); err != nil {
+		return fmt.Errorf("configure repository Git author email: %w", err)
+	}
+	return nil
 }
 
 func Open(path string) (*Repository, error) {

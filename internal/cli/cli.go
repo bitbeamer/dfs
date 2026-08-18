@@ -94,7 +94,7 @@ func (a *App) transportCommand() *cobra.Command {
 }
 
 func (a *App) setupCommand() *cobra.Command {
-	var repositoryPath, mountpoint, name, limit, installer, filesystem, networkName string
+	var repositoryPath, mountpoint, name, limit, installer, filesystem, networkName, gitName, gitEmail string
 	var pairingPort int
 	var discoveryTimeout time.Duration
 	var resume, abort, yes, create bool
@@ -117,11 +117,19 @@ func (a *App) setupCommand() *cobra.Command {
 			}
 			reader := bufio.NewReader(cmd.InOrStdin())
 			selectedFilesystem := strings.TrimSpace(filesystem)
+			selectedNetworkName := ""
 			if !resume && !create {
-				selectedFilesystem, err = selectDiscoveredFilesystem(cmd.Context(), reader, a.Out, selectedFilesystem, discoveryTimeout)
+				selectedFilesystem, selectedNetworkName, err = selectDiscoveredFilesystem(cmd.Context(), reader, a.Out, selectedFilesystem, discoveryTimeout)
 				if err != nil {
 					return err
 				}
+			}
+			if create {
+				selectedNetworkName = networkName
+			}
+			gitName, gitEmail, err = ensureGitIdentity(cmd.Context(), reader, a.Out, gitName, gitEmail, yes)
+			if err != nil {
+				return err
 			}
 			approve := func(state *dfssetup.State) error {
 				if state.Create {
@@ -131,15 +139,12 @@ func (a *App) setupCommand() *cobra.Command {
 					}
 					fmt.Fprintf(a.Out, "Create DFS filesystem %q as %s and install its managed mount on port %d? [y/N] ", state.NetworkName, state.Name, state.PairingPort)
 				} else {
-					shortID := state.FileSystemID
-					if len(shortID) > 12 {
-						shortID = shortID[:12]
-					}
+					filesystemName := setupFilesystemName(state)
 					if yes {
-						fmt.Fprintf(a.Out, "Approved joining DFS filesystem %s as %s on managed port %d\n", shortID, state.Name, state.PairingPort)
+						fmt.Fprintf(a.Out, "Approved joining DFS filesystem %q as %s on managed port %d\n", filesystemName, state.Name, state.PairingPort)
 						return nil
 					}
-					fmt.Fprintf(a.Out, "Join DFS filesystem %s as %s and install its managed mount on port %d? [y/N] ", shortID, state.Name, state.PairingPort)
+					fmt.Fprintf(a.Out, "Join DFS filesystem %q as %s and install its managed mount on port %d? [y/N] ", filesystemName, state.Name, state.PairingPort)
 				}
 				answer, readErr := reader.ReadString('\n')
 				if readErr != nil && !errors.Is(readErr, io.EOF) {
@@ -151,8 +156,8 @@ func (a *App) setupCommand() *cobra.Command {
 				}
 				return nil
 			}
-			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Create: create, NetworkName: networkName, Repository: repositoryPath, Mountpoint: mountpoint,
-				Name: name, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
+			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Create: create, NetworkName: selectedNetworkName, Repository: repositoryPath, Mountpoint: mountpoint,
+				Name: name, GitName: gitName, GitEmail: gitEmail, CacheLimit: cacheLimit, Timeout: discoveryTimeout, Resume: resume, Installer: installer,
 				PairingPort: pairingPort, Out: a.Out, Approve: approve})
 			if err != nil {
 				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup --resume or roll back with dfs setup --abort)", err)
@@ -177,19 +182,21 @@ func (a *App) setupCommand() *cobra.Command {
 	command.Flags().StringVar(&filesystem, "filesystem", "", "discovered filesystem ID or unambiguous name")
 	command.Flags().BoolVar(&create, "create", false, "create the first peer of a new DFS filesystem")
 	command.Flags().StringVar(&networkName, "network-name", "", "display name for a newly created DFS filesystem (defaults to the mountpoint name)")
+	command.Flags().StringVar(&gitName, "git-name", "", "Git author name stored in this DFS repository")
+	command.Flags().StringVar(&gitEmail, "git-email", "", "Git author email stored in this DFS repository")
 	command.MarkFlagsMutuallyExclusive("resume", "abort")
 	command.MarkFlagsMutuallyExclusive("create", "filesystem")
 	return command
 }
 
-func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out io.Writer, wanted string, timeout time.Duration) (string, error) {
+func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out io.Writer, wanted string, timeout time.Duration) (string, string, error) {
 	offers, err := discoverSetupNetworks(ctx, out, timeout, time.Second, peer.Discover)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	networks := peer.GroupOffers(offers)
 	if len(networks) == 0 {
-		return "", errors.New("no DFS filesystems discovered")
+		return "", "", errors.New("no DFS filesystems discovered")
 	}
 	if wanted != "" {
 		var matches []peer.Network
@@ -199,9 +206,9 @@ func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out i
 			}
 		}
 		if len(matches) != 1 {
-			return "", fmt.Errorf("filesystem %q does not identify exactly one discovered DFS filesystem", wanted)
+			return "", "", fmt.Errorf("filesystem %q does not identify exactly one discovered DFS filesystem", wanted)
 		}
-		return matches[0].FileSystemID, nil
+		return matches[0].FileSystemID, matches[0].NetworkName, nil
 	}
 	fmt.Fprintln(out, "Discovered DFS filesystems:")
 	for index, network := range networks {
@@ -213,18 +220,88 @@ func selectDiscoveredFilesystem(ctx context.Context, reader *bufio.Reader, out i
 	}
 	if len(networks) == 1 {
 		fmt.Fprintln(out, "Selected the only discovered filesystem")
-		return networks[0].FileSystemID, nil
+		return networks[0].FileSystemID, networks[0].NetworkName, nil
 	}
 	fmt.Fprintf(out, "Select filesystem [1-%d]: ", len(networks))
 	answer, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		return "", err
+		return "", "", err
 	}
 	var selected int
 	if _, err := fmt.Sscanf(strings.TrimSpace(answer), "%d", &selected); err != nil || selected < 1 || selected > len(networks) {
-		return "", errors.New("invalid DFS filesystem selection")
+		return "", "", errors.New("invalid DFS filesystem selection")
 	}
-	return networks[selected-1].FileSystemID, nil
+	return networks[selected-1].FileSystemID, networks[selected-1].NetworkName, nil
+}
+
+func setupFilesystemName(state *dfssetup.State) string {
+	if name := strings.TrimSpace(state.NetworkName); name != "" {
+		return name
+	}
+	id := state.FileSystemID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
+}
+
+func ensureGitIdentity(ctx context.Context, reader *bufio.Reader, out io.Writer, name, email string, nonInteractive bool) (string, string, error) {
+	name = strings.TrimSpace(name)
+	email = strings.TrimSpace(email)
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("GIT_AUTHOR_NAME"))
+	}
+	if email == "" {
+		email = strings.TrimSpace(os.Getenv("GIT_AUTHOR_EMAIL"))
+	}
+	if name == "" {
+		name = globalGitConfig(ctx, "user.name")
+	}
+	if email == "" {
+		email = globalGitConfig(ctx, "user.email")
+	}
+	if nonInteractive && (name == "" || email == "") {
+		return "", "", errors.New("Git author identity is required; pass --git-name and --git-email or configure user.name and user.email globally")
+	}
+	if name == "" {
+		fmt.Fprint(out, "Git author name (stored only in this DFS filesystem): ")
+		value, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", "", err
+		}
+		name = strings.TrimSpace(value)
+	}
+	if email == "" {
+		fmt.Fprint(out, "Git author email (stored only in this DFS filesystem): ")
+		value, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", "", err
+		}
+		email = strings.TrimSpace(value)
+	}
+	if name == "" {
+		return "", "", errors.New("Git author name cannot be empty")
+	}
+	if !validGitEmail(email) {
+		return "", "", fmt.Errorf("Git author email %q is invalid", email)
+	}
+	fmt.Fprintf(out, "Git author identity: %s <%s>\n", name, email)
+	return name, email, nil
+}
+
+func globalGitConfig(ctx context.Context, key string) string {
+	command := exec.CommandContext(ctx, "git", "config", "--global", "--get", key)
+	output, err := command.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func validGitEmail(value string) bool {
+	value = strings.TrimSpace(value)
+	at := strings.LastIndexByte(value, '@')
+	return at > 0 && at < len(value)-1 && !strings.ContainsAny(value, " \t\r\n<>")
 }
 
 type setupDiscoverer func(context.Context, time.Duration) ([]peer.Offer, error)

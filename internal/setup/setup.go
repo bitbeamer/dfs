@@ -43,6 +43,8 @@ type State struct {
 	FileSystemID   string                      `json:"filesystem_id"`
 	PeerID         string                      `json:"peer_id"`
 	Name           string                      `json:"name"`
+	GitName        string                      `json:"git_name,omitempty"`
+	GitEmail       string                      `json:"git_email,omitempty"`
 	Repository     string                      `json:"repository"`
 	Mountpoint     string                      `json:"mountpoint"`
 	CacheLimit     int64                       `json:"cache_limit_bytes"`
@@ -64,6 +66,8 @@ type Options struct {
 	Repository   string
 	Mountpoint   string
 	Name         string
+	GitName      string
+	GitEmail     string
 	CacheLimit   int64
 	Timeout      time.Duration
 	Resume       bool
@@ -176,7 +180,8 @@ func Run(ctx context.Context, options Options) (*State, error) {
 					return nil, fmt.Errorf("clear interrupted repository creation: %w", removeErr)
 				}
 			}
-			repo, initErr := repository.Init(ctx, state.Repository, state.Name, state.CacheLimit)
+			repo, initErr := repository.InitWithIdentity(ctx, state.Repository, state.Name, state.CacheLimit,
+				repository.GitIdentity{Name: state.GitName, Email: state.GitEmail})
 			if initErr != nil {
 				return nil, fmt.Errorf("initialize DFS repository: %w", initErr)
 			}
@@ -200,7 +205,7 @@ func Run(ctx context.Context, options Options) (*State, error) {
 				}
 			}
 			result, joinErr := peer.PairAndJoinWithOptions(ctx, state.Invitation, state.Repository, state.Name, state.CacheLimit, time.Duration(state.Timeout), true, peer.PairOptions{
-				PeerID: state.PeerID, StateDirectory: pairingPath(path), PairingPort: state.PairingPort,
+				PeerID: state.PeerID, StateDirectory: pairingPath(path), PairingPort: state.PairingPort, GitName: state.GitName, GitEmail: state.GitEmail,
 			})
 			if joinErr != nil {
 				return nil, joinErr
@@ -323,7 +328,17 @@ func loadOrCreate(options Options) (*State, string, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", errors.New("no DFS setup transaction is recorded")
 		}
-		return state, path, err
+		if err != nil {
+			return nil, "", err
+		}
+		if before(state.Phase, PhaseRepositoryPrepared) && state.GitName == "" && state.GitEmail == "" {
+			state.GitName = strings.TrimSpace(options.GitName)
+			state.GitEmail = strings.TrimSpace(options.GitEmail)
+			if err := save(path, state); err != nil {
+				return nil, "", err
+			}
+		}
+		return state, path, nil
 	}
 	if _, err := os.Stat(path); err == nil {
 		return nil, "", errors.New("a DFS setup transaction already exists; use dfs setup --resume or --abort")
@@ -369,7 +384,7 @@ func loadOrCreate(options Options) (*State, string, error) {
 		return nil, "", err
 	}
 	state := &State{Version: 1, Phase: PhaseDiscovered, Create: options.Create, Invitation: strings.TrimSpace(options.Invitation), FileSystemID: filesystemID,
-		PeerID: peerID, Name: name, Repository: repositoryPath, Mountpoint: mountpoint, CacheLimit: options.CacheLimit,
+		PeerID: peerID, Name: name, GitName: strings.TrimSpace(options.GitName), GitEmail: strings.TrimSpace(options.GitEmail), Repository: repositoryPath, Mountpoint: mountpoint, CacheLimit: options.CacheLimit,
 		Timeout: int64(options.Timeout), NetworkName: networkName, PairingPort: pairingPort, OwnsRepository: true, UpdatedAt: time.Now().UTC()}
 	if err := save(path, state); err != nil {
 		return nil, "", err
