@@ -44,7 +44,7 @@ func TestInstallersCreateIndependentFilesystemInstances(t *testing.T) {
 		mountpoint := filepath.Join(home, fmt.Sprintf("linux-mount-%d", index))
 		runInstaller(t, environment, "../../scripts/install-cachyos.sh", "--pair-port", fmt.Sprint(7901+index), item.repository, mountpoint, sourceBinary)
 		coreUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-core-"+item.id[:12]+".service")
-		assertContains(t, coreUnit, "daemon --managed --pair-port "+fmt.Sprint(7901+index))
+		assertContains(t, coreUnit, "internal core --managed --pair-port "+fmt.Sprint(7901+index))
 		mountUnit := filepath.Join(home, ".config", "systemd", "user", "dfs-mount-"+item.id[:12]+".service")
 		assertNotContains(t, mountUnit, "Requires=dfs-core-")
 	}

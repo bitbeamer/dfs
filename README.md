@@ -51,13 +51,13 @@ organizing files therefore does not require their content to be present locally.
 - Stream requested ranges of uncached files over authenticated QUIC, retaining
   resumable sparse partials privately and promoting only verified complete
   objects into git-annex.
-- Measure directed QUIC performance with `dfs optimize` and retain stable
-  interactive-read and bulk-hydration source priorities locally; add
-  `--cluster` to optimize every responding peer.
+- Measure directed QUIC performance with `dfs peer optimize` and retain stable
+  interactive-read and bulk-hydration source priorities locally; use
+  `--scope cluster` to optimize every responding peer.
 - Diagnose dependencies and every directed authenticated QUIC path with
-  `health` and `health --cluster`.
+  `health` and `health --scope cluster`.
 - Inspect service, namespace, repository, cache, disk, content-policy,
-  membership, and peer health with `dfs health`; add `--cluster` for an active
+  membership, and peer health with `dfs health`; use `--scope cluster` for an active
   whole-cluster check and namespace-convergence comparison. Health output lists
   every pinned file or directory with its scope, hydration status, logical size,
   and missing-file count.
@@ -118,64 +118,55 @@ upgrading managed daemons, firewalls, and live acceptance testing.
 Create, install, mount, and verify the first peer in one recoverable setup transaction:
 
 ```sh
-./bin/dfs setup --create --network-name "Home Files" \
-  --name desktop --cache-limit 100GiB
+./bin/dfs setup create --filesystem-name "Home Files" \
+  --peer-name desktop --cache-limit 100GiB
 ```
 
 Setup invokes the platform installer, which copies the binary and creates two filesystem-specific user
 services: an independent core daemon and a FUSE frontend. systemd or launchd
 starts the core first, then the mount, and restarts either after failure.
 
-A manual foreground core and mount are also available for development. Run
-them in separate terminals:
-
-```sh
-./bin/dfs --repo ~/.local/share/dfs/repository daemon
-./bin/dfs --repo ~/.local/share/dfs/repository mount ~/dfs_storage
-```
-
-Stopping or unmounting the frontend does not stop synchronization, QUIC,
-pin hydration, cache maintenance, or health. Stop the daemon separately.
+The service manager starts the independent core and mount frontend in order.
+Stopping only the frontend does not stop synchronization, QUIC, pin hydration,
+cache maintenance, or health.
 
 ## Add another peer
 
 On the new device, from the DFS source checkout, run:
 
 ```sh
-./bin/dfs setup --name laptop --cache-limit 50GiB
+./bin/dfs setup join --peer-name laptop --cache-limit 50GiB
 ```
 
-`dfs setup` shows elapsed progress while it scans, lists nearby filesystems by display name, and asks you to select one. It resolves the Git author identity from `--git-name` and `--git-email`, the author environment, or global Git configuration; if either value is missing, interactive setup collects it and stores it only in this DFS repository. Setup then prints a short request ID and waits. On any existing online member, review and approve that exact signed request:
+`dfs setup join` shows elapsed progress while it scans, lists nearby filesystems by display name, and asks you to select one. It resolves the history author identity from `--author-name` and `--author-email`, the author environment, or global Git configuration; if either value is missing, interactive setup collects it and stores it only in this DFS repository. Setup then prints a short request ID and waits. On any existing online member, review and approve that exact signed request:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository pair requests
-dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
+dfs peer requests
+dfs peer approve <request-id>
 ```
 
 The new peer then joins over QUIC, completes reciprocal registration, installs the platform user service, mounts the default `~/dfs_storage`, and verifies every directed connection between online members. Each responding member must acknowledge the complete online topology; unavailable members are recorded as `PENDING` and reconcile when they return. No invitation secret is copied between machines.
 
-Setup stores the first/default repository at
-`~/.local/share/dfs/repository`. Ordinary commands automatically use that path
-when no repository was selected explicitly and the current directory is not
-inside another DFS repository. Resolution order is `--repo`, `DFS_REPO`, the
-current directory or one of its parents, then the setup default. DFS never
-guesses among additional `repository-*` instances; select those with `--repo`,
-`DFS_REPO`, or by running the command inside that repository.
+Ordinary commands select an enclosing repository or mounted path, or the only
+installed filesystem. If several are installed, select one explicitly with
+`--filesystem <name|id|mountpoint|repository>` or `DFS_FILESYSTEM`; DFS never
+silently chooses an arbitrary default.
 
 If setup is interrupted, continue or roll it back:
 
 ```sh
-./bin/dfs setup --resume
-./bin/dfs setup --abort
+./bin/dfs setup resume
+./bin/dfs setup abort
 ```
 
 Setup progress, locks, and pairing state are private and repository-specific.
-For a non-default repository, pass the same `--repository` to the initial,
-resume, or abort command. `--mountpoint` selects another mountpoint and
-`--pair-port` selects a local managed transport port. Otherwise setup uses the
-first free UDP port beginning at 7843. `--verification-timeout` controls how long setup waits for online members to acknowledge the new topology; a timeout preserves the acknowledgements and resumes from verification with `dfs setup --resume`.
+For a non-default private data directory, pass the same advanced `--data-dir`
+to the initial, resume, or abort command. `--mountpoint` selects another mountpoint and
+`--transport-port` selects a local managed transport port. Otherwise setup uses the
+first free UDP port beginning at 7843. `--verification-timeout` controls how long setup waits for online members to acknowledge the new topology; a timeout preserves the acknowledgements and resumes from verification with `dfs setup resume`.
 
-`dfs network discover`, `dfs network join`, `dfs network complete`, `dfs init`, and the installer scripts are lower-level controls for manual recovery and diagnostics. Guided `dfs setup` creates the first peer with `--create` or joins an existing filesystem discovered on the LAN.
+Low-level repository, pairing, mount, and transport commands are private
+runtime/recovery interfaces. They are intentionally absent from normal help.
 
 ### Pairing and membership security
 
@@ -211,24 +202,19 @@ renamed machine must be removed and admitted as a new peer. Letter case and the
 Useful administration commands are:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository network discover
-dfs --repo ~/.local/share/dfs/repository network set-name "Home Files"
-dfs --repo ~/.local/share/dfs/repository network complete
-dfs --repo ~/.local/share/dfs/repository pair requests
-dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
-dfs --repo ~/.local/share/dfs/repository pair reject <request-id>
-dfs --repo ~/.local/share/dfs/repository peer list
-dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<id>
-dfs --repo ~/.local/share/dfs/repository transport probe <peer-id>
+dfs peer requests
+dfs peer approve <request-id>
+dfs peer reject <request-id>
+dfs peer list
+dfs peer check <peer-id>
+dfs peer check --scope cluster
+dfs peer remove <peer-id> --dry-run
+dfs peer remove <peer-id> --yes
 ```
 
-Restart the managed mount after changing its advertised network name. Removing
-a peer publishes its signed revocation but cannot erase content it already copied.
-If reciprocal registration was interrupted after cloning, `network complete`
-retries it without consuming a new invitation.
-
-`dfs network join` and the legacy invitation subcommands remain available only
-for recovery and compatibility. Guided `dfs setup` is the normal admission path.
+`peer list` reads the signed membership roster rather than incidental Git
+remotes. Removing a peer previews and publishes its signed revocation, removes
+the local transport, and cannot erase content the peer already copied.
 
 ## Run multiple filesystems on one host
 
@@ -236,26 +222,33 @@ Use a distinct repository and mountpoint for each filesystem. For example, a
 second peer can join with:
 
 ```sh
-./bin/dfs setup \
-  --repository ~/.local/share/dfs/repository-archive \
+./bin/dfs setup join \
+  --data-dir ~/.local/share/dfs/repository-archive \
   --mountpoint ~/dfs_archive \
-  --name laptop-archive --cache-limit 25GiB
+  --peer-name laptop-archive --cache-limit 25GiB
 ```
 
-Each managed instance receives filesystem-specific core and mount services,
+Each local filesystem receives filesystem-specific core and mount services,
 separate health/runtime data, separate logs, and the first available transport
 port. Installing or uninstalling one instance does not replace the others.
 
 ```sh
-dfs instance list
-dfs instance stop "Home Files"
-dfs instance stop --all
-dfs instance update --binary ./bin/dfs
-dfs instance uninstall "Home Files"
-dfs instance uninstall --all --yes
+dfs service list
+dfs service show --filesystem "Home Files"
+dfs service stop --filesystem "Home Files"
+dfs service restart --filesystem "Home Files"
+dfs service repair --filesystem "Home Files" --dry-run
+dfs upgrade --from ./bin/dfs --dry-run
+dfs upgrade --from ./bin/dfs --yes
+dfs service uninstall --filesystem "Home Files"
 ```
 
-`instance list` discovers the actual systemd or launchd definitions, including manually installed and non-default repositories. Selectors accept an unambiguous filesystem display name, peer name, ID prefix, or repository path. Update applies one executable to every instance and preserves whether each was running. Uninstall removes managed services but retains repositories, content, and the shared executable.
+`service list` discovers actual systemd or launchd definitions. Selectors accept
+an unambiguous filesystem display name, peer name, ID prefix, mountpoint, or
+repository. `upgrade` validates and atomically stages a different shared
+executable, preserves running and enabled state, verifies restarted services,
+and rolls back failures. `service repair` only reinstalls definitions.
+Uninstall retains repositories, cached content, peer identity, and membership.
 
 ## Work with files and local storage
 
@@ -270,24 +263,24 @@ rm ~/dfs_storage/Archive/old.pdf
 Control local or cluster-wide content placement explicitly:
 
 ```sh
-dfs fetch Documents/report.pdf
-dfs pin Photos/Vacation
-dfs pin --cluster Shared/Reference
-dfs unpin Photos/Vacation
-dfs unpin --cluster Shared/Reference
-dfs evict Movies/large.mkv
-dfs cache status
-dfs cache set-limit 75GiB
-dfs cache prune
+dfs content fetch Documents/report.pdf
+dfs content pin Photos/Vacation --scope local
+dfs content pin Shared/Reference --scope cluster --yes
+dfs content unpin Photos/Vacation --scope local
+dfs content unpin Shared/Reference --scope cluster --yes
+dfs content evict Movies/large.mkv --dry-run
+dfs cache show
+dfs cache limit 75GiB
+dfs cache prune --dry-run
 ```
 
-`fetch` caches content temporarily. `pin` creates a peer-local policy;
-`pin --cluster` writes a signed policy to DFS's replicated Git metadata ref.
+`content fetch` caches content temporarily. A local pin creates a peer-private
+policy; cluster scope writes a signed policy to DFS's replicated Git metadata ref.
 Both forms notify the daemon and hydrate matching files automatically in the
 background—opening or copying them manually is unnecessary. An offline peer
 applies a cluster pin when it reconnects. `health` shows each pin as `LOCAL` or
 `CLUSTER` and as `READY`, `HYDRATING`, or `CAPACITY-CONSTRAINED`; `health
---cluster` also exposes offline and incomplete peers. Local and cluster scopes
+--scope cluster` also exposes offline and incomplete peers. Local and cluster scopes
 are independent, so removing one does not remove the other. `evict` delegates
 safety checks to git-annex and refuses to remove content protected by either
 scope. Open or pinned files and copy-safety rules can temporarily keep usage
@@ -302,9 +295,9 @@ hydration. Run optimization only on this peer, or coordinate it across every
 responding peer:
 
 ```sh
-dfs optimize
-dfs optimize --cluster
-dfs optimize --cluster --json
+dfs peer optimize --scope local
+dfs peer optimize --scope cluster --yes
+dfs peer optimize --scope cluster --yes --output json
 ```
 
 The command performs repeated, bounded, authenticated QUIC measurements using
@@ -321,15 +314,16 @@ returning online leave them unchanged until the next explicit optimization.
 Membership or endpoint changes mark a result stale and append new eligible
 sources deterministically without rewriting it. Revoked peers are excluded,
 known non-holders are temporarily skipped, failed transfers safely try the
-next source, and an explicit `fetch --from` selection is still honored.
+next source, and an explicit `content fetch --source` selection is still honored.
 
 ## Inspect history and recover a path
 
 ```sh
-dfs status
-dfs history Documents/report.pdf
-dfs restore <commit> Documents/report.pdf
-dfs conflicts
+dfs filesystem show
+dfs history list Documents/report.pdf
+dfs history restore <commit> Documents/report.pdf --dry-run
+dfs history restore <commit> Documents/report.pdf
+dfs history conflicts
 ```
 
 Restore creates a new commit and never rewrites shared history. Git history
@@ -341,9 +335,9 @@ dropped.
 
 ```sh
 dfs health
-dfs health --json
-dfs health --cluster
-dfs health --cluster --json
+dfs health --output json
+dfs health --scope cluster
+dfs health --scope cluster --output json
 ```
 
 `health` checks all required commands and the platform FUSE dependency, validates
@@ -353,13 +347,13 @@ That observation includes network identity and role, instance port, logical file
 count and size, repository/metadata/private-state sizes, physical cache and disk use,
 local content holdings, pins, reconciliation state, outgoing reachability, and
 actionable degraded-state guidance. When optimization has been run, it also
-shows both source profiles, measurement status, and timestamp; `health
---cluster` shows those values for every responding peer. The daemon refreshes it periodically without
-hydrating missing content. `health --cluster` actively queries every configured or
+shows both source profiles, measurement status, and timestamp; cluster scope
+shows those values for every responding peer. The daemon refreshes it periodically without
+hydrating missing content. `health --scope cluster` actively queries every configured or
 discovered member in parallel, reports the same metrics for each responding
 peer, checks every directed connection, and compares online namespace tree IDs.
 The human-readable view is a compact peer and connection summary with shortened,
-deduplicated errors; `--json` retains environment, service, and optional cluster
+deduplicated errors; `--output json` retains environment, service, and optional cluster
 objects with complete diagnostic details. The command exits unsuccessfully when
 dependencies are missing or the cluster is incomplete or inconsistent.
 
@@ -369,7 +363,7 @@ physical unique annex-object content plus the byte ranges actually retained in
 the sparse range cache, and reports both components separately. A duplicate of
 an already-local file does not consume the file's logical size again.
 
-`health --cluster` asks every known mounted peer to test every configured peer in both directions:
+`health --scope cluster` asks every known mounted peer to test every configured peer in both directions:
 `desktop -> laptop` and `laptop -> desktop` are separate rows. Each read-only
 probe tests mutually authenticated QUIC.
 
@@ -387,12 +381,9 @@ Important cluster statuses are:
 bounded probes when needed:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository health --cluster \
+dfs health --scope cluster \
   --discovery-timeout 5s --peer-timeout 10s
 ```
-
-`dfs doctor` is retained temporarily as a deprecated compatibility alias for
-`dfs health` and accepts the same flags.
 
 ## Services, logs, and recovery
 
@@ -405,9 +396,9 @@ DFS_INSTANCE=$(sed -n 's/.*"filesystem_id": *"\([0-9a-f]*\)".*/\1/p' ~/.local/sh
 On systemd (the core owns health and networking; the mount is a frontend):
 
 ```sh
-systemctl --user status "dfs-core-$DFS_INSTANCE" "dfs-mount-$DFS_INSTANCE"
+dfs service show --filesystem "$DFS_INSTANCE"
 journalctl --user -u "dfs-core-$DFS_INSTANCE" -f
-systemctl --user restart "dfs-core-$DFS_INSTANCE"
+dfs service restart --filesystem "$DFS_INSTANCE"
 ```
 
 On launchd:
@@ -415,7 +406,7 @@ On launchd:
 ```sh
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
 launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
-launchctl kickstart -k "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
+dfs service restart --filesystem "$DFS_INSTANCE"
 tail -F "$HOME/Library/Logs/DFS/core-$DFS_INSTANCE.stderr.log"
 ```
 
@@ -423,20 +414,22 @@ Remove one managed service while retaining its repository and the shared
 installed binary with:
 
 ```sh
-./scripts/install-cachyos.sh --uninstall ~/.local/share/dfs/repository
-./scripts/install-macos.sh --uninstall ~/.local/share/dfs/repository
+dfs service uninstall --filesystem "$DFS_INSTANCE"
 ```
 
-Managed services use JSON `info` logging. Manual daemons and mounts default to
-structured text at `error` level; use `--log-level info`, `--log-level debug`,
-`--log-file <path>`, or the very noisy `--fuse-debug` as needed.
+The command prints the retained repository path; cached content, peer identity,
+and cluster membership are not deleted.
+
+Managed services use JSON `info` logging. Runtime logging and FUSE-debug flags
+belong to hidden service-manager and developer interfaces rather than the
+public command surface.
 
 Mount startup holds an exclusive repository session and performs conservative
 recovery. Interrupted staging payloads, partial annex transfers, and uncertain
 Git state are moved under `.git/dfs/recovery/<timestamp>/`. A stale session from
-another hostname is never overridden automatically; after verifying that mount
-is gone, use `dfs mount --recover-stale-session`. A crashed same-host session
-and disconnected FUSE endpoint are recovered automatically.
+another hostname is never overridden automatically. A crashed same-host
+session and disconnected FUSE endpoint are recovered automatically; use the
+documented recovery procedure before invoking hidden runtime controls directly.
 
 ## Network and firewall requirements
 
@@ -446,18 +439,15 @@ each instance's managed port.
 The first instance normally uses 7843, the next 7844, and so on. DFS continues
 mounting with a warning if discovery or the listener cannot start.
 
-Use `dfs mount --discovery=false` when a peer must not advertise or accept
-pairing. Already configured remotes continue to work.
-
 ## Optional metadata relay
 
 A bare relay lets peers publish Git namespace and annex-location metadata at
 different times. It does not store file content:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository relay set \
+dfs peer relay set \
   https://git.example.com/dfs-metadata.git
-dfs --repo ~/.local/share/dfs/repository sync --metadata-only
+dfs sync --mode metadata
 ```
 
 ## Optional S3 durability
@@ -468,15 +458,15 @@ git-annex reads the standard AWS credential environment variables:
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 
-dfs --repo ~/.local/share/dfs/repository storage add-s3 archive \
+dfs storage add s3 archive \
   --bucket my-dfs-bucket --region eu-central-1
-dfs --repo ~/.local/share/dfs/repository storage copy archive Documents
+dfs storage copy archive Documents
 ```
 
 After metadata synchronization, another peer can enable the same remote with:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository storage enable archive
+dfs storage enable archive
 ```
 
 ## Filesystem semantics

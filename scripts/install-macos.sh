@@ -6,13 +6,16 @@ support_dir="$HOME/Library/Application Support/DFS"
 app_dir="$support_dir/DFS.app"
 install_path="$app_dir/Contents/MacOS/dfs"
 legacy_install_path="$support_dir/bin/dfs"
+installer_path="$support_dir/scripts/install-macos.sh"
 info_path="$app_dir/Contents/Info.plist"
 plist_dir="$HOME/Library/LaunchAgents"
 log_dir="$HOME/Library/Logs/DFS"
 pair_port=7843
+start_services=true
+enable_services=true
 
 usage() {
-  printf 'Usage: %s [--pair-port PORT] <repository> <mountpoint> [dfs-binary]\n' "$0" >&2
+  printf 'Usage: %s [--pair-port PORT] [--no-start] [--no-enable] <repository> <mountpoint> [dfs-binary]\n' "$0" >&2
   printf '       %s --uninstall <repository>\n' "$0" >&2
 }
 
@@ -41,11 +44,26 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "--pair-port" ]]; then
-  [[ $# -ge 3 ]] || { usage; exit 2; }
-  pair_port=$2
-  shift 2
-fi
+while (( $# > 0 )); do
+  case "$1" in
+    --pair-port)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      pair_port=$2
+      shift 2
+      ;;
+    --no-start)
+      start_services=false
+      shift
+      ;;
+    --no-enable)
+      enable_services=false
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 if (( $# < 2 || $# > 3 )); then
   usage
   exit 2
@@ -70,7 +88,7 @@ repository=$(absolute_path "$1")
 mountpoint=$2
 source_binary=${3:-./bin/dfs}
 source_binary=$(absolute_path "$source_binary")
-mkdir -p "$mountpoint" "$app_dir/Contents/MacOS" "$support_dir/bin" "$plist_dir" "$log_dir"
+mkdir -p "$mountpoint" "$app_dir/Contents/MacOS" "$support_dir/bin" "$(dirname "$installer_path")" "$plist_dir" "$log_dir"
 mountpoint=$(absolute_path "$mountpoint")
 filesystem_id=$(filesystem_identity "$repository")
 instance=${filesystem_id:0:12}
@@ -108,6 +126,10 @@ if "$source_binary" --repo "$repository" health >/dev/null 2>&1; then
 fi
 if [[ ! -e "$install_path" ]] || ! [[ "$source_binary" -ef "$install_path" ]]; then
   install -m 0755 "$source_binary" "$install_path"
+fi
+current_installer=$(absolute_path "$0")
+if [[ ! -e "$installer_path" ]] || ! [[ "$current_installer" -ef "$installer_path" ]]; then
+  install -m 0755 "$current_installer" "$installer_path"
 fi
 
 cat >"$info_path" <<'EOF'
@@ -169,7 +191,8 @@ cat >"$core_plist_path" <<EOF
     <string>$binary_xml</string>
     <string>--repo</string>
     <string>$repository_xml</string>
-    <string>daemon</string>
+    <string>internal</string>
+    <string>core</string>
     <string>--managed</string>
     <string>--pair-port</string>
     <string>$pair_port</string>
@@ -204,6 +227,7 @@ cat >"$plist_path" <<EOF
     <string>$binary_xml</string>
     <string>--repo</string>
     <string>$repository_xml</string>
+    <string>internal</string>
     <string>mount</string>
     <string>--managed</string>
     <string>--log-level</string>
@@ -240,6 +264,17 @@ plutil -lint "$plist_path"
 plutil -lint "$core_plist_path"
 launchctl bootout "$domain/$label" 2>/dev/null || true
 launchctl bootout "$domain/$core_label" 2>/dev/null || true
+if [[ "$enable_services" == true ]]; then
+  launchctl enable "$domain/$core_label"
+  launchctl enable "$domain/$label"
+else
+  launchctl disable "$domain/$core_label"
+  launchctl disable "$domain/$label"
+fi
+if [[ "$start_services" != true ]]; then
+  printf 'Installed %s and %s without starting them.\n' "$core_label" "$label"
+  exit 0
+fi
 bootstrapped=false
 for _ in $(seq 1 30); do
   if launchctl bootstrap "$domain" "$core_plist_path"; then

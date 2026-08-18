@@ -80,42 +80,31 @@ make build
 ./bin/dfs health
 ```
 
-Do not copy `bin/dfs` over the installed binary while a daemon is running.
-Rerun the installer for the current platform. It stops the mount frontend and
-core daemon, installs the binary, reloads both service definitions, starts the
-core before the mount, and waits for health and mount readiness.
-
-The installed executable is shared, but every active filesystem has its own
-service. On a host with multiple DFS filesystems, rerun the installer once for
-each repository and mountpoint. This updates every service definition and
-restarts every daemon on the new executable; updating only one instance can
-leave another active process running the old code.
-
-On CachyOS/systemd:
+Do not copy `bin/dfs` over the installed binary. Preview and perform one
+transactional host-wide upgrade instead:
 
 ```sh
-cd ~/dfs
-./scripts/install-cachyos.sh --pair-port 7843 \
-  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
-
-DFS_INSTANCE=$(sed -n 's/.*"filesystem_id": *"\([0-9a-f]*\)".*/\1/p' ~/.local/share/dfs/repository/.git/dfs/config.json | cut -c1-12)
-systemctl --user --no-pager --full status "dfs-core-$DFS_INSTANCE" "dfs-mount-$DFS_INSTANCE"
-~/.local/bin/dfs --repo ~/.local/share/dfs/repository health
+./bin/dfs upgrade --from ./bin/dfs --dry-run
+./bin/dfs upgrade --from ./bin/dfs --yes
 ```
 
-On macOS/launchd:
+The installed executable is shared, while every filesystem has its own service
+pair. Upgrade inventories all of them, validates and atomically stages a
+different candidate, preserves running and enabled state, verifies restarted
+cores and mounts, and restores the previous executable and definitions on
+failure. Use `dfs service repair --filesystem <selector>` when only service
+definitions need repair.
+
+After upgrade, verify every local service and the selected filesystem:
 
 ```sh
-cd ~/dfs
-./scripts/install-macos.sh --pair-port 7843 \
-  ~/.local/share/dfs/repository ~/dfs_storage ./bin/dfs
-
-DFS_INSTANCE=$(sed -n 's/.*"filesystem_id": *"\([0-9a-f]*\)".*/\1/p' ~/.local/share/dfs/repository/.git/dfs/config.json | cut -c1-12)
-launchctl print "gui/$(id -u)/io.bitbeamer.dfs.core.$DFS_INSTANCE"
-launchctl print "gui/$(id -u)/io.bitbeamer.dfs.mount.$DFS_INSTANCE"
-"$HOME/Library/Application Support/DFS/bin/dfs" \
-  --repo ~/.local/share/dfs/repository health
+dfs service list
+dfs health
+dfs health --scope cluster
 ```
+
+The platform installers are retained for initial setup and controlled recovery;
+normal upgrades and service-definition repairs go through the CLI transaction.
 
 DFS persists the logical filesystem ID in `.git/dfs/config.json`; service names
 remain stable even if administrators later perform Git history maintenance.
@@ -124,9 +113,9 @@ The installer puts the daemon in a signed `DFS.app` helper with a stable bundle
 identifier and keeps `~/Library/Application Support/DFS/bin/dfs` as a
 compatibility link. On first install, allow **DFS** under **System Settings →
 Privacy & Security → Local Network** so discovery can use `_dfs._udp`.
-When updating, reuse each instance's existing `--pair-port`; choosing another
-port changes its advertised endpoint, and omitting the option defaults a manual
-installer invocation to 7843.
+Service repair and upgrade reuse each filesystem's existing managed transport
+port automatically. The installer-level port option is an internal setup and
+recovery interface.
 
 Homebrew is normally added to interactive macOS shells automatically. For a
 non-interactive build environment, make it explicit first:
@@ -159,13 +148,13 @@ print it.
 If no DFS filesystem exists yet, create it through the same recoverable setup flow used to join later peers. Use a unique repository and mountpoint for every logical filesystem:
 
 ```sh
-./bin/dfs setup --create --network-name "Home Files" \
-  --name desktop --cache-limit 100GiB
+./bin/dfs setup create --filesystem-name "Home Files" \
+  --peer-name desktop --cache-limit 100GiB
 ```
 
 The installer creates a filesystem-specific core service and mount frontend,
 starts the core first, and waits for both health and mount readiness. The core
-advertises the filesystem to nearby peers. The transaction can be resumed with `dfs setup --resume` or rolled back with `dfs setup --abort` if creation or installation is interrupted.
+advertises the filesystem to nearby peers. The transaction can be resumed with `dfs setup resume` or rolled back with `dfs setup abort` if creation or installation is interrupted.
 
 The mount frontend is a thin FUSE adapter over DFS's in-process Go core API.
 There is no RPC or second process in the mounted read path, so cached annex
@@ -179,96 +168,102 @@ On the new peer, from the cloned DFS source directory, run the transactional
 setup command:
 
 ```sh
-./bin/dfs setup --name laptop --cache-limit 50GiB
+./bin/dfs setup join --peer-name laptop --cache-limit 50GiB
 ```
 
-Setup prints the discovery window and elapsed progress, then lists filesystems by display name. Select one of them. DFS resolves the Git author identity from `--git-name` and `--git-email`, the author environment, or global Git configuration; interactive setup collects missing values and stores them only in the joined repository. It then prints a short request ID and waits. On any existing online member, verify the peer name and ID, then approve the request:
+Setup prints the discovery window and elapsed progress, then lists filesystems by display name. Select one of them. DFS resolves the history author identity from `--author-name` and `--author-email`, the author environment, or global Git configuration; interactive setup collects missing values and stores them only in the joined repository. It then prints a short request ID and waits. On any existing online member, verify the peer name and ID, then approve the request:
 
 ```sh
-dfs --repo ~/.local/share/dfs/repository pair requests
-dfs --repo ~/.local/share/dfs/repository pair approve <request-id>
+dfs peer requests
+dfs peer approve <request-id>
 ```
 
 DFS then clones over authenticated QUIC, reconciles reciprocal membership, installs the platform service, mounts `~/dfs_storage`, and verifies every directed connection between responding members. Unavailable accepted members are recorded as `PENDING` and reconcile when they return. No long invitation or bearer secret is copied between machines.
 
 The default setup repository is `~/.local/share/dfs/repository`. After setup,
-ordinary commands such as `dfs health`, `dfs optimize --cluster`, and `dfs pin Photos` find it automatically. DFS first honors `--repo`, then `DFS_REPO`, then
-an enclosing repository, and only then tries the setup default. Additional
-instances are never selected by guessing their names; use `--repo`, `DFS_REPO`,
-or run the command inside the intended repository.
+ordinary commands such as `dfs health`, `dfs peer optimize --scope cluster`, and
+`dfs content pin Photos` select an enclosing repository or mounted path, or the
+only installed filesystem. With several filesystems, use
+`--filesystem <name|id|mountpoint|repository>` or `DFS_FILESYSTEM`; DFS never
+chooses an arbitrary default.
 
 Every completed step is recorded privately and atomically. If setup is
 interrupted or a dependency is temporarily unavailable, retry it without a new
 join request while the recorded request is still valid:
 
 ```sh
-./bin/dfs setup --resume
+./bin/dfs setup resume
 ```
 
 To deliberately undo an incomplete setup, including the repository that this
 transaction created, run:
 
 ```sh
-./bin/dfs setup --abort
+./bin/dfs setup abort
 ```
 
-Use `--repository` and `--mountpoint` on the initial command to override their
+Use the advanced `--data-dir` and normal `--mountpoint` on the initial command to override their
 defaults. `--filesystem` selects an unambiguous discovered name or ID without an
 interactive menu. Setup state and locks are repository-specific, so multiple incomplete
 or completed filesystem transactions do not collide. Resume and abort select
-the transaction using `--repository`; use the same non-default repository path
-you supplied initially. `--pair-port` selects an explicit local UDP port;
+the transaction using `--data-dir`; use the same non-default data path
+you supplied initially. `--transport-port` selects an explicit local UDP port;
 otherwise DFS uses the first free port beginning at 7843. The
-`--verification-timeout` flag controls how long setup waits for online members to acknowledge the topology; acknowledgement state survives a timeout and `dfs setup --resume` retries only the remaining verification. The
-lower-level `network join` and installer scripts remain available for debugging
-and manual deployments.
+`--verification-timeout` flag controls how long setup waits for online members to acknowledge the topology; acknowledgement state survives a timeout and `dfs setup resume` retries only the remaining verification. Low-level repository, pairing, mount, and transport commands are hidden runtime and recovery interfaces.
 
 To join a second active DFS filesystem on the same host, choose another
 repository and mountpoint. The new instance receives a distinct service, logs,
 health state, and managed port:
 
 ```sh
-./bin/dfs setup \
-  --repository ~/.local/share/dfs/repository-archive \
+./bin/dfs setup join \
+  --data-dir ~/.local/share/dfs/repository-archive \
   --mountpoint ~/dfs_archive \
-  --name laptop-archive --cache-limit 25GiB
+  --peer-name laptop-archive --cache-limit 25GiB
 ```
 
 Verify the peer:
 
 ```sh
 dfs health
-dfs health --cluster
+dfs health --scope cluster
 dfs peer list
 ```
 
 Administer every installed filesystem from its actual systemd or launchd definition:
 
 ```sh
-dfs instance list
-dfs instance stop "Home Files"
-dfs instance stop --all
-dfs instance update --binary ./bin/dfs
-dfs instance uninstall "Home Files"
-dfs instance uninstall --all --yes
+dfs service list
+dfs service show --filesystem "Home Files"
+dfs service stop --filesystem "Home Files"
+dfs service restart --filesystem "Home Files"
+dfs service repair --filesystem "Home Files" --dry-run
+dfs upgrade --from ./bin/dfs --dry-run
+dfs upgrade --from ./bin/dfs --yes
+dfs service uninstall --filesystem "Home Files"
 ```
 
-Instance selectors accept an unambiguous filesystem display name, peer name, ID prefix, or repository path. Update reinstalls every instance with its recorded repository, mountpoint, and port while preserving stopped instances. Uninstall removes the selected managed services but retains repository data and the shared executable; host-wide uninstall requires `--yes`.
+Service selectors accept an unambiguous filesystem display name, peer name, ID
+prefix, mountpoint, or repository path. Upgrade validates and stages a different
+shared executable, preserves running and enabled state, verifies restarted
+services, and rolls back failures. Repair only reinstalls service definitions.
+Uninstall retains repository data, cached content, peer identity, membership,
+and the shared executable.
 
 `health` checks required commands and the platform FUSE dependency, then reports
 the independent core plus filesystem identity, logical size and file count,
 instance port, role, repository and metadata size, physical cache and disk use, content
 holdings, pins, reconciliation, and timestamped peer observations.
-`health --cluster` actively collects those details from all responding members,
+`health --scope cluster` actively collects those details from all responding members,
 compares namespace convergence, and verifies every directed peer edge. Use
-`--json` with either form for complete machine-readable diagnostics; the normal
+`--output json` with either form for complete machine-readable diagnostics; the normal
 terminal view shortens transport errors and avoids repeating them per peer.
 
-Pinning needs no manual file access. `dfs pin <path>` saves a peer-local policy;
-`dfs pin --cluster <path>` saves a signed replicated policy for all current and
+Pinning needs no manual file access. `dfs content pin <path> --scope local` saves a peer-local policy;
+`dfs content pin <path> --scope cluster` saves a signed replicated policy for all current and
 future peers. A running daemon hydrates the selected content automatically in
 the background. Offline peers apply cluster pins after reconnecting, and
-`health --cluster` reports each peer's pin scope and hydration, missing-content,
+`health --scope cluster` reports each peer's pin scope and hydration, missing-content,
 or capacity-constrained state. Use the corresponding `unpin` command with or
 without `--cluster`; the two scopes are independent.
 
@@ -283,17 +278,17 @@ When several peers can supply content, measure and persist source priorities
 after installation or after a material network change:
 
 ```sh
-dfs optimize
-dfs optimize --cluster
+dfs peer optimize --scope local
+dfs peer optimize --scope cluster --yes
 ```
 
-Without `--cluster`, only the current peer benchmarks its eligible sources and
-updates its private result. With `--cluster`, every responding peer performs
+With local scope, only the current peer benchmarks its eligible sources and
+updates its private result. With cluster scope, every responding peer performs
 the same directed QUIC measurements and updates its own result. DFS retains an
 interactive range-read order and a bulk hydration order until the corresponding
 command is run again. Benchmarks use validated in-memory bytes and create no
 user, Git, or annex content. `health` displays the local orders and timestamp;
-`health --cluster` displays them for all responding peers and marks stale,
+`health --scope cluster` displays them for all responding peers and marks stale,
 offline, or unmeasured sources.
 
 Health counts locally available content by logical path, while cache usage is
@@ -302,25 +297,25 @@ ranges retained in sparse partials and displays both components. Duplicating an
 already-local file therefore adds another logical path without consuming the
 file's full size again.
 
-`health --cluster` verifies authenticated QUIC for every directed peer pair.
+`health --scope cluster` verifies authenticated QUIC for every directed peer pair.
 An unavailable member is reported without delaying healthy-peer operations or
 trying another transport.
 
 ### Hostname changes create a new peer
 
-DFS binds each peer identity to the machine hostname recorded during `init` or
-`network join`. Changing that hostname invalidates the pairing; DFS refuses to
+DFS binds each peer identity to the machine hostname recorded during setup.
+Changing that hostname invalidates the pairing; DFS refuses to
 open or mount the repository and reports the old peer ID. It never silently
 transfers the old identity to the renamed machine. Re-add it as a new peer:
 
 1. Uninstall its managed mount with `scripts/install-macos.sh --uninstall <repository>`
    or `scripts/install-cachyos.sh --uninstall <repository>`.
 2. On another cluster member, run
-   `dfs --repo ~/.local/share/dfs/repository peer remove dfs-peer-<old-id>`.
+   `dfs peer remove <old-id> --yes`.
 3. Move the renamed machine's old repository aside as a backup, create a new
    `dfs setup` against an existing member into the original repository path.
    The join generates a new peer ID.
-4. Reinstall the managed mount and verify it with `health --cluster` and the
+4. Reinstall the managed mount and verify it with `health --scope cluster` and the
    mounted-volume acceptance test.
 
 The `.local` DNS suffix and hostname letter case are normalized, so `zeus`,

@@ -9,10 +9,9 @@
     <string>@DFS_BINARY@</string>
     <string>--repo</string>
     <string>@DFS_REPOSITORY@</string>
+    <string>internal</string>
     <string>mount</string>
     <string>--managed</string>
-    <string>--pair-port</string>
-    <string>@DFS_PAIR_PORT@</string>
     <string>--log-level</string>
     <string>info</string>
     <string>--log-format</string>

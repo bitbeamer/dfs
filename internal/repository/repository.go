@@ -76,6 +76,11 @@ type Remote struct {
 	URL  string
 }
 
+type StorageRemote struct {
+	Name string `json:"name"`
+	UUID string `json:"uuid"`
+}
+
 type CachedFile struct {
 	Path string
 	Size int64
@@ -926,7 +931,7 @@ func (r *Repository) AddManagedRemote(ctx context.Context, peerID, executable st
 		value = strings.ReplaceAll(value, "%", "%%")
 		return strings.ReplaceAll(value, " ", "% ")
 	}
-	managedURL := "ext::" + escape(executable) + " --repo " + escape(r.Config.Repository) + " transport git " + escape(peerID) + " %S"
+	managedURL := "ext::" + escape(executable) + " --repo " + escape(r.Config.Repository) + " internal transport-git " + escape(peerID) + " %S"
 	name, err := r.AddPairedRemote(ctx, peerID, managedURL)
 	if err != nil {
 		return "", err
@@ -996,6 +1001,25 @@ func (r *Repository) SetRelay(ctx context.Context, url string) error {
 		return err
 	}
 	r.Config.Relay = url
+	return r.SaveConfig()
+}
+
+func (r *Repository) ClearRelay(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remotes, err := r.remotesLocked(ctx)
+	if err != nil {
+		return err
+	}
+	for _, remote := range remotes {
+		if remote.Name == RelayRemote {
+			if _, err := r.runner.Run(ctx, "git", "remote", "remove", RelayRemote); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	r.Config.Relay = ""
 	return r.SaveConfig()
 }
 
@@ -1074,6 +1098,51 @@ func (r *Repository) EnableStorage(ctx context.Context, name string) error {
 	defer r.mu.Unlock()
 	_, err := r.runner.Run(ctx, "git", "annex", "enableremote", name)
 	return err
+}
+
+func (r *Repository) Storages(ctx context.Context) ([]StorageRemote, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out, err := r.runner.Run(ctx, "git", "config", "--list")
+	if err != nil {
+		return nil, err
+	}
+	var result []StorageRemote
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		key, value, found := strings.Cut(line, "=")
+		if !found || !strings.HasPrefix(key, "remote.") || !strings.HasSuffix(key, ".annex-uuid") {
+			continue
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(key, "remote."), ".annex-uuid")
+		if name == "" || strings.HasPrefix(name, "dfs-peer-") || name == RelayRemote {
+			continue
+		}
+		result = append(result, StorageRemote{Name: name, UUID: strings.TrimSpace(value)})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+func (r *Repository) DisableStorage(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" || name == RelayRemote || name == "origin" || strings.HasPrefix(name, "dfs-peer-") {
+		return errors.New("durable storage name is required")
+	}
+	storages, err := r.Storages(ctx)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, storage := range storages {
+		if storage.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("durable storage %q was not found", name)
+	}
+	return r.RemoveRemote(ctx, name)
 }
 
 func (r *Repository) CopyTo(ctx context.Context, name string, paths []string) error {

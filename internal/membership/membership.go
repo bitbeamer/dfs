@@ -23,15 +23,17 @@ import (
 )
 
 const (
-	Version            = 1
-	SharedRef          = "refs/heads/dfs-membership"
-	PinRef             = "refs/heads/dfs-pins"
-	privateKeyFile     = "membership-key.pem"
-	trustedMembersFile = "trusted-members.json"
-	revokedMembersFile = "revoked-members.json"
-	membersPrefix      = "members/"
-	revocationsPrefix  = "revocations/"
-	pinsPrefix         = "pins/"
+	Version              = 1
+	SharedRef            = "refs/heads/dfs-membership"
+	PinRef               = "refs/heads/dfs-pins"
+	ConfigRef            = "refs/heads/dfs-config"
+	privateKeyFile       = "membership-key.pem"
+	trustedMembersFile   = "trusted-members.json"
+	revokedMembersFile   = "revoked-members.json"
+	membersPrefix        = "members/"
+	revocationsPrefix    = "revocations/"
+	pinsPrefix           = "pins/"
+	filesystemConfigPath = "filesystem.json"
 )
 
 func KeyPath(repositoryPath string) string {
@@ -92,6 +94,99 @@ type PinPolicy struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	IssuedBy     string    `json:"issued_by"`
 	Signature    string    `json:"signature"`
+}
+
+type FilesystemConfig struct {
+	Version      int       `json:"version"`
+	FileSystemID string    `json:"filesystem_id"`
+	Name         string    `json:"name"`
+	Generation   uint64    `json:"generation"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	IssuedBy     string    `json:"issued_by"`
+	Signature    string    `json:"signature"`
+}
+
+func SetFilesystemName(repositoryPath, filesystemID, peerID, name string) (FilesystemConfig, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 128 || strings.ContainsAny(name, "\r\n\x00") {
+		return FilesystemConfig{}, errors.New("filesystem name must contain 1 to 128 printable characters")
+	}
+	records, err := Accepted(repositoryPath, filesystemID, peerID)
+	if err != nil {
+		return FilesystemConfig{}, err
+	}
+	admin := false
+	for _, record := range records {
+		if record.Payload.PeerID == peerID && record.Payload.Role == "admin" {
+			admin = true
+			break
+		}
+	}
+	if !admin {
+		return FilesystemConfig{}, errors.New("only an administrator member can rename a DFS filesystem")
+	}
+	private, public, err := EnsureKey(repositoryPath)
+	if err != nil {
+		return FilesystemConfig{}, err
+	}
+	trusted, err := LoadTrusted(repositoryPath)
+	if err != nil {
+		return FilesystemConfig{}, err
+	}
+	if trusted[peerID] != public {
+		return FilesystemConfig{}, errors.New("local membership signing key does not match trusted membership")
+	}
+	generation := uint64(1)
+	if current, loadErr := LoadFilesystemConfig(repositoryPath, filesystemID); loadErr == nil {
+		generation = current.Generation + 1
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		return FilesystemConfig{}, fmt.Errorf("load current filesystem configuration: %w", loadErr)
+	}
+	value := FilesystemConfig{Version: Version, FileSystemID: filesystemID, Name: name, Generation: generation, UpdatedAt: time.Now().UTC(), IssuedBy: peerID}
+	value.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(private, filesystemConfigBytes(value)))
+	if err := verifyFilesystemConfig(value, public); err != nil {
+		return FilesystemConfig{}, err
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return FilesystemConfig{}, err
+	}
+	data = append(data, '\n')
+	if err := writeMetadataFile(repositoryPath, ConfigRef, filesystemConfigPath, data, "filesystem configuration"); err != nil {
+		return FilesystemConfig{}, err
+	}
+	return value, nil
+}
+
+func LoadFilesystemConfig(repositoryPath, filesystemID string) (FilesystemConfig, error) {
+	files, err := loadSharedPrefix(repositoryPath, ConfigRef, "")
+	if err != nil {
+		return FilesystemConfig{}, err
+	}
+	data := files[filesystemConfigPath]
+	if len(data) == 0 {
+		return FilesystemConfig{}, os.ErrNotExist
+	}
+	var value FilesystemConfig
+	if err := json.Unmarshal(data, &value); err != nil {
+		return FilesystemConfig{}, err
+	}
+	if value.FileSystemID != filesystemID {
+		return FilesystemConfig{}, errors.New("filesystem configuration belongs to another filesystem")
+	}
+	records, err := Accepted(repositoryPath, filesystemID)
+	if err != nil {
+		return FilesystemConfig{}, err
+	}
+	for _, record := range records {
+		if record.Payload.PeerID == value.IssuedBy && record.Payload.Role == "admin" {
+			if err := verifyFilesystemConfig(value, record.Payload.SigningPublicKey); err != nil {
+				return FilesystemConfig{}, err
+			}
+			return value, nil
+		}
+	}
+	return FilesystemConfig{}, errors.New("filesystem configuration was not signed by an accepted administrator")
 }
 
 func SetPinPolicy(repositoryPath, filesystemID, peerID, path string, pinned bool) (PinPolicy, error) {
@@ -600,6 +695,27 @@ func pinPolicyBytes(policy PinPolicy) []byte {
 	return data
 }
 
+func filesystemConfigBytes(value FilesystemConfig) []byte {
+	return []byte(fmt.Sprintf("%d\x00%s\x00%s\x00%d\x00%s\x00%s", value.Version, value.FileSystemID, value.Name,
+		value.Generation, value.UpdatedAt.UTC().Format(time.RFC3339Nano), value.IssuedBy))
+}
+
+func verifyFilesystemConfig(value FilesystemConfig, encodedPublic string) error {
+	if value.Version != Version || len(value.FileSystemID) < 16 || strings.TrimSpace(value.Name) == "" || len(value.Name) > 128 ||
+		strings.ContainsAny(value.Name, "\r\n\x00") || !validPeerID(value.IssuedBy) || value.Generation == 0 || value.UpdatedAt.IsZero() {
+		return errors.New("incomplete filesystem configuration")
+	}
+	public, err := decodePublicKey(encodedPublic)
+	if err != nil {
+		return err
+	}
+	signature, err := base64.RawStdEncoding.DecodeString(value.Signature)
+	if err != nil || len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, filesystemConfigBytes(value), signature) {
+		return errors.New("invalid filesystem configuration signature")
+	}
+	return nil
+}
+
 func verifyPinPolicy(policy PinPolicy, encodedPublic string) error {
 	if policy.Version != Version || len(policy.FileSystemID) < 16 || !validPeerID(policy.IssuedBy) || policy.Generation == 0 || policy.UpdatedAt.IsZero() {
 		return errors.New("incomplete cluster pin policy")
@@ -904,7 +1020,85 @@ func Sync(ctx context.Context, repositoryPath string, remotes []string) error {
 	for _, item := range fetched {
 		_, _ = runGit(ctx, repositoryPath, nil, "push", item.remote, SharedRef+":"+SharedRef)
 	}
+	if err := syncFilesystemConfig(ctx, repositoryPath, remotes); err != nil {
+		return err
+	}
 	return syncPinPolicies(ctx, repositoryPath, remotes, trusted)
+}
+
+func syncFilesystemConfig(ctx context.Context, repositoryPath string, remotes []string) error {
+	cfg, err := config.Load(repositoryPath)
+	if err != nil {
+		// Bare repositories used for membership exchange, and repositories from
+		// versions predating replicated filesystem configuration, have nothing
+		// to reconcile yet.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	records, err := Accepted(repositoryPath, cfg.FileSystemID, cfg.PeerID)
+	if err != nil {
+		return err
+	}
+	adminKeys := make(map[string]string)
+	for _, record := range records {
+		if record.Payload.Role == "admin" {
+			adminKeys[record.Payload.PeerID] = record.Payload.SigningPublicKey
+		}
+	}
+	refs := []string{ConfigRef}
+	var fetched []struct{ remote, ref string }
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		if remote == "" {
+			continue
+		}
+		digest := sha256.Sum256([]byte(remote))
+		tracking := fmt.Sprintf("refs/dfs/config-remotes/%x", digest[:8])
+		if _, err := runGit(ctx, repositoryPath, nil, "fetch", "--no-tags", remote, "+"+ConfigRef+":"+tracking); err != nil {
+			continue
+		}
+		refs = append(refs, tracking)
+		fetched = append(fetched, struct{ remote, ref string }{remote: remote, ref: tracking})
+	}
+	var selected FilesystemConfig
+	var selectedData []byte
+	for _, ref := range refs {
+		files, err := loadSharedPrefix(repositoryPath, ref, "")
+		if err != nil {
+			return err
+		}
+		data := files[filesystemConfigPath]
+		var candidate FilesystemConfig
+		if len(data) == 0 || json.Unmarshal(data, &candidate) != nil || candidate.FileSystemID != cfg.FileSystemID ||
+			adminKeys[candidate.IssuedBy] == "" || verifyFilesystemConfig(candidate, adminKeys[candidate.IssuedBy]) != nil {
+			continue
+		}
+		if selectedData == nil || candidate.Generation > selected.Generation ||
+			(candidate.Generation == selected.Generation && candidate.UpdatedAt.After(selected.UpdatedAt)) {
+			selected, selectedData = candidate, data
+		}
+	}
+	if selectedData != nil {
+		if err := writeMetadataFile(repositoryPath, ConfigRef, filesystemConfigPath, selectedData, "filesystem configuration"); err != nil {
+			return err
+		}
+	}
+	remoteRefs := make([]string, 0, len(fetched))
+	for _, item := range fetched {
+		remoteRefs = append(remoteRefs, item.ref)
+	}
+	if err := joinRefHistories(ctx, repositoryPath, ConfigRef, remoteRefs, "filesystem configuration"); err != nil {
+		return err
+	}
+	for _, remote := range remotes {
+		remote = strings.TrimSpace(remote)
+		if remote != "" {
+			_, _ = runGit(ctx, repositoryPath, nil, "push", remote, ConfigRef+":"+ConfigRef)
+		}
+	}
+	return nil
 }
 
 func syncPinPolicies(ctx context.Context, repositoryPath string, remotes []string, trusted map[string]string) error {
