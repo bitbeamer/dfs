@@ -156,7 +156,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if start.Approver.Payload.PeerID != start.PeerID || start.Membership.Payload.PeerID != peerID {
 		return nil, errors.New("pairing peer returned mismatched membership identities")
 	}
-	if err := membership.VerifyApproval(start.Approver, start.Approver); err != nil {
+	if err := verifyMembershipApprovalChain(start.Approver, start.Members, invitation.FileSystemID); err != nil {
 		return nil, fmt.Errorf("verify approving DFS membership: %w", err)
 	}
 	if err := membership.VerifyApproval(start.Membership, start.Approver); err != nil {
@@ -271,6 +271,42 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		Repository: repo, NetworkName: start.NetworkName, OfferingPeer: start.PeerName,
 		ReverseRemoteName: complete.RemoteName,
 	}, nil
+}
+
+func verifyMembershipApprovalChain(record membership.Record, members []membership.Record, filesystemID string) error {
+	byID := make(map[string]membership.Record, len(members)+1)
+	for _, member := range append(append([]membership.Record(nil), members...), record) {
+		if member.Payload.FileSystemID != filesystemID {
+			continue
+		}
+		if existing, found := byID[member.Payload.PeerID]; found && existing.Payload.SigningPublicKey != member.Payload.SigningPublicKey {
+			return fmt.Errorf("membership chain contains conflicting records for peer %s", member.Payload.PeerID)
+		}
+		byID[member.Payload.PeerID] = member
+	}
+	current := record
+	visited := make(map[string]bool, len(byID))
+	for {
+		peerID := current.Payload.PeerID
+		if current.Payload.FileSystemID != filesystemID {
+			return errors.New("approving membership belongs to another filesystem")
+		}
+		if visited[peerID] {
+			return errors.New("membership approval chain contains a cycle")
+		}
+		visited[peerID] = true
+		approver, found := byID[current.ApprovedBy]
+		if !found {
+			return fmt.Errorf("membership approval chain is missing peer %s", current.ApprovedBy)
+		}
+		if err := membership.VerifyApproval(current, approver); err != nil {
+			return err
+		}
+		if current.ApprovedBy == peerID {
+			return nil
+		}
+		current = approver
+	}
 }
 
 func CompletePairing(ctx context.Context, repositoryPath string) (PairCompleteResponse, error) {

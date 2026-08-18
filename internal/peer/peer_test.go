@@ -311,6 +311,32 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 }
 
+func TestVerifyMembershipApprovalChainAcceptsNonFounderApprover(t *testing.T) {
+	filesystemID := strings.Repeat("a", 40)
+	rootKey, root, err := newMembershipDraft(filepath.Join(t.TempDir(), "root"), filesystemID, "root-peer", "root", 7843)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err = membership.Approve(root, root.Payload.PeerID, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, approver, err := newMembershipDraft(filepath.Join(t.TempDir(), "approver"), filesystemID, "approver-peer", "approver", 7844)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approver, err = membership.Approve(approver, root.Payload.PeerID, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyMembershipApprovalChain(approver, []membership.Record{root, approver}, filesystemID); err != nil {
+		t.Fatalf("valid non-founder approval chain rejected: %v", err)
+	}
+	if err := verifyMembershipApprovalChain(approver, []membership.Record{approver}, filesystemID); err == nil || !strings.Contains(err.Error(), "missing peer") {
+		t.Fatalf("incomplete approval chain error = %v", err)
+	}
+}
+
 func TestDiscoveredJoinRequestRequiresExplicitBoundApproval(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
