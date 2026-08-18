@@ -498,8 +498,8 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 	}
 	var last []peer.SetupAcknowledgement
 	for {
-		if err := peer.ReconcileMembership(verifyCtx, repo); err != nil {
-			return fmt.Errorf("reconcile DFS membership before cluster verification: %w", err)
+		if err := verifyCtx.Err(); err != nil {
+			return setupVerificationTimeout(options.Out, last, nil)
 		}
 		report, checkErr := checker(verifyCtx, repo, discoveryTimeout, 5*time.Second)
 		if checkErr == nil {
@@ -526,19 +526,28 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 				return nil
 			}
 		}
+		if err := verifyCtx.Err(); err != nil {
+			return setupVerificationTimeout(options.Out, last, checkErr)
+		}
+		timer := time.NewTimer(2 * time.Second)
 		select {
 		case <-verifyCtx.Done():
-			if len(last) > 0 {
-				printSetupAcknowledgements(options.Out, last)
-			}
-			if checkErr != nil {
-				return fmt.Errorf("verify directed DFS cluster: %w", checkErr)
-			}
-			return errors.New("online DFS members have not acknowledged every directed cluster connection; retry with dfs setup resume")
-		case <-time.After(2 * time.Second):
+			timer.Stop()
+			return setupVerificationTimeout(options.Out, last, checkErr)
+		case <-timer.C:
 			fmt.Fprintln(options.Out, "Waiting for online DFS members to acknowledge the new cluster topology...")
 		}
 	}
+}
+
+func setupVerificationTimeout(out io.Writer, last []peer.SetupAcknowledgement, checkErr error) error {
+	if len(last) > 0 {
+		printSetupAcknowledgements(out, last)
+	}
+	if checkErr != nil && !errors.Is(checkErr, context.DeadlineExceeded) && !errors.Is(checkErr, context.Canceled) {
+		return fmt.Errorf("verify directed DFS cluster: %w", checkErr)
+	}
+	return errors.New("online DFS members have not acknowledged every directed cluster connection; retry with dfs setup resume")
 }
 
 func printSetupAcknowledgements(out io.Writer, acknowledgements []peer.SetupAcknowledgement) {

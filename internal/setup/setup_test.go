@@ -158,6 +158,30 @@ func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *
 	}
 }
 
+func TestSetupClusterVerificationReportsExpiredDeadlineAsIncompleteTopology(t *testing.T) {
+	home := t.TempDir()
+	repositoryPath := filepath.Join(home, "repository")
+	repo, err := repository.InitWithIdentity(context.Background(), repositoryPath, "iris", 1<<20,
+		repository.GitIdentity{Name: "DFS Test", Email: "dfs@example.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID := repo.Config.PeerID
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state := &State{Version: 1, Phase: PhaseMounted, Repository: repositoryPath, Mountpoint: filepath.Join(home, "mount"), PeerID: peerID,
+		VerificationTimeout: int64(20 * time.Millisecond), Timeout: int64(time.Millisecond)}
+	checker := func(ctx context.Context, _ *repository.Repository, _, _ time.Duration) (peer.MeshReport, error) {
+		<-ctx.Done()
+		return peer.MeshReport{}, ctx.Err()
+	}
+	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{Out: os.Stderr, CheckCluster: checker})
+	if err == nil || !strings.Contains(err.Error(), "online DFS members have not acknowledged") || strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("verification deadline error = %v", err)
+	}
+}
+
 func TestJoinApprovalInstructionUsesPublicPeerCommand(t *testing.T) {
 	var output strings.Builder
 	printJoinApprovalInstruction(&output, "V8XC0A8orLhl49GB")
