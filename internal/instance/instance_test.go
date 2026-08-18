@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/bitbeamer/dfs/internal/setup"
 )
 
 func TestDiscoverSystemdInstancesUsesInstalledServiceDefinitions(t *testing.T) {
@@ -224,11 +226,24 @@ func TestUninstallAndPurgeRemovesFrozenAnnexRepository(t *testing.T) {
 	manager := &manager{platform: "linux", systemdDir: unitDirectory, run: func(context.Context, string, ...string) ([]byte, error) {
 		return nil, nil
 	}}
+	setupState, err := setup.StatePath(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(setupState), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(setupState, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := manager.uninstallAndPurge(context.Background(), []Instance{{Repository: repository, serviceID: serviceID}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(repository); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("purged repository remains: %v", err)
+	}
+	if _, err := os.Stat(setupState); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purged setup state remains: %v", err)
 	}
 }
 

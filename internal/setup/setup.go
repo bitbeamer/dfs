@@ -100,6 +100,22 @@ func StatePath(repositoryPath string) (string, error) {
 	return filepath.Join(root, "dfs", "setup", fmt.Sprintf("state-%x.json", digest[:8])), nil
 }
 
+// Forget removes recoverable setup state for a repository after that local
+// repository has been intentionally purged.
+func Forget(repositoryPath string) error {
+	path, err := StatePath(repositoryPath)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(pairingPath(path)); err != nil {
+		return fmt.Errorf("remove DFS setup pairing state: %w", err)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove DFS setup transaction: %w", err)
+	}
+	return nil
+}
+
 func Run(ctx context.Context, options Options) (*State, error) {
 	if options.Out == nil {
 		options.Out = io.Discard
@@ -364,7 +380,18 @@ func loadOrCreate(options Options) (*State, string, error) {
 		return state, path, nil
 	}
 	if _, err := os.Stat(path); err == nil {
-		return nil, "", errors.New("a DFS setup transaction already exists; use dfs setup resume or dfs setup abort")
+		existing, loadErr := load(path)
+		if loadErr == nil && existing.Phase == PhaseVerified {
+			if _, repositoryErr := os.Stat(config.Path(existing.Repository)); errors.Is(repositoryErr, os.ErrNotExist) {
+				if forgetErr := Forget(repositoryPath); forgetErr != nil {
+					return nil, "", forgetErr
+				}
+			} else {
+				return nil, "", errors.New("a DFS setup transaction already exists; use dfs setup resume or dfs setup abort")
+			}
+		} else {
+			return nil, "", errors.New("a DFS setup transaction already exists; use dfs setup resume or dfs setup abort")
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
 	}

@@ -63,6 +63,29 @@ func TestSetupCreationRejectsExistingFilesystemSelection(t *testing.T) {
 	}
 }
 
+func TestSetupDiscardsVerifiedStateAfterRepositoryPurge(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+	repositoryPath := filepath.Join(home, "repository")
+	mountpoint := filepath.Join(home, "mount")
+	statePath, err := StatePath(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := &State{Version: 1, Phase: PhaseVerified, Repository: repositoryPath, Mountpoint: mountpoint, PeerID: "purged-peer"}
+	if err := save(statePath, stale); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := loadOrCreate(Options{Create: true, Repository: repositoryPath, Mountpoint: mountpoint, NetworkName: "Replacement", CacheLimit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != PhaseApprovalRequested || state.PeerID == stale.PeerID {
+		t.Fatalf("replacement setup state = %#v", state)
+	}
+}
+
 func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

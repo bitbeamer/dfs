@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	dfssetup "github.com/bitbeamer/dfs/internal/setup"
 )
 
 type Instance struct {
@@ -794,6 +796,10 @@ func (m *manager) uninstallAndPurge(ctx context.Context, instances []Instance) e
 	for _, target := range targets {
 		if err := purgeRepository(ctx, target); err != nil {
 			failures = append(failures, fmt.Errorf("purge repository %s: %w", target, err))
+			continue
+		}
+		if err := dfssetup.Forget(target); err != nil {
+			failures = append(failures, fmt.Errorf("remove setup state for %s: %w", target, err))
 		}
 	}
 	return errors.Join(failures...)
