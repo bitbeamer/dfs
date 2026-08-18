@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -277,6 +278,38 @@ func TestUninstallWaitsForCoreProcessBeforeRemovingDefinitions(t *testing.T) {
 	}
 	if checks < 2 {
 		t.Fatalf("core process checked %d time(s), want shutdown wait", checks)
+	}
+}
+
+func TestRestartWaitsForLaunchdToUnloadBeforeStarting(t *testing.T) {
+	serviceID := "123456789abc"
+	printCalls := map[string]int{}
+	var calls []string
+	manager := &manager{platform: "darwin", launchdDir: "/launch-agents", domain: "gui/501", run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+		call := strings.Join(append([]string{name}, arguments...), " ")
+		calls = append(calls, call)
+		if name == "launchctl" && len(arguments) == 2 && arguments[0] == "print" {
+			printCalls[arguments[1]]++
+			if printCalls[arguments[1]] == 1 {
+				return nil, nil
+			}
+			return nil, errors.New("not loaded")
+		}
+		return nil, nil
+	}}
+	instance := Instance{serviceID: serviceID, CoreActive: true, MountActive: true}
+	if err := manager.restart(context.Background(), []Instance{instance}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"core", "mount"} {
+		label := "gui/501/io.bitbeamer.dfs." + kind + "." + serviceID
+		if printCalls[label] < 3 {
+			t.Fatalf("launchd status for %s checked %d times, want unload wait followed by start check", kind, printCalls[label])
+		}
+		bootstrap := "launchctl bootstrap gui/501 /launch-agents/io.bitbeamer.dfs." + kind + "." + serviceID + ".plist"
+		if !slices.Contains(calls, bootstrap) {
+			t.Fatalf("restart calls = %#v, missing %q", calls, bootstrap)
+		}
 	}
 }
 

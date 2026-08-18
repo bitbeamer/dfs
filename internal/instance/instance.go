@@ -379,10 +379,53 @@ func Restart(ctx context.Context, instances []Instance) error {
 	if err != nil {
 		return err
 	}
-	if err := manager.stop(ctx, instances); err != nil {
+	return manager.restart(ctx, instances)
+}
+
+func (m *manager) restart(ctx context.Context, instances []Instance) error {
+	if err := m.stop(ctx, instances); err != nil {
 		return err
 	}
-	return manager.start(ctx, instances)
+	if m.platform == "darwin" {
+		if err := m.waitForLaunchdUnload(ctx, instances); err != nil {
+			return err
+		}
+	}
+	return m.start(ctx, instances)
+}
+
+func (m *manager) waitForLaunchdUnload(ctx context.Context, instances []Instance) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		loaded := false
+		for _, instance := range instances {
+			for _, item := range []struct {
+				kind   string
+				active bool
+			}{
+				{kind: "mount", active: instance.MountActive},
+				{kind: "core", active: instance.CoreActive},
+			} {
+				if item.active && m.commandSucceeds(waitCtx, "launchctl", "print", m.domain+"/io.bitbeamer.dfs."+item.kind+"."+instance.serviceID) {
+					loaded = true
+				}
+			}
+		}
+		if err := waitCtx.Err(); err != nil {
+			return fmt.Errorf("managed launch agents did not stop: %w", err)
+		}
+		if !loaded {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("managed launch agents did not stop: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func Stop(ctx context.Context, instances []Instance) error {
