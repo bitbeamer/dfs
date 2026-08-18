@@ -364,7 +364,7 @@ func (a *App) setupCommand() *cobra.Command {
 				}
 				answer = strings.ToLower(strings.TrimSpace(answer))
 				if answer != "y" && answer != "yes" {
-					return errors.New("DFS setup was not approved; resume later with dfs setup --resume")
+					return errors.New("DFS setup was not approved; resume later with dfs setup resume")
 				}
 				return nil
 			}
@@ -372,7 +372,7 @@ func (a *App) setupCommand() *cobra.Command {
 				Name: name, GitName: gitName, GitEmail: gitEmail, CacheLimit: cacheLimit, Timeout: discoveryTimeout, VerificationTimeout: verificationTimeout, Resume: resume, Installer: installer,
 				PairingPort: pairingPort, Out: a.Out, Approve: approve})
 			if err != nil {
-				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup --resume or roll back with dfs setup --abort)", err)
+				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup resume or roll back with dfs setup abort)", err)
 			}
 			fmt.Fprintf(a.Out, "DFS setup verified: %s is mounted at %s on managed port %d\n", state.NetworkName, state.Mountpoint, state.PairingPort)
 			return nil

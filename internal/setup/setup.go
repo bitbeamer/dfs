@@ -364,7 +364,7 @@ func loadOrCreate(options Options) (*State, string, error) {
 		return state, path, nil
 	}
 	if _, err := os.Stat(path); err == nil {
-		return nil, "", errors.New("a DFS setup transaction already exists; use dfs setup --resume or --abort")
+		return nil, "", errors.New("a DFS setup transaction already exists; use dfs setup resume or dfs setup abort")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
 	}
@@ -479,7 +479,7 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 			if checkErr != nil {
 				return fmt.Errorf("verify directed DFS cluster: %w", checkErr)
 			}
-			return errors.New("online DFS members have not acknowledged every directed cluster connection; retry with dfs setup --resume")
+			return errors.New("online DFS members have not acknowledged every directed cluster connection; retry with dfs setup resume")
 		case <-time.After(2 * time.Second):
 			fmt.Fprintln(options.Out, "Waiting for online DFS members to acknowledge the new cluster topology...")
 		}
@@ -531,7 +531,7 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 			if err := save(statePath, state); err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "Join request %s is pending. On any existing peer run: dfs pair approve %s\n", credentials.RequestID, credentials.RequestID)
+			printJoinApprovalInstruction(out, credentials.RequestID)
 		}
 		invitation, approved, err := peer.PollJoinApproval(ctx, selected, state.Approval)
 		if err == nil && approved {
@@ -551,6 +551,10 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+func printJoinApprovalInstruction(out io.Writer, requestID string) {
+	fmt.Fprintf(out, "Join request %s is pending. On any existing peer run: dfs peer approve %s\n", requestID, requestID)
 }
 
 func save(path string, state *State) error {

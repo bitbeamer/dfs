@@ -206,7 +206,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	server, _, err := nodefs.Mount(mountpoint, pathNodes.Root(), mountOptions, nodeOptions)
 	if err != nil {
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
-		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs unmount %s before retrying", mountpoint, err, mountpoint)
+		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs internal unmount %s before retrying", mountpoint, err, mountpoint)
 	}
 	logger.Info("mount ready", "mountpoint", mountpoint)
 	serveDone := make(chan struct{})
@@ -225,7 +225,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 			logger.Error("automatic unmount failed",
 				"mountpoint", mountpoint,
 				"error", err,
-				"recovery", fmt.Sprintf("run dfs unmount %s from another terminal", mountpoint),
+				"recovery", fmt.Sprintf("run dfs internal unmount %s from another terminal", mountpoint),
 			)
 			return fmt.Errorf("unmount DFS at %s during shutdown: %w", mountpoint, err)
 		}

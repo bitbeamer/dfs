@@ -260,3 +260,28 @@ func TestPublicCommandHelpMatchesConsolidatedTree(t *testing.T) {
 		t.Fatalf("service uninstall purge help is incomplete: %q", uninstall.Long)
 	}
 }
+
+func TestPublicCommandHelpDoesNotReferenceLegacyCommands(t *testing.T) {
+	root := New()
+	legacy := []string{
+		"dfs setup --resume", "dfs setup --abort", "dfs pair ", "dfs network ",
+		"dfs unmount ", "dfs status", "dfs doctor", "dfs fetch ", "dfs pin ",
+		"dfs unpin ", "dfs evict ", "dfs restore ", "dfs conflicts",
+	}
+	var visit func(*cobra.Command)
+	visit = func(command *cobra.Command) {
+		if command.Hidden {
+			return
+		}
+		help := strings.Join([]string{command.Short, command.Long, command.Example}, "\n")
+		for _, stale := range legacy {
+			if strings.Contains(help, stale) {
+				t.Errorf("%s help references legacy command %q", command.CommandPath(), stale)
+			}
+		}
+		for _, child := range command.Commands() {
+			visit(child)
+		}
+	}
+	visit(root)
+}

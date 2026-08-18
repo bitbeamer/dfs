@@ -89,7 +89,7 @@ func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *
 		}, nil
 	}
 	err = verifySetupCluster(context.Background(), statePath, state, Options{Out: os.Stderr, CheckCluster: checker})
-	if err == nil || !strings.Contains(err.Error(), "retry with dfs setup --resume") {
+	if err == nil || !strings.Contains(err.Error(), "retry with dfs setup resume") {
 		t.Fatalf("incomplete cluster verification error = %v", err)
 	}
 	persisted, err := load(statePath)
@@ -98,6 +98,15 @@ func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *
 	}
 	if persisted.Phase != PhaseMounted || len(persisted.Acknowledgements) != 2 || persisted.Acknowledgements[1].Status != "INCOMPLETE" {
 		t.Fatalf("persisted resumable cluster state = %+v", persisted)
+	}
+}
+
+func TestJoinApprovalInstructionUsesPublicPeerCommand(t *testing.T) {
+	var output strings.Builder
+	printJoinApprovalInstruction(&output, "V8XC0A8orLhl49GB")
+	want := "Join request V8XC0A8orLhl49GB is pending. On any existing peer run: dfs peer approve V8XC0A8orLhl49GB\n"
+	if output.String() != want {
+		t.Fatalf("join approval instruction = %q, want %q", output.String(), want)
 	}
 }
 

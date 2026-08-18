@@ -258,7 +258,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := postPair(ctx, endpoint, invitation.CertificateSHA256, "pair-complete", PairCompleteRequest{
 		SessionID: start.SessionID, CompletionSecret: start.CompletionSecret,
 	}, &complete); err != nil {
-		return nil, fmt.Errorf("repository joined but reciprocal pairing is incomplete: %w; retry with dfs --repo %s network complete", err, repo.Config.Repository)
+		return nil, fmt.Errorf("repository joined but reciprocal pairing is incomplete: %w; retry with dfs --repo %s internal pairing complete", err, repo.Config.Repository)
 	}
 	if err := removePairingResume(repo.Config.Repository); err != nil {
 		return nil, err
