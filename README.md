@@ -251,6 +251,7 @@ dfs service repair --filesystem "Home Files" --dry-run
 dfs upgrade --from ./bin/dfs --dry-run
 dfs upgrade --from ./bin/dfs --yes
 dfs service uninstall --filesystem "Home Files"
+dfs service uninstall --filesystem "Home Files" --purge --yes
 ```
 
 `service list` discovers actual systemd or launchd definitions. Selectors accept
@@ -258,7 +259,11 @@ an unambiguous filesystem display name, peer name, ID prefix, mountpoint, or
 repository. `upgrade` validates and atomically stages a different shared
 executable, preserves running and enabled state, verifies restarted services,
 and rolls back failures. `service repair` only reinstalls definitions.
-Uninstall retains repositories, cached content, peer identity, and membership.
+Uninstall retains repositories, cached content, peer identity, and membership by
+default. Add `--purge --yes` to permanently delete the selected local
+repository, including frozen git-annex objects and the local peer identity,
+after its services stop. Purging does not revoke membership records held by
+other peers, and neither form removes the shared DFS executable.
 
 ## Work with files and local storage
 
@@ -430,6 +435,17 @@ dfs service uninstall --filesystem "$DFS_INSTANCE"
 
 The command prints the retained repository path; cached content, peer identity,
 and cluster membership are not deleted.
+
+To also permanently delete that local repository and its cached content, use:
+
+```sh
+dfs service uninstall --filesystem "$DFS_INSTANCE" --purge --yes
+```
+
+DFS validates the repository target before changing services and makes frozen
+git-annex object directories removable during deletion. This destroys the
+local peer identity but does not revoke its membership record on other peers;
+remove that peer separately from a remaining cluster member when appropriate.
 
 Managed services use JSON `info` logging. Runtime logging and FUSE-debug flags
 belong to hidden service-manager and developer interfaces rather than the

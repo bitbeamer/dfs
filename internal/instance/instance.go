@@ -771,6 +771,115 @@ func Uninstall(ctx context.Context, instances []Instance) error {
 	return manager.uninstall(ctx, instances)
 }
 
+// UninstallAndPurge removes managed service definitions and permanently
+// deletes their local repositories. Repository targets are validated before
+// any services are changed.
+func UninstallAndPurge(ctx context.Context, instances []Instance) error {
+	manager, err := newManager()
+	if err != nil {
+		return err
+	}
+	return manager.uninstallAndPurge(ctx, instances)
+}
+
+func (m *manager) uninstallAndPurge(ctx context.Context, instances []Instance) error {
+	targets, err := purgeTargets(instances)
+	if err != nil {
+		return err
+	}
+	if err := m.uninstall(ctx, instances); err != nil {
+		return err
+	}
+	var failures []error
+	for _, target := range targets {
+		if err := purgeRepository(ctx, target); err != nil {
+			failures = append(failures, fmt.Errorf("purge repository %s: %w", target, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func purgeTargets(instances []Instance) ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("locate home directory for purge safety checks: %w", err)
+	}
+	home, err = filepath.Abs(home)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(instances))
+	targets := make([]string, 0, len(instances))
+	for _, instance := range instances {
+		target := strings.TrimSpace(instance.Repository)
+		if target == "" {
+			return nil, fmt.Errorf("refusing to purge %s: repository path is empty", instanceLabel(instance))
+		}
+		if !filepath.IsAbs(target) {
+			return nil, fmt.Errorf("refusing to purge %s: repository path is not absolute: %s", instanceLabel(instance), target)
+		}
+		target, err = filepath.Abs(target)
+		if err != nil {
+			return nil, fmt.Errorf("resolve repository path %q: %w", instance.Repository, err)
+		}
+		target = filepath.Clean(target)
+		root := filepath.VolumeName(target) + string(os.PathSeparator)
+		if target == root || target == home {
+			return nil, fmt.Errorf("refusing to purge unsafe repository path %s", target)
+		}
+		info, statErr := os.Lstat(target)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+		case statErr != nil:
+			return nil, fmt.Errorf("inspect repository path %s: %w", target, statErr)
+		case info.Mode()&os.ModeSymlink != 0:
+			return nil, fmt.Errorf("refusing to purge repository through symbolic link %s", target)
+		case !info.IsDir():
+			return nil, fmt.Errorf("refusing to purge repository path that is not a directory: %s", target)
+		default:
+			gitInfo, gitErr := os.Stat(filepath.Join(target, ".git"))
+			if gitErr != nil || !gitInfo.IsDir() {
+				return nil, fmt.Errorf("refusing to purge path without a DFS Git repository: %s", target)
+			}
+		}
+		if !seen[target] {
+			seen[target] = true
+			targets = append(targets, target)
+		}
+	}
+	return targets, nil
+}
+
+func purgeRepository(ctx context.Context, root string) error {
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			// git-annex freezes object directories at 0555. Restore owner
+			// access before RemoveAll descends into and empties them.
+			return os.Chmod(path, info.Mode().Perm()|0o700)
+		}
+		return nil
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("make repository removable: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.RemoveAll(root)
+}
+
 func (m *manager) uninstall(ctx context.Context, instances []Instance) error {
 	var failures []error
 	for _, instance := range instances {

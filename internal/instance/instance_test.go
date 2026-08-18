@@ -195,3 +195,106 @@ func TestUninstallRemovesServicesButRetainsRepository(t *testing.T) {
 		t.Fatalf("uninstall calls = %#v", calls)
 	}
 }
+
+func TestUninstallAndPurgeRemovesFrozenAnnexRepository(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repository := filepath.Join(home, ".local", "share", "dfs", "repository")
+	objectDirectory := filepath.Join(repository, ".git", "annex", "objects", "AA", "BB", "SHA256E-s4--test.txt")
+	if err := os.MkdirAll(objectDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	object := filepath.Join(objectDirectory, "SHA256E-s4--test.txt")
+	if err := os.WriteFile(object, []byte("test"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(objectDirectory, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	serviceID := "123456789abc"
+	unitDirectory := filepath.Join(home, "units")
+	if err := os.MkdirAll(unitDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"mount", "core"} {
+		if err := os.WriteFile(filepath.Join(unitDirectory, "dfs-"+kind+"-"+serviceID+".service"), []byte("unit"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := &manager{platform: "linux", systemdDir: unitDirectory, run: func(context.Context, string, ...string) ([]byte, error) {
+		return nil, nil
+	}}
+	if err := manager.uninstallAndPurge(context.Background(), []Instance{{Repository: repository, serviceID: serviceID}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(repository); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purged repository remains: %v", err)
+	}
+}
+
+func TestUninstallAndPurgeRejectsUnsafeTargetBeforeChangingServices(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	calls := 0
+	manager := &manager{platform: "linux", systemdDir: filepath.Join(home, "units"), run: func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return nil, nil
+	}}
+	err := manager.uninstallAndPurge(context.Background(), []Instance{{Repository: home, serviceID: "123456789abc"}})
+	if err == nil || !strings.Contains(err.Error(), "unsafe repository path") {
+		t.Fatalf("unsafe purge error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("service commands ran before purge validation: %d", calls)
+	}
+}
+
+func TestPurgeTargetsRejectAmbiguousPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	nonRepository := filepath.Join(home, "not-a-repository")
+	if err := os.MkdirAll(nonRepository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(home, "repository")
+	if err := os.MkdirAll(filepath.Join(repository, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(home, "repository-link")
+	if err := os.Symlink(repository, symlink); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"relative":       "repository",
+		"non-repository": nonRepository,
+		"symlink":        symlink,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := purgeTargets([]Instance{{Repository: target}}); err == nil {
+				t.Fatalf("purge target %q was accepted", target)
+			}
+		})
+	}
+}
+
+func TestUninstallAndPurgeRetainsRepositoryWhenServiceStopFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repository := filepath.Join(home, "repository")
+	if err := os.MkdirAll(filepath.Join(repository, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &manager{platform: "linux", systemdDir: filepath.Join(home, "units"), run: func(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+		if len(arguments) > 1 && arguments[1] == "disable" {
+			return nil, errors.New("stop failed")
+		}
+		return nil, nil
+	}}
+	err := manager.uninstallAndPurge(context.Background(), []Instance{{Repository: repository, serviceID: "123456789abc"}})
+	if err == nil || !strings.Contains(err.Error(), "stop managed services") {
+		t.Fatalf("failed uninstall error = %v", err)
+	}
+	if _, err := os.Stat(repository); err != nil {
+		t.Fatalf("repository was purged after service stop failure: %v", err)
+	}
+}

@@ -37,7 +37,7 @@ func (a *App) publicCommands() []*cobra.Command {
 func (a *App) setupGroupCommand() *cobra.Command {
 	root := a.setupModeCommand("join")
 	root.Use = "setup"
-	root.Short = "Create or join, install, mount, and verify DFS"
+	root.Short = "Provision or recover a DFS filesystem"
 	root.AddCommand(
 		a.setupModeCommand("create"),
 		a.setupModeCommand("join"),
@@ -88,9 +88,9 @@ func (a *App) setupModeCommand(mode string) *cobra.Command {
 	switch mode {
 	case "create":
 		_ = command.Flags().Set("create", "true")
-		command.Short = "Create and install the first peer of a new filesystem"
+		command.Short = "Create, install, mount, and verify a new filesystem"
 	case "join":
-		command.Short = "Discover, join, install, and verify a filesystem"
+		command.Short = "Discover, join, install, mount, and verify a filesystem"
 	case "resume":
 		_ = command.Flags().Set("resume", "true")
 		command.Short = "Resume an interrupted setup transaction"
@@ -120,7 +120,7 @@ func aliasFlag(command *cobra.Command, existing, replacement, usage string) {
 }
 
 func (a *App) filesystemCommand() *cobra.Command {
-	command := &cobra.Command{Use: "filesystem", Short: "Inspect the selected DFS filesystem"}
+	command := &cobra.Command{Use: "filesystem", Short: "Inspect and manage the selected DFS filesystem"}
 	command.AddCommand(&cobra.Command{Use: "show", Args: cobra.NoArgs, Short: "Show filesystem identity and local configuration", RunE: func(cmd *cobra.Command, _ []string) error {
 		repo, err := a.open()
 		if err != nil {
@@ -270,37 +270,56 @@ func (a *App) serviceStateCommand(action string) *cobra.Command {
 }
 
 func (a *App) serviceUninstallCommand() *cobra.Command {
-	var all, dryRun bool
-	command := &cobra.Command{Use: "uninstall [name|id|mountpoint|repository]", Args: cobra.MaximumNArgs(1), Short: "Remove local service definitions while retaining repository data", RunE: func(cmd *cobra.Command, args []string) error {
-		instances, err := dfsinstance.Discover(cmd.Context())
-		if err != nil {
-			return err
-		}
-		selected, err := selectManagedInstances(instances, args, all, a.filesystem)
-		if err != nil {
-			return err
-		}
-		if dryRun {
-			return a.writeMutationPlan("service uninstall (repository data retained)", selected, nil)
-		}
-		if all {
-			if err := a.confirm(cmd, "service uninstall with repository data retained", len(selected)); err != nil {
+	var all, dryRun, purge bool
+	command := &cobra.Command{Use: "uninstall [name|id|mountpoint|repository]", Args: cobra.MaximumNArgs(1),
+		Short: "Remove local DFS services and optionally their repositories",
+		Long:  "Remove the selected local DFS service definitions. Repository data is retained by default.\n\nWith --purge, permanently delete each local repository, cached content, and peer identity after stopping its services. Membership records held by other peers are not revoked.", RunE: func(cmd *cobra.Command, args []string) error {
+			if purge && !dryRun && !a.yes {
+				return errors.New("service uninstall --purge permanently deletes repository data and requires --yes")
+			}
+			instances, err := dfsinstance.Discover(cmd.Context())
+			if err != nil {
 				return err
 			}
-		}
-		if err := dfsinstance.Uninstall(cmd.Context(), selected); err != nil {
-			return err
-		}
-		if !a.quiet {
-			fmt.Fprintf(a.Out, "Uninstalled %d DFS service(s); repository data and peer membership were retained\n", len(selected))
-			for _, instance := range selected {
-				fmt.Fprintf(a.Out, "  Retained: %s\n", instance.Repository)
+			selected, err := selectManagedInstances(instances, args, all, a.filesystem)
+			if err != nil {
+				return err
 			}
-		}
-		return nil
-	}}
+			if dryRun {
+				action := "service uninstall (repository data retained)"
+				if purge {
+					action = "service uninstall and repository purge"
+				}
+				return a.writeMutationPlan(action, selected, map[string]any{"purge": purge})
+			}
+			if all && !purge {
+				if err := a.confirm(cmd, "service uninstall with repository data retained", len(selected)); err != nil {
+					return err
+				}
+			}
+			if purge {
+				err = dfsinstance.UninstallAndPurge(cmd.Context(), selected)
+			} else {
+				err = dfsinstance.Uninstall(cmd.Context(), selected)
+			}
+			if err != nil {
+				return err
+			}
+			if !a.quiet {
+				if purge {
+					fmt.Fprintf(a.Out, "Uninstalled %d DFS service(s) and permanently deleted their local repositories; membership records on other peers were retained\n", len(selected))
+				} else {
+					fmt.Fprintf(a.Out, "Uninstalled %d DFS service(s); repository data and peer membership were retained\n", len(selected))
+					for _, instance := range selected {
+						fmt.Fprintf(a.Out, "  Retained: %s\n", instance.Repository)
+					}
+				}
+			}
+			return nil
+		}}
 	command.Flags().BoolVar(&all, "all", false, "uninstall every local DFS service")
 	command.Flags().BoolVar(&dryRun, "dry-run", false, "show the uninstall plan without changing services")
+	command.Flags().BoolVar(&purge, "purge", false, "permanently delete local repositories after uninstalling services (requires --yes)")
 	return command
 }
 

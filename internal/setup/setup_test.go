@@ -78,7 +78,9 @@ func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *
 	}
 	statePath := filepath.Join(home, "state.json")
 	state := &State{Version: 1, Phase: PhaseMounted, Repository: repositoryPath, Mountpoint: filepath.Join(home, "mount"), PeerID: peerID,
-		VerificationTimeout: int64(20 * time.Millisecond), Timeout: int64(time.Millisecond)}
+		// Leave enough time for membership reconciliation's local Git commands
+		// before exercising the deliberately incomplete mesh timeout.
+		VerificationTimeout: int64(time.Second), Timeout: int64(time.Millisecond)}
 	checker := func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error) {
 		return peer.MeshReport{
 			Peers:       []peer.MeshPeer{{PeerID: peerID, PeerName: "ares"}, {PeerID: "zeus-peer", PeerName: "zeus"}},

@@ -12,6 +12,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/peer"
 	dfssetup "github.com/bitbeamer/dfs/internal/setup"
+	"github.com/spf13/cobra"
 )
 
 func TestDiscoverSetupNetworksReportsProgress(t *testing.T) {
@@ -178,5 +179,56 @@ func TestMaterialMutationsExposeDryRun(t *testing.T) {
 		if command.Flags().Lookup("dry-run") == nil {
 			t.Errorf("%s has no --dry-run", command.CommandPath())
 		}
+	}
+}
+
+func TestServiceUninstallPurgeRequiresExplicitApproval(t *testing.T) {
+	command := New()
+	command.SetArgs([]string{"service", "uninstall", "--purge"})
+	err := command.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
+		t.Fatalf("unapproved purge error = %v", err)
+	}
+}
+
+func TestPublicCommandHelpMatchesConsolidatedTree(t *testing.T) {
+	root := New()
+	wanted := map[string]string{
+		"dfs setup":             "Provision or recover a DFS filesystem",
+		"dfs setup create":      "Create, install, mount, and verify a new filesystem",
+		"dfs setup join":        "Discover, join, install, mount, and verify a filesystem",
+		"dfs filesystem":        "Inspect and manage the selected DFS filesystem",
+		"dfs cache show":        "Show cache use, limit, and pins",
+		"dfs history list":      "Show namespace history",
+		"dfs peer relay show":   "Show relay configuration",
+		"dfs service uninstall": "Remove local DFS services and optionally their repositories",
+	}
+	var visit func(*cobra.Command)
+	visit = func(command *cobra.Command) {
+		if !command.Hidden && command.Name() != "help" && command.Name() != "completion" {
+			if strings.TrimSpace(command.Short) == "" {
+				t.Errorf("%s has no short help description", command.CommandPath())
+			}
+			if expected, found := wanted[command.CommandPath()]; found {
+				if command.Short != expected {
+					t.Errorf("%s short help = %q, want %q", command.CommandPath(), command.Short, expected)
+				}
+				delete(wanted, command.CommandPath())
+			}
+		}
+		for _, child := range command.Commands() {
+			visit(child)
+		}
+	}
+	visit(root)
+	for path := range wanted {
+		t.Errorf("help audit did not find %s", path)
+	}
+	uninstall, _, err := root.Find([]string{"service", "uninstall"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uninstall.Flags().Lookup("purge") == nil || !strings.Contains(uninstall.Long, "Membership records held by other peers are not revoked") {
+		t.Fatalf("service uninstall purge help is incomplete: %q", uninstall.Long)
 	}
 }

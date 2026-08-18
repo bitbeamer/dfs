@@ -256,6 +256,7 @@ dfs service repair --filesystem "Home Files" --dry-run
 dfs upgrade --from ./bin/dfs --dry-run
 dfs upgrade --from ./bin/dfs --yes
 dfs service uninstall --filesystem "Home Files"
+dfs service uninstall --filesystem "Home Files" --purge --yes
 ```
 
 Service selectors accept an unambiguous filesystem display name, peer name, ID
@@ -263,7 +264,11 @@ prefix, mountpoint, or repository path. Upgrade validates and stages a different
 shared executable, preserves running and enabled state, verifies restarted
 services, and rolls back failures. Repair only reinstalls service definitions.
 Uninstall retains repository data, cached content, peer identity, membership,
-and the shared executable.
+and the shared executable by default. `--purge --yes` also permanently deletes
+the selected local repository after stopping its services, including frozen
+git-annex objects and the local peer identity. The shared executable and
+membership records held by other peers remain; revoke the removed peer from a
+remaining cluster member when appropriate.
 
 `health` checks required commands and the platform FUSE dependency, then reports
 the independent core plus filesystem identity, logical size and file count,
