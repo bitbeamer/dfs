@@ -368,9 +368,15 @@ func (a *App) setupCommand() *cobra.Command {
 				}
 				return nil
 			}
+			waitForApproval := func(string) error {
+				if a.yes {
+					return nil
+				}
+				return promptAfterJoinApproval(reader, a.Out)
+			}
 			state, err := dfssetup.Run(ctx, dfssetup.Options{FileSystemID: selectedFilesystem, Create: create, NetworkName: selectedNetworkName, Repository: repositoryPath, Mountpoint: mountpoint,
 				Name: name, GitName: gitName, GitEmail: gitEmail, CacheLimit: cacheLimit, Timeout: discoveryTimeout, VerificationTimeout: verificationTimeout, Resume: resume, Installer: installer,
-				PairingPort: pairingPort, Out: a.Out, Approve: approve})
+				PairingPort: pairingPort, Out: a.Out, Approve: approve, WaitForApproval: waitForApproval})
 			if err != nil {
 				return fmt.Errorf("DFS setup stopped at a recoverable step: %w (retry with dfs setup resume or roll back with dfs setup abort)", err)
 			}
@@ -456,6 +462,14 @@ func setupFilesystemName(state *dfssetup.State) string {
 		id = id[:12]
 	}
 	return id
+}
+
+func promptAfterJoinApproval(reader *bufio.Reader, out io.Writer) error {
+	fmt.Fprint(out, "After approving the join request on an existing peer, press Enter to continue: ")
+	if _, err := reader.ReadString('\n'); err != nil {
+		return errors.New("interactive setup requires Enter after the join request is approved; resume later with dfs setup resume")
+	}
+	return nil
 }
 
 func ensureGitIdentity(ctx context.Context, reader *bufio.Reader, out io.Writer, name, email string, nonInteractive bool) (string, string, error) {

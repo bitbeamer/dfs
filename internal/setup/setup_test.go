@@ -184,10 +184,20 @@ func TestSetupClusterVerificationReportsExpiredDeadlineAsIncompleteTopology(t *t
 
 func TestJoinApprovalInstructionUsesPublicPeerCommand(t *testing.T) {
 	var output strings.Builder
-	printJoinApprovalInstruction(&output, "V8XC0A8orLhl49GB")
+	var waitedFor string
+	err := showJoinApprovalInstruction(&output, "V8XC0A8orLhl49GB", func(requestID string) error {
+		waitedFor = requestID
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := "Join request V8XC0A8orLhl49GB is pending. On any existing peer run: dfs peer approve V8XC0A8orLhl49GB\n"
 	if output.String() != want {
 		t.Fatalf("join approval instruction = %q, want %q", output.String(), want)
+	}
+	if waitedFor != "V8XC0A8orLhl49GB" {
+		t.Fatalf("waited for request %q", waitedFor)
 	}
 }
 

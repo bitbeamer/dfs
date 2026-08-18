@@ -88,6 +88,23 @@ func TestSetupFilesystemNamePrefersDisplayName(t *testing.T) {
 	}
 }
 
+func TestPromptAfterJoinApprovalWaitsForEnter(t *testing.T) {
+	var output bytes.Buffer
+	if err := promptAfterJoinApproval(bufio.NewReader(strings.NewReader("\n")), &output); err != nil {
+		t.Fatal(err)
+	}
+	if want := "After approving the join request on an existing peer, press Enter to continue: "; output.String() != want {
+		t.Fatalf("approval prompt = %q, want %q", output.String(), want)
+	}
+}
+
+func TestPromptAfterJoinApprovalRejectsClosedInput(t *testing.T) {
+	err := promptAfterJoinApproval(bufio.NewReader(strings.NewReader("")), &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "requires Enter") {
+		t.Fatalf("closed approval prompt error = %v", err)
+	}
+}
+
 func TestConsolidatedServiceCommandsAreExposed(t *testing.T) {
 	root := New()
 	for _, path := range [][]string{{"service", "list"}, {"service", "show"}, {"service", "start"}, {"service", "stop"}, {"service", "restart"}, {"service", "repair"}, {"service", "uninstall"}, {"upgrade"}} {

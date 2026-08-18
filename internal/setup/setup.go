@@ -80,6 +80,7 @@ type Options struct {
 	VerificationTimeout time.Duration
 	Out                 io.Writer
 	Approve             func(*State) error
+	WaitForApproval     func(string) error
 	CheckCluster        func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error)
 }
 
@@ -157,7 +158,7 @@ func Run(ctx context.Context, options Options) (*State, error) {
 			}
 		}
 		if !state.Create && state.Invitation == "" {
-			if err := awaitApproval(ctx, path, state, options.Out); err != nil {
+			if err := awaitApproval(ctx, path, state, options.Out, options.WaitForApproval); err != nil {
 				return nil, err
 			}
 		}
@@ -560,7 +561,8 @@ func printSetupAcknowledgements(out io.Writer, acknowledgements []peer.SetupAckn
 	}
 }
 
-func awaitApproval(ctx context.Context, statePath string, state *State, out io.Writer) error {
+func awaitApproval(ctx context.Context, statePath string, state *State, out io.Writer, waitForApproval func(string) error) error {
+	instructionShown := false
 	for {
 		if !state.Approval.ExpiresAt.IsZero() && !state.Approval.ExpiresAt.After(time.Now()) {
 			return errors.New("DFS join request expired; abort setup and start a new request")
@@ -595,7 +597,12 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 			if err := save(statePath, state); err != nil {
 				return err
 			}
-			printJoinApprovalInstruction(out, credentials.RequestID)
+		}
+		if !instructionShown {
+			if err := showJoinApprovalInstruction(out, state.Approval.RequestID, waitForApproval); err != nil {
+				return err
+			}
+			instructionShown = true
 		}
 		invitation, approved, err := peer.PollJoinApproval(ctx, selected, state.Approval)
 		if err == nil && approved {
@@ -619,6 +626,14 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 
 func printJoinApprovalInstruction(out io.Writer, requestID string) {
 	fmt.Fprintf(out, "Join request %s is pending. On any existing peer run: dfs peer approve %s\n", requestID, requestID)
+}
+
+func showJoinApprovalInstruction(out io.Writer, requestID string, waitForApproval func(string) error) error {
+	printJoinApprovalInstruction(out, requestID)
+	if waitForApproval == nil {
+		return nil
+	}
+	return waitForApproval(requestID)
 }
 
 func save(path string, state *State) error {
