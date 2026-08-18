@@ -242,6 +242,19 @@ dfs health --cluster
 dfs peer list
 ```
 
+Administer every installed filesystem from its actual systemd or launchd definition:
+
+```sh
+dfs instance list
+dfs instance stop "Home Files"
+dfs instance stop --all
+dfs instance update --binary ./bin/dfs
+dfs instance uninstall "Home Files"
+dfs instance uninstall --all --yes
+```
+
+Instance selectors accept an unambiguous filesystem display name, peer name, ID prefix, or repository path. Update reinstalls every instance with its recorded repository, mountpoint, and port while preserving stopped instances. Uninstall removes the selected managed services but retains repository data and the shared executable; host-wide uninstall requires `--yes`.
+
 `health` checks required commands and the platform FUSE dependency, then reports
 the independent core plus filesystem identity, logical size and file count,
 instance port, role, repository and metadata size, physical cache and disk use, content

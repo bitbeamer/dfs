@@ -84,3 +84,16 @@ func TestSetupFilesystemNamePrefersDisplayName(t *testing.T) {
 		t.Fatalf("setup filesystem name = %q", got)
 	}
 }
+
+func TestInstanceAdministrationCommandsAreExposed(t *testing.T) {
+	root := New()
+	for _, path := range [][]string{{"instance", "list"}, {"instance", "stop"}, {"instance", "update"}, {"instance", "uninstall"}} {
+		command, _, err := root.Find(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if command.Name() != path[len(path)-1] {
+			t.Fatalf("command %v resolved to %s", path, command.Name())
+		}
+	}
+}

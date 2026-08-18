@@ -245,7 +245,17 @@ second peer can join with:
 Each managed instance receives filesystem-specific core and mount services,
 separate health/runtime data, separate logs, and the first available transport
 port. Installing or uninstalling one instance does not replace the others.
-Rerun the installer once for every repository after building a new DFS binary.
+
+```sh
+dfs instance list
+dfs instance stop "Home Files"
+dfs instance stop --all
+dfs instance update --binary ./bin/dfs
+dfs instance uninstall "Home Files"
+dfs instance uninstall --all --yes
+```
+
+`instance list` discovers the actual systemd or launchd definitions, including manually installed and non-default repositories. Selectors accept an unambiguous filesystem display name, peer name, ID prefix, or repository path. Update applies one executable to every instance and preserves whether each was running. Uninstall removes managed services but retains repositories, content, and the shared executable.
 
 ## Work with files and local storage
 

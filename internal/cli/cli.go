@@ -19,6 +19,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/config"
 	dfscore "github.com/bitbeamer/dfs/internal/daemon"
+	dfsinstance "github.com/bitbeamer/dfs/internal/instance"
 	"github.com/bitbeamer/dfs/internal/managed"
 	dfsmount "github.com/bitbeamer/dfs/internal/mount"
 	"github.com/bitbeamer/dfs/internal/optimization"
@@ -50,7 +51,7 @@ func New() *cobra.Command {
 	root.SetErr(app.Err)
 	root.PersistentFlags().StringVar(&app.repo, "repo", "", "DFS repository (otherwise use DFS_REPO, the current tree, or the setup default)")
 	root.AddCommand(
-		app.setupCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
+		app.setupCommand(), app.instanceCommand(), app.initCommand(), app.joinCommand(), app.peerCommand(), app.networkCommand(), app.pairCommand(), app.relayCommand(), app.transportCommand(),
 		app.storageCommand(), app.daemonCommand(),
 		app.mountCommand(), app.unmountCommand(), app.healthCommand(), app.optimizeCommand(), app.syncCommand(), app.statusCommand(),
 		app.fetchCommand(), app.pinCommand(), app.unpinCommand(), app.evictCommand(),
@@ -58,6 +59,140 @@ func New() *cobra.Command {
 		app.doctorCommand(),
 	)
 	return root
+}
+
+func (a *App) instanceCommand() *cobra.Command {
+	instancesCommand := &cobra.Command{Use: "instance", Short: "Administer every managed DFS filesystem on this host"}
+	var listJSON bool
+	list := &cobra.Command{Use: "list", Args: cobra.NoArgs, Short: "List installed DFS filesystem instances",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			instances, err := dfsinstance.Discover(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if listJSON {
+				encoder := json.NewEncoder(a.Out)
+				encoder.SetIndent("", "  ")
+				return encoder.Encode(instances)
+			}
+			if len(instances) == 0 {
+				fmt.Fprintln(a.Out, "No managed DFS filesystem instances found")
+				return nil
+			}
+			writer := tabwriter.NewWriter(a.Out, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(writer, "FILESYSTEM\tPEER\tID\tSTATUS\tPORT\tMOUNTPOINT\tREPOSITORY")
+			for _, instance := range instances {
+				id := instance.FileSystemID
+				if len(id) > 12 {
+					id = id[:12]
+				}
+				fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", instance.NetworkName, instance.Name, id, instanceStatus(instance), instance.PairingPort, instance.Mountpoint, instance.Repository)
+			}
+			return writer.Flush()
+		}}
+	list.Flags().BoolVar(&listJSON, "json", false, "emit machine-readable instance data")
+
+	var stopAll bool
+	stop := &cobra.Command{Use: "stop [name|id|repository]", Args: cobra.MaximumNArgs(1), Short: "Stop one or every managed DFS filesystem without uninstalling it",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			instances, err := dfsinstance.Discover(cmd.Context())
+			if err != nil {
+				return err
+			}
+			selected, err := selectManagedInstances(instances, args, stopAll)
+			if err != nil {
+				return err
+			}
+			if err := dfsinstance.Stop(cmd.Context(), selected); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Stopped %d DFS filesystem instance(s)\n", len(selected))
+			return nil
+		}}
+	stop.Flags().BoolVar(&stopAll, "all", false, "stop every managed DFS filesystem")
+
+	var updateBinary, updateInstaller string
+	update := &cobra.Command{Use: "update", Args: cobra.NoArgs, Short: "Update every managed DFS filesystem and preserve its running state",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			instances, err := dfsinstance.Discover(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if len(instances) == 0 {
+				return errors.New("no managed DFS filesystem instances found")
+			}
+			binary := updateBinary
+			if binary == "" {
+				binary, err = os.Executable()
+				if err != nil {
+					return err
+				}
+			}
+			if err := dfsinstance.Update(cmd.Context(), instances, binary, updateInstaller); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Updated %d DFS filesystem instance(s)\n", len(instances))
+			return nil
+		}}
+	update.Flags().StringVar(&updateBinary, "binary", "", "replacement DFS executable (defaults to this executable)")
+	update.Flags().StringVar(&updateInstaller, "installer", "", "service installer script (advanced)")
+	_ = update.Flags().MarkHidden("installer")
+
+	var uninstallAll, uninstallYes bool
+	uninstall := &cobra.Command{Use: "uninstall [name|id|repository]", Args: cobra.MaximumNArgs(1), Short: "Remove managed services while retaining DFS repository data",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			instances, err := dfsinstance.Discover(cmd.Context())
+			if err != nil {
+				return err
+			}
+			selected, err := selectManagedInstances(instances, args, uninstallAll)
+			if err != nil {
+				return err
+			}
+			if uninstallAll && !uninstallYes {
+				return errors.New("uninstalling every DFS instance requires --yes; repository data will be retained")
+			}
+			if err := dfsinstance.Uninstall(cmd.Context(), selected); err != nil {
+				return err
+			}
+			fmt.Fprintf(a.Out, "Uninstalled %d DFS filesystem instance(s); repository data was retained\n", len(selected))
+			return nil
+		}}
+	uninstall.Flags().BoolVar(&uninstallAll, "all", false, "uninstall every managed DFS filesystem")
+	uninstall.Flags().BoolVarP(&uninstallYes, "yes", "y", false, "confirm host-wide uninstall")
+
+	instancesCommand.AddCommand(list, stop, update, uninstall)
+	return instancesCommand
+}
+
+func selectManagedInstances(instances []dfsinstance.Instance, args []string, all bool) ([]dfsinstance.Instance, error) {
+	if all {
+		if len(args) != 0 {
+			return nil, errors.New("pass either one DFS instance selector or --all, not both")
+		}
+		if len(instances) == 0 {
+			return nil, errors.New("no managed DFS filesystem instances found")
+		}
+		return instances, nil
+	}
+	if len(args) != 1 {
+		return nil, errors.New("pass one DFS instance name, ID, or repository, or use --all")
+	}
+	selected, err := dfsinstance.Find(instances, args[0])
+	if err != nil {
+		return nil, err
+	}
+	return []dfsinstance.Instance{selected}, nil
+}
+
+func instanceStatus(instance dfsinstance.Instance) string {
+	if instance.CoreActive && instance.MountActive {
+		return "RUNNING"
+	}
+	if instance.Active() {
+		return "PARTIAL"
+	}
+	return "STOPPED"
 }
 
 func (a *App) transportCommand() *cobra.Command {
