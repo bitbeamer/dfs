@@ -256,7 +256,8 @@ instance port, role, repository and metadata size, physical cache and disk use, 
 holdings, pins, reconciliation, and timestamped peer observations.
 `health --scope cluster` actively collects those details from all responding members,
 compares namespace convergence, and verifies every directed peer edge. Use
-`--output json` with either form for complete machine-readable diagnostics; the normal
+`--output json` with either form for complete machine-readable diagnostics, including
+the result plus a `HEALTH_DEGRADED` error on a nonzero degraded-health exit; the normal
 terminal view shortens transport errors and avoids repeating them per peer.
 
 Pinning needs no manual file access. `dfs content pin <path> --scope local` saves a peer-local policy;

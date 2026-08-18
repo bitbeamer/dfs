@@ -48,6 +48,11 @@ type App struct {
 }
 
 func New() *cobra.Command {
+	root, _ := newRoot()
+	return root
+}
+
+func newRoot() (*cobra.Command, *App) {
 	app := &App{Out: os.Stdout, Err: os.Stderr, destination: os.Stdout}
 	root := &cobra.Command{
 		Use:           "dfs",
@@ -91,13 +96,7 @@ func New() *cobra.Command {
 		if !app.capturing {
 			return nil
 		}
-		var result any
-		trimmed := bytes.TrimSpace(app.capture.Bytes())
-		if len(trimmed) > 0 {
-			if err := json.Unmarshal(trimmed, &result); err != nil {
-				result = map[string]any{"text": string(trimmed)}
-			}
-		}
+		result := app.capturedResult()
 		scope := "filesystem"
 		path := cmd.CommandPath()
 		if strings.HasPrefix(path, "dfs service ") || path == "dfs upgrade" {
@@ -114,7 +113,19 @@ func New() *cobra.Command {
 	root.AddCommand(app.publicCommands()...)
 	root.AddCommand(app.internalCommand())
 	root.AddCommand(app.legacyRuntimeCommands()...)
-	return root
+	return root, app
+}
+
+func (a *App) capturedResult() any {
+	trimmed := bytes.TrimSpace(a.capture.Bytes())
+	if len(trimmed) == 0 {
+		return nil
+	}
+	var result any
+	if err := json.Unmarshal(trimmed, &result); err != nil {
+		return map[string]any{"text": string(trimmed)}
+	}
+	return result
 }
 
 func (a *App) instanceCommand() *cobra.Command {
@@ -769,7 +780,7 @@ func (e *JSONCommandError) Error() string { return e.Err.Error() }
 func (e *JSONCommandError) Unwrap() error { return e.Err }
 
 func Execute() error {
-	root := New()
+	root, app := newRoot()
 	err := root.Execute()
 	if err == nil {
 		return nil
@@ -783,8 +794,20 @@ func Execute() error {
 	if strings.HasPrefix(command, "dfs service ") || command == "dfs service" || command == "dfs upgrade" {
 		scope = "host"
 	}
-	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": "dfs.cli/v1", "command": command, "scope": scope, "error": map[string]any{"code": errorCode(err), "message": err.Error()}})
+	envelope := app.jsonErrorEnvelope(command, scope, err)
+	_ = json.NewEncoder(app.destination).Encode(envelope)
 	return &JSONCommandError{Err: err}
+}
+
+func (a *App) jsonErrorEnvelope(command, scope string, err error) map[string]any {
+	envelope := map[string]any{"schema": "dfs.cli/v1", "command": command, "scope": scope, "error": map[string]any{"code": errorCode(err), "message": err.Error()}}
+	if result := a.capturedResult(); result != nil {
+		envelope["result"] = result
+	}
+	if a.filesystemID != "" {
+		envelope["filesystem_id"] = a.filesystemID
+	}
+	return envelope
 }
 
 func publicCommandPath(root *cobra.Command, arguments []string) string {
@@ -814,6 +837,8 @@ func errorCode(err error) string {
 		return "NOT_FOUND"
 	case strings.Contains(message, "not approved"):
 		return "NOT_CONFIRMED"
+	case strings.Contains(message, "health is degraded"):
+		return "HEALTH_DEGRADED"
 	default:
 		return "OPERATION_FAILED"
 	}

@@ -354,7 +354,8 @@ discovered member in parallel, reports the same metrics for each responding
 peer, checks every directed connection, and compares online namespace tree IDs.
 The human-readable view is a compact peer and connection summary with shortened,
 deduplicated errors; `--output json` retains environment, service, and optional cluster
-objects with complete diagnostic details. The command exits unsuccessfully when
+objects with complete diagnostic details. A degraded JSON response retains that
+result alongside a stable `HEALTH_DEGRADED` error while exiting unsuccessfully. The command exits unsuccessfully when
 dependencies are missing or the cluster is incomplete or inconsistent.
 
 Content holdings count logical paths whose annex object is locally available;

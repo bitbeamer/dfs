@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,33 @@ import (
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
 )
+
+func TestDegradedJSONRetainsHealthResult(t *testing.T) {
+	app := &App{output: "json", filesystemID: strings.Repeat("a", 40)}
+	app.capture.WriteString(`{"cluster":{"complete":false,"namespace_status":"unknown"}}`)
+	envelope := app.jsonErrorEnvelope("dfs health", "cluster", errors.New("DFS cluster health is degraded"))
+	result, ok := envelope["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("captured result = %#v", envelope["result"])
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"complete":false`) {
+		t.Fatalf("degraded result was discarded: %s", encoded)
+	}
+	errorValue, ok := envelope["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error envelope = %#v", envelope["error"])
+	}
+	if code := errorValue["code"]; code != "HEALTH_DEGRADED" {
+		t.Fatalf("degraded health error code = %q", code)
+	}
+	if envelope["filesystem_id"] != strings.Repeat("a", 40) {
+		t.Fatalf("filesystem ID missing from degraded envelope: %#v", envelope)
+	}
+}
 
 func TestPrintNodeHealthIncludesOperationalDetailsAndActions(t *testing.T) {
 	report := peer.DiagnosticReport{

@@ -277,7 +277,11 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	}
 	if records, membershipErr := acceptedMembership(ctx, repo, filesystemID); membershipErr == nil {
 		for _, record := range records {
-			peers[record.Payload.PeerID] = MeshPeer{PeerID: record.Payload.PeerID, PeerName: record.Payload.Name}
+			participant := MeshPeer{PeerID: record.Payload.PeerID, PeerName: record.Payload.Name}
+			if existing, found := peers[record.Payload.PeerID]; found {
+				participant.Online = existing.Online
+			}
+			peers[record.Payload.PeerID] = participant
 		}
 	}
 	if offers, discoverErr := Discover(ctx, discoveryTimeout); discoverErr == nil {
