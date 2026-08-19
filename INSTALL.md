@@ -79,10 +79,11 @@ cd ~/dfs
 ```
 
 The script refuses dirty source state, updates directly from `origin/main`,
-builds a native candidate, previews the transaction, upgrades every local DFS
-service, and verifies the installed services and local health. It supports
-both ordinary Git checkouts and the project's local Jujutsu workflow. Use
-`--no-fetch` only to install the already checked-out commit.
+builds a native candidate, discovers managed installations from their service
+definitions (so `dfs` need not be on `PATH`), previews the transaction, upgrades
+every local DFS service, and verifies the installed services and local health.
+It supports both ordinary Git checkouts and the project's local Jujutsu
+workflow. Use `--no-fetch` only to install the already checked-out commit.
 
 Build the new binary in the DFS source checkout before replacing the running
 version:

@@ -71,9 +71,10 @@ fi
 
 make build
 candidate="$source_dir/bin/dfs"
-installed=$(command -v dfs || true)
+service_json=$("$candidate" service list --output json)
+installed=$(printf '%s\n' "$service_json" | grep -o '"binary":"[^"]*"' | sed 's/.*:"\([^"]*\)"/\1/' | head -n 1 || true)
 if [[ -z "$installed" ]]; then
-  printf 'No installed dfs executable is on PATH; complete dfs setup first.\n' >&2
+  printf 'No managed DFS installation was discovered; complete dfs setup first.\n' >&2
   exit 1
 fi
 
@@ -81,8 +82,8 @@ printf 'Candidate: %s\n' "$("$candidate" --version)"
 printf 'Installed: %s\n' "$("$installed" --version)"
 
 verify_host() {
-  "$installed" service list
-  service_json=$("$installed" service list --output json)
+  "$candidate" service list
+  service_json=$("$candidate" service list --output json)
   filesystem_ids=$(printf '%s\n' "$service_json" | grep -o '"filesystem_id":"[^"]*"' | sed 's/.*:"\([^"]*\)"/\1/' | sort -u)
   if [[ -z "$filesystem_ids" ]]; then
     printf 'The upgraded host reports no managed DFS filesystems.\n' >&2
@@ -90,7 +91,7 @@ verify_host() {
   fi
   while IFS= read -r filesystem_id; do
     [[ -n "$filesystem_id" ]] || continue
-    "$installed" health --filesystem "$filesystem_id"
+    "$candidate" health --filesystem "$filesystem_id"
   done <<<"$filesystem_ids"
 }
 
