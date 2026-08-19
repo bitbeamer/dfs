@@ -64,26 +64,27 @@ type State struct {
 }
 
 type Options struct {
-	Invitation          string
-	FileSystemID        string
-	Create              bool
-	NetworkName         string
-	Repository          string
-	Mountpoint          string
-	Name                string
-	GitName             string
-	GitEmail            string
-	CacheLimit          int64
-	Timeout             time.Duration
-	Resume              bool
-	Installer           string
-	Binary              string
-	PairingPort         int
-	VerificationTimeout time.Duration
-	Out                 io.Writer
-	Approve             func(*State) error
-	WaitForApproval     func(string) error
-	CheckCluster        func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error)
+	Invitation           string
+	FileSystemID         string
+	Create               bool
+	NetworkName          string
+	Repository           string
+	Mountpoint           string
+	Name                 string
+	GitName              string
+	GitEmail             string
+	CacheLimit           int64
+	Timeout              time.Duration
+	Resume               bool
+	Installer            string
+	Binary               string
+	PairingPort          int
+	VerificationTimeout  time.Duration
+	VerificationInterval time.Duration
+	Out                  io.Writer
+	Approve              func(*State) error
+	WaitForApproval      func(string) error
+	CheckCluster         func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error)
 }
 
 func StatePath(repositoryPath string) (string, error) {
@@ -233,6 +234,7 @@ func Run(ctx context.Context, options Options) (*State, error) {
 			}
 			result, joinErr := peer.PairAndJoinWithOptions(ctx, state.Invitation, state.Repository, state.Name, state.CacheLimit, time.Duration(state.Timeout), true, peer.PairOptions{
 				PeerID: state.PeerID, StateDirectory: pairingPath(path), PairingPort: state.PairingPort, GitName: state.GitName, GitEmail: state.GitEmail,
+				Progress: func(message string) { fmt.Fprintln(options.Out, message) },
 			})
 			if joinErr != nil {
 				return nil, joinErr
@@ -499,7 +501,13 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 	if discoveryTimeout <= 0 || discoveryTimeout > 2*time.Second {
 		discoveryTimeout = 2 * time.Second
 	}
+	interval := options.VerificationInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
 	var last []peer.SetupAcknowledgement
+	lastIncomplete := ""
+	unchangedIncomplete := 0
 	for {
 		if err := verifyCtx.Err(); err != nil {
 			return setupVerificationTimeout(options.Out, last, nil)
@@ -528,11 +536,22 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 				printSetupAcknowledgements(options.Out, acknowledgements)
 				return nil
 			}
+			signature := fmt.Sprintf("%#v", acknowledgements)
+			if signature == lastIncomplete {
+				unchangedIncomplete++
+			} else {
+				lastIncomplete = signature
+				unchangedIncomplete = 1
+				printSetupAcknowledgements(options.Out, acknowledgements)
+			}
+			if unchangedIncomplete >= 2 {
+				return errors.New("DFS cluster topology remained incomplete across consecutive checks; retry with dfs setup resume after the named online peers reconcile")
+			}
 		}
 		if err := verifyCtx.Err(); err != nil {
 			return setupVerificationTimeout(options.Out, last, nil)
 		}
-		timer := time.NewTimer(2 * time.Second)
+		timer := time.NewTimer(interval)
 		select {
 		case <-verifyCtx.Done():
 			timer.Stop()
@@ -574,6 +593,9 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 		if discoveryTimeout <= 0 {
 			discoveryTimeout = 3 * time.Second
 		}
+		if state.Approval.RequestID == "" {
+			fmt.Fprintln(out, "Discovering an online peer for the DFS join request...")
+		}
 		discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout+time.Second)
 		offers, err := peer.Discover(discoveryCtx, discoveryTimeout)
 		cancel()
@@ -591,6 +613,7 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 			return errors.New("selected DFS filesystem is no longer discoverable")
 		}
 		if state.Approval.RequestID == "" {
+			fmt.Fprintf(out, "Submitting DFS join request to %s...\n", joinOfferNames(selected.Offers))
 			credentials, err := peer.SubmitJoinRequest(ctx, selected, state.PeerID, state.Name, pairingPath(statePath), state.PairingPort, 15*time.Minute)
 			if err != nil {
 				return err
@@ -617,6 +640,7 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 		}
 		invitation, approved, err := peer.PollJoinApproval(ctx, selected, state.Approval)
 		if err == nil && approved {
+			fmt.Fprintln(out, "DFS join request approved; starting secure repository pairing...")
 			encoded, encodeErr := invitation.Encode()
 			if encodeErr != nil {
 				return encodeErr
@@ -636,6 +660,21 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+func joinOfferNames(offers []peer.Offer) string {
+	names := make([]string, 0, len(offers))
+	for _, offer := range offers {
+		if name := strings.TrimSpace(offer.PeerName); name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	names = slices.Compact(names)
+	if len(names) == 0 {
+		return "discovered peers"
+	}
+	return strings.Join(names, ", ")
 }
 
 func printJoinApprovalWait(out io.Writer, pendingPolls int) {

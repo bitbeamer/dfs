@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -179,6 +180,48 @@ func TestSetupClusterVerificationReportsExpiredDeadlineAsIncompleteTopology(t *t
 	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{Out: os.Stderr, CheckCluster: checker})
 	if err == nil || !strings.Contains(err.Error(), "online DFS members have not acknowledged") || strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("verification deadline error = %v", err)
+	}
+}
+
+func TestSetupClusterVerificationStopsAfterRepeatedUnchangedIncompleteTopology(t *testing.T) {
+	home := t.TempDir()
+	repositoryPath := filepath.Join(home, "repository")
+	repo, err := repository.InitWithIdentity(context.Background(), repositoryPath, "zeus", 1<<20,
+		repository.GitIdentity{Name: "DFS Test", Email: "dfs@example.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID := repo.Config.PeerID
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state := &State{Version: 1, Phase: PhaseMounted, Repository: repositoryPath, Mountpoint: filepath.Join(home, "mount"), PeerID: peerID,
+		VerificationTimeout: int64(time.Second), Timeout: int64(time.Millisecond)}
+	checks := 0
+	checker := func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error) {
+		checks++
+		return peer.MeshReport{
+			Peers:       []peer.MeshPeer{{PeerID: peerID, PeerName: "zeus"}, {PeerID: "iris-peer", PeerName: "iris"}},
+			Reports:     []peer.DiagnosticReport{{PeerID: peerID, ReconciliationStatus: "ready"}, {PeerID: "iris-peer", ReconciliationStatus: "ready"}},
+			Connections: []peer.MeshConnection{{FromPeerID: "iris-peer", ToPeerID: peerID, Status: "NOT_CONFIGURED"}},
+		}, nil
+	}
+	var output bytes.Buffer
+	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{
+		Out: &output, CheckCluster: checker, VerificationInterval: time.Millisecond,
+	})
+	if err == nil || !strings.Contains(err.Error(), "remained incomplete") || checks != 2 {
+		t.Fatalf("stable incomplete verification: checks=%d error=%v", checks, err)
+	}
+	if !strings.Contains(output.String(), "Cluster member iris: INCOMPLETE") {
+		t.Fatalf("stable incomplete progress was not reported:\n%s", output.String())
+	}
+}
+
+func TestJoinOfferNamesAreSortedAndDeduplicated(t *testing.T) {
+	offers := []peer.Offer{{PeerName: "iris"}, {PeerName: "ares"}, {PeerName: "iris"}}
+	if got := joinOfferNames(offers); got != "ares, iris" {
+		t.Fatalf("join offer names = %q", got)
 	}
 }
 

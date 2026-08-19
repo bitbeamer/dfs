@@ -34,6 +34,7 @@ type PairOptions struct {
 	PairingPort    int
 	GitName        string
 	GitEmail       string
+	Progress       func(string)
 }
 
 const pairingResumeFile = "pairing-resume.json"
@@ -105,8 +106,14 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		return nil, fmt.Errorf("create signed DFS membership: %w", err)
 	}
 	request.Membership = membershipDraft
+	progress := func(message string) {
+		if options.Progress != nil {
+			options.Progress(message)
+		}
+	}
 
 	var quicEndpoints []string
+	progress("Locating the approving DFS peer...")
 	discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout+time.Second)
 	offers, discoverErr := Discover(discoveryCtx, discoveryTimeout)
 	cancel()
@@ -137,6 +144,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 		endpoint string
 		startErr error
 	)
+	progress("Requesting the approved DFS pairing session...")
 	for _, candidate := range quicEndpoints {
 		startErr = postPair(ctx, candidate, invitation.CertificateSHA256, "pair-start", request, &start)
 		if startErr == nil {
@@ -165,6 +173,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if !strings.HasPrefix(endpoint, "quic://") {
 		return nil, errors.New("pairing peer did not provide a QUIC bootstrap endpoint")
 	}
+	progress(fmt.Sprintf("Approval confirmed by %s; downloading the DFS repository...", start.PeerName))
 	bundlePath := filepath.Join(temporary, "repository.bundle")
 	if err := managed.PairClone(ctx, endpoint, invitation.CertificateSHA256, start.SessionID, start.CompletionSecret, bundlePath); err != nil {
 		return nil, fmt.Errorf("clone paired DFS repository over QUIC: %w", err)
@@ -192,6 +201,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := repo.SaveConfig(); err != nil {
 		return nil, fmt.Errorf("save paired DFS identity: %w", err)
 	}
+	progress("Repository downloaded; configuring trusted DFS membership...")
 	if err := os.Rename(membership.KeyPath(temporary), membership.KeyPath(repo.Config.Repository)); err != nil {
 		return nil, fmt.Errorf("install DFS membership private key: %w", err)
 	}
@@ -254,6 +264,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := savePairingResume(repo.Config.Repository, resume); err != nil {
 		return nil, err
 	}
+	progress(fmt.Sprintf("Completing reciprocal DFS pairing with %s...", start.PeerName))
 	var complete PairCompleteResponse
 	if err := postPair(ctx, endpoint, invitation.CertificateSHA256, "pair-complete", PairCompleteRequest{
 		SessionID: start.SessionID, CompletionSecret: start.CompletionSecret,
@@ -263,6 +274,7 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := removePairingResume(repo.Config.Repository); err != nil {
 		return nil, err
 	}
+	progress("Reciprocal pairing completed; reconciling DFS membership...")
 	if err := ReconcileMembership(ctx, repo); err != nil {
 		return nil, fmt.Errorf("reconcile DFS membership: %w", err)
 	}

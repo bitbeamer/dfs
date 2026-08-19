@@ -223,7 +223,10 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(home, "laptop")
-	result, err := PairAndJoin(ctx, encoded, destination, "laptop", 5<<20, 20*time.Millisecond, true)
+	var progress []string
+	result, err := PairAndJoinWithOptions(ctx, encoded, destination, "laptop", 5<<20, 20*time.Millisecond, true, PairOptions{
+		Progress: func(message string) { progress = append(progress, message) },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +236,11 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 	if result.ReverseRemoteName == "" {
 		t.Fatal("pairing did not configure a reverse remote")
+	}
+	for _, wanted := range []string{"Locating the approving DFS peer", "Approval confirmed by desktop", "Repository downloaded", "Completing reciprocal DFS pairing with desktop", "Reciprocal pairing completed"} {
+		if !slices.ContainsFunc(progress, func(message string) bool { return strings.Contains(message, wanted) }) {
+			t.Fatalf("pairing progress %#v does not contain %q", progress, wanted)
+		}
 	}
 	existingID, err := existing.FileSystemID(ctx)
 	if err != nil {
