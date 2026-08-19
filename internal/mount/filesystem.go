@@ -38,6 +38,7 @@ type FileSystem struct {
 	logger           *slog.Logger
 	writesMu         sync.Mutex
 	writes           map[string]*writeSession
+	closing          map[string]chan struct{}
 	cacheInvalidator contentInvalidator
 }
 
@@ -86,7 +87,7 @@ func NewFileSystemWithContext(ctx context.Context, api core.API, notifier change
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &FileSystem{FileSystem: pathfs.NewDefaultFileSystem(), core: api, lifetime: ctx,
-		notifier: notifier, logger: logger, writes: make(map[string]*writeSession)}
+		notifier: notifier, logger: logger, writes: make(map[string]*writeSession), closing: make(map[string]chan struct{})}
 }
 
 func status(err error) fuse.Status {
@@ -180,9 +181,20 @@ func dirMode(kind core.Kind, mode uint32) uint32 {
 }
 
 func (f *FileSystem) session(path string) *writeSession {
-	f.writesMu.Lock()
-	defer f.writesMu.Unlock()
-	return f.writes[path]
+	for {
+		f.writesMu.Lock()
+		session := f.writes[path]
+		done := f.closing[path]
+		f.writesMu.Unlock()
+		if session != nil || done == nil {
+			return session
+		}
+		select {
+		case <-done:
+		case <-f.lifetime.Done():
+			return nil
+		}
+	}
 }
 
 func (f *FileSystem) GetAttr(name string, _ *fuse.Context) (*fuse.Attr, fuse.Status) {
@@ -256,22 +268,36 @@ func (f *FileSystem) OpenDir(name string, _ *fuse.Context) ([]fuse.DirEntry, fus
 		}
 		return result, fuse.OK
 	}
+	type stagedWrite struct {
+		path    string
+		session *writeSession
+	}
+	staged := make([]stagedWrite, 0, len(f.writes))
+	for candidate, session := range f.writes {
+		staged = append(staged, stagedWrite{path: candidate, session: session})
+	}
+	f.writesMu.Unlock()
 	byName := make(map[string]fuse.DirEntry, len(page.Entries))
 	for _, entry := range page.Entries {
 		byName[entry.Name] = fuse.DirEntry{Name: entry.Name, Mode: dirMode(entry.Kind, entry.Mode), Ino: entry.Inode}
 	}
-	for candidate, session := range f.writes {
+	for _, write := range staged {
+		candidate, session := write.path, write.session
 		if filepath.ToSlash(filepath.Dir(candidate)) != emptyAsDot(path) {
 			continue
 		}
-		session.mu.Lock()
+		// Directory enumeration must never queue behind a slow fsync/commit for
+		// one staged file. The backing entry is already present for existing
+		// files; a busy new file will appear on the next kernel lookup.
+		if !session.mu.TryLock() {
+			continue
+		}
 		if !session.removed {
 			name := filepath.Base(candidate)
 			byName[name] = fuse.DirEntry{Name: name, Mode: dirMode(session.attributes.Kind, session.attributes.Mode), Ino: session.attributes.Inode}
 		}
 		session.mu.Unlock()
 	}
-	f.writesMu.Unlock()
 	result := make([]fuse.DirEntry, 0, len(byName))
 	for _, entry := range byName {
 		result = append(result, entry)
@@ -331,10 +357,23 @@ func (f *FileSystem) Create(name string, flags, mode uint32, _ *fuse.Context) (n
 }
 
 func (f *FileSystem) openWrite(path string, flags uint32, create bool, modes ...uint32) (nodefs.File, fuse.Status) {
-	f.writesMu.Lock()
+	for {
+		f.writesMu.Lock()
+		done := f.closing[path]
+		if done == nil {
+			break
+		}
+		f.writesMu.Unlock()
+		select {
+		case <-done:
+		case <-f.lifetime.Done():
+			return nil, fuse.EINTR
+		}
+	}
 	if session := f.writes[path]; session != nil {
-		session.mu.Lock()
 		session.refs++
+		f.writesMu.Unlock()
+		session.mu.Lock()
 		writable := flags&syscall.O_ACCMODE != syscall.O_RDONLY
 		if writable && flags&syscall.O_TRUNC != 0 {
 			size := int64(0)
@@ -344,11 +383,9 @@ func (f *FileSystem) openWrite(path string, flags uint32, create bool, modes ...
 				session.dirty = true
 			}
 			session.mu.Unlock()
-			f.writesMu.Unlock()
 			return &adapterFile{File: nodefs.NewDefaultFile(), filesystem: f, session: session, writable: writable}, status(err)
 		}
 		session.mu.Unlock()
-		f.writesMu.Unlock()
 		return &adapterFile{File: nodefs.NewDefaultFile(), filesystem: f, session: session, writable: writable}, fuse.OK
 	}
 	mode := uint32(0o644)
@@ -652,14 +689,24 @@ func (a *adapterFile) Release() { a.release.Do(func() { a.filesystem.releaseWrit
 
 func (f *FileSystem) releaseWrite(session *writeSession) {
 	f.writesMu.Lock()
-	session.mu.Lock()
 	session.refs--
 	final := session.refs == 0
 	if !final {
-		session.mu.Unlock()
 		f.writesMu.Unlock()
 		return
 	}
+	path := session.path
+	done := make(chan struct{})
+	if f.closing == nil {
+		f.closing = make(map[string]chan struct{})
+	}
+	f.closing[path] = done
+	if f.writes[path] == session {
+		delete(f.writes, path)
+	}
+	f.writesMu.Unlock()
+
+	session.mu.Lock()
 	var err error
 	if session.removed || session.failure != nil || !session.dirty {
 		err = session.transaction.Abort(context.Background())
@@ -668,11 +715,13 @@ func (f *FileSystem) releaseWrite(session *writeSession) {
 		err = session.transaction.Commit(commitCtx)
 		cancel()
 	}
-	path, changed := session.path, err == nil && session.dirty && !session.removed
-	if f.writes[session.path] == session {
-		delete(f.writes, session.path)
-	}
+	changed := err == nil && session.dirty && !session.removed
 	session.mu.Unlock()
+	f.writesMu.Lock()
+	if f.closing[path] == done {
+		delete(f.closing, path)
+		close(done)
+	}
 	f.writesMu.Unlock()
 	if f.notifier != nil {
 		f.notifier.EndWrite()

@@ -28,6 +28,22 @@ type recordingNotifier struct {
 	ends   int
 }
 
+type blockingCommitTransaction struct {
+	core.WriteTransaction
+	started chan struct{}
+	finish  chan struct{}
+}
+
+func (t *blockingCommitTransaction) Commit(ctx context.Context) error {
+	close(t.started)
+	select {
+	case <-t.finish:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (n *recordingNotifier) Notify(reason string) {
 	n.mu.Lock()
 	n.notify = append(n.notify, reason)
@@ -138,6 +154,61 @@ func TestMultipleHandlesShareOneWriteUntilFinalRelease(t *testing.T) {
 	second.Release()
 	if content, err := os.ReadFile(filepath.Join(root, "shared.txt")); err != nil || string(content) != "firstsecond" {
 		t.Fatalf("shared content = %q, %v", content, err)
+	}
+}
+
+func TestSlowWriteCommitDoesNotBlockUnrelatedDirectoryReads(t *testing.T) {
+	filesystem, _, _ := testFileSystem(t, t.TempDir())
+	transaction := &blockingCommitTransaction{started: make(chan struct{}), finish: make(chan struct{})}
+	session := &writeSession{transaction: transaction, path: "slow.txt", refs: 1, dirty: true}
+	filesystem.writes[session.path] = session
+	released := make(chan struct{})
+	go func() {
+		filesystem.releaseWrite(session)
+		close(released)
+	}()
+	<-transaction.started
+
+	directoryRead := make(chan fuse.Status, 1)
+	go func() {
+		_, status := filesystem.OpenDir("", nil)
+		directoryRead <- status
+	}()
+	select {
+	case status := <-directoryRead:
+		if status != fuse.OK {
+			t.Fatalf("directory read during unrelated commit = %v", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated directory read blocked behind write commit")
+	}
+	close(transaction.finish)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("write release did not complete")
+	}
+}
+
+func TestBusyWriteSessionDoesNotBlockDirectoryReads(t *testing.T) {
+	filesystem, _, _ := testFileSystem(t, t.TempDir())
+	session := &writeSession{path: "busy.txt", refs: 1, dirty: true}
+	filesystem.writes[session.path] = session
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	directoryRead := make(chan fuse.Status, 1)
+	go func() {
+		_, status := filesystem.OpenDir("", nil)
+		directoryRead <- status
+	}()
+	select {
+	case status := <-directoryRead:
+		if status != fuse.OK {
+			t.Fatalf("directory read during busy write = %v", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("directory read blocked behind busy write session")
 	}
 }
 
