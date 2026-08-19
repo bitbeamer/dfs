@@ -821,6 +821,9 @@ func addScopeFlag(command *cobra.Command) {
 				return err
 			}
 		}
+		if !cmd.Flags().Changed("scope") && cmd.Flags().Changed("cluster") {
+			return nil
+		}
 		switch scope {
 		case "local":
 			return cluster.Value.Set("false")

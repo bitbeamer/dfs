@@ -192,7 +192,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			report.ReconciliationStatus = "pending"
 			report.Issues = append(report.Issues, HealthIssue{Code: "RECONCILIATION_PENDING", Severity: "warning",
 				Detail: fmt.Sprintf("%d accepted member(s) are not configured as local peers", expected-len(remotes)),
-				Action: "keep peers online and run dfs sync; use dfs health --cluster to identify incomplete edges"})
+				Action: "keep peers online and run dfs sync; use dfs health --scope cluster to identify incomplete edges"})
 		}
 	}
 	if report.Role == "" {
@@ -248,7 +248,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 			report.Remotes = append(report.Remotes, check)
 			if !check.Reachable {
 				report.Issues = append(report.Issues, HealthIssue{Code: "PEER_UNREACHABLE", Severity: "warning",
-					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs health --cluster"})
+					Detail: check.Name + ": " + check.Error, Action: "check the peer daemon and firewall, then run dfs health --scope cluster"})
 			}
 		}
 	}
@@ -432,7 +432,7 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 		result.NamespaceStatus = "inconsistent"
 		result.Complete = false
 		result.Issues = append(result.Issues, HealthIssue{Code: "NAMESPACE_DIVERGED", Severity: "error",
-			Detail: "online peers report different logical namespace trees", Action: "run dfs sync on the affected peers and repeat dfs health --cluster"})
+			Detail: "online peers report different logical namespace trees", Action: "run dfs sync on the affected peers and repeat dfs health --scope cluster"})
 	} else if len(result.Reports) < len(result.Peers) || missingTree {
 		result.NamespaceStatus = "unknown"
 		result.Complete = false
@@ -440,7 +440,7 @@ func evaluateMesh(peers map[string]MeshPeer, reports map[string]DiagnosticReport
 	if len(clusterPinPolicies) > 1 {
 		result.Complete = false
 		result.Issues = append(result.Issues, HealthIssue{Code: "CLUSTER_PIN_POLICY_DIVERGED", Severity: "error",
-			Detail: "online peers report different replicated cluster pin policies", Action: "keep peers online until reconciliation completes, then repeat dfs health --cluster"})
+			Detail: "online peers report different replicated cluster pin policies", Action: "keep peers online until reconciliation completes, then repeat dfs health --scope cluster"})
 	}
 	return result
 }

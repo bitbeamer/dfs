@@ -2,15 +2,20 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	dfscore "github.com/bitbeamer/dfs/internal/daemon"
 	"github.com/bitbeamer/dfs/internal/optimization"
 	"github.com/bitbeamer/dfs/internal/peer"
 	"github.com/bitbeamer/dfs/internal/repository"
+	"github.com/spf13/cobra"
 )
 
 func TestDegradedJSONRetainsHealthResult(t *testing.T) {
@@ -105,6 +110,47 @@ func TestHealthUsesExplicitScopeFlag(t *testing.T) {
 	}
 	if flag := command.Flags().Lookup("cluster"); flag == nil || !flag.Hidden {
 		t.Error("health command does not hide the legacy --cluster flag")
+	}
+}
+
+func TestLegacyHealthClusterFlagIsNotOverriddenByDefaultScope(t *testing.T) {
+	var cluster bool
+	command := &cobra.Command{Use: "health", RunE: func(*cobra.Command, []string) error { return nil }}
+	command.Flags().BoolVar(&cluster, "cluster", false, "")
+	addScopeFlag(command)
+	command.SetArgs([]string{"--cluster"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !cluster {
+		t.Fatal("legacy --cluster flag was silently reset by the default local scope")
+	}
+}
+
+func TestRefreshOperationalHealthReplacesCachedObservation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git-annex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	repo, err := repository.InitWithIdentity(context.Background(), filepath.Join(home, "repository"), "iris", 1<<20,
+		repository.GitIdentity{Name: "Health Test", Email: "health@example.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	stale := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	report := dfscore.HealthReport{Operational: &peer.DiagnosticReport{PeerName: "cached", ObservedAt: stale}, OperationalError: "cached error"}
+	if err := refreshOperationalHealth(context.Background(), repo.Config.Repository, repo, &report, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if report.Operational == nil || report.Operational.PeerName != "iris" || !report.Operational.ObservedAt.After(stale) || report.OperationalError != "" {
+		t.Fatalf("fresh operational health did not replace cached observation: %+v", report)
 	}
 }
 

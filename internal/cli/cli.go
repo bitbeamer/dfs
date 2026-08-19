@@ -1374,25 +1374,32 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 				return errors.Join(environmentErr, err)
 			}
 			report, healthErr := dfscore.CheckHealth(repositoryPath)
-			if healthErr == nil && report.Operational != nil {
-				if state, stateErr := optimization.LoadCurrent(repositoryPath, report.Operational.FileSystemID, report.Operational.PeerID); stateErr == nil {
-					report.Operational.Optimization = &state
-				}
-			}
 			var clusterReport *peer.MeshReport
-			var clusterErr error
-			if cluster && healthErr == nil {
-				repo, openErr := a.open()
-				if openErr != nil {
-					clusterErr = openErr
-				} else {
-					defer repo.Close()
+			var diagnosticErr, clusterErr error
+			repo, openErr := repository.Open(repositoryPath)
+			if openErr != nil {
+				diagnosticErr = openErr
+				setOperationalHealth(repositoryPath, &report, peer.DiagnosticReport{}, openErr)
+			} else {
+				defer repo.Close()
+				if cluster {
 					meshReport, meshErr := peer.CheckMesh(cmd.Context(), repo, discoveryTimeout, peerTimeout)
 					clusterReport = &meshReport
 					clusterErr = meshErr
+					if local, found := meshDiagnostic(meshReport, repo.Config.PeerID); found {
+						setOperationalHealth(repositoryPath, &report, local, nil)
+					} else {
+						localErr := meshErr
+						if localErr == nil {
+							localErr = errors.New("local DFS health was not reported by the cluster check")
+						}
+						setOperationalHealth(repositoryPath, &report, peer.DiagnosticReport{}, localErr)
+					}
 					if meshErr == nil && !meshReport.Complete {
 						clusterErr = errors.New("DFS cluster health is degraded")
 					}
+				} else {
+					diagnosticErr = refreshOperationalHealth(cmd.Context(), repositoryPath, repo, &report, peerTimeout)
 				}
 			}
 			if asJSON {
@@ -1415,7 +1422,7 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 					printMeshHealth(a.Out, *clusterReport)
 				}
 			}
-			return errors.Join(environmentErr, healthErr, clusterErr)
+			return errors.Join(environmentErr, healthErr, diagnosticErr, clusterErr)
 		},
 	}
 	if deprecated {
@@ -1426,6 +1433,34 @@ func (a *App) newHealthCommand(name string, deprecated bool) *cobra.Command {
 	cmd.Flags().DurationVar(&discoveryTimeout, "discovery-timeout", 2*time.Second, "how long to discover peers for the cluster check")
 	cmd.Flags().DurationVar(&peerTimeout, "peer-timeout", 10*time.Second, "maximum time for each peer health probe")
 	return cmd
+}
+
+func refreshOperationalHealth(ctx context.Context, repositoryPath string, repo *repository.Repository, report *dfscore.HealthReport, timeout time.Duration) error {
+	diagnostic, err := peer.Diagnose(ctx, repo, timeout)
+	setOperationalHealth(repositoryPath, report, diagnostic, err)
+	return err
+}
+
+func setOperationalHealth(repositoryPath string, report *dfscore.HealthReport, diagnostic peer.DiagnosticReport, err error) {
+	if err != nil {
+		report.Operational = nil
+		report.OperationalError = err.Error()
+		return
+	}
+	if state, stateErr := optimization.LoadCurrent(repositoryPath, diagnostic.FileSystemID, diagnostic.PeerID); stateErr == nil {
+		diagnostic.Optimization = &state
+	}
+	report.Operational = &diagnostic
+	report.OperationalError = ""
+}
+
+func meshDiagnostic(report peer.MeshReport, peerID string) (peer.DiagnosticReport, bool) {
+	for _, diagnostic := range report.Reports {
+		if diagnostic.PeerID == peerID {
+			return diagnostic, true
+		}
+	}
+	return peer.DiagnosticReport{}, false
 }
 
 func printServiceHealth(output io.Writer, report dfscore.HealthReport) {
