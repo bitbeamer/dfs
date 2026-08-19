@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +54,36 @@ type nodeContentInvalidator struct {
 	paths       entryNotifier
 	directories directoryChangeNotifier
 	logger      *slog.Logger
+	gate        *invalidationGate
+}
+
+type invalidationGate struct {
+	sync.RWMutex
+	ready bool
+}
+
+func (g *invalidationGate) enable() {
+	g.Lock()
+	g.ready = true
+	g.Unlock()
+}
+
+func (g *invalidationGate) disable() {
+	g.Lock()
+	g.ready = false
+	g.Unlock()
+}
+
+func (i nodeContentInvalidator) begin() (func(), bool) {
+	if i.gate == nil {
+		return func() {}, true
+	}
+	i.gate.RLock()
+	if !i.gate.ready {
+		i.gate.RUnlock()
+		return nil, false
+	}
+	return i.gate.RUnlock, true
 }
 
 type entryNotifier interface {
@@ -65,12 +96,22 @@ func (i nodeContentInvalidator) InvalidateContent(path string) {
 	// avoid nesting a FUSE upcall, while retaining the vnode and its read
 	// offset. Tail receives a content event without a replacement event.
 	time.AfterFunc(10*time.Millisecond, func() {
+		done, ready := i.begin()
+		if !ready {
+			return
+		}
+		defer done()
 		i.paths.FileNotify(path, 0, 0)
 	})
 }
 
 func (i nodeContentInvalidator) InvalidateEntry(path string) {
 	time.AfterFunc(10*time.Millisecond, func() {
+		done, ready := i.begin()
+		if !ready {
+			return
+		}
+		defer done()
 		// Do not mutate pathfs's internal node tree here. RmChild races active
 		// lookups on macOS and can leave a name lookup blocked indefinitely.
 		// If the changed path's parent is not represented in that tree, walk up
@@ -162,10 +203,12 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	pathNodes := pathfs.NewPathNodeFs(filesystem, &pathfs.PathNodeFsOptions{ClientInodes: false})
 	directoryNotifier := newDirectoryChangeNotifier(mountpoint, logger.With("component", "desktop"))
 	defer directoryNotifier.Close()
+	invalidationState := &invalidationGate{}
 	invalidator := nodeContentInvalidator{
 		paths:       pathNodes,
 		directories: directoryNotifier,
 		logger:      logger.With("component", "fuse"),
+		gate:        invalidationState,
 	}
 	filesystem.cacheInvalidator = invalidator
 	frontendEvents, err := wakeup.ListenFrontend(repo.Config.Repository)
@@ -208,6 +251,8 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		logger.Error("mount failed", "mountpoint", mountpoint, "error", err)
 		return fmt.Errorf("mount DFS at %s: %w; if the mountpoint is stale, run dfs internal unmount %s before retrying", mountpoint, err, mountpoint)
 	}
+	invalidationState.enable()
+	defer invalidationState.disable()
 	logger.Info("mount ready", "mountpoint", mountpoint)
 	serveDone := make(chan struct{})
 	go func() {
@@ -215,6 +260,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		close(serveDone)
 	}()
 	shutdown, shutdownReason := waitForMountStop(ctx, options.Signals, serveDone)
+	invalidationState.disable()
 	// Cancel FUSE operations before asking the kernel to unmount. In particular,
 	// an on-demand content fetch must not keep macFUSE teardown blocked after the
 	// daemon has received SIGTERM.

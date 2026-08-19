@@ -23,6 +23,18 @@ type recordingEntryNotifier struct {
 	calls    []entryNotifyCall
 }
 
+type channelEntryNotifier struct{ calls chan string }
+
+func (n channelEntryNotifier) FileNotify(path string, _ int64, _ int64) fuse.Status {
+	n.calls <- path
+	return fuse.OK
+}
+
+func (n channelEntryNotifier) EntryNotify(directory, name string) fuse.Status {
+	n.calls <- filepath.Join(directory, name)
+	return fuse.OK
+}
+
 func (n *recordingEntryNotifier) FileNotify(string, int64, int64) fuse.Status {
 	return fuse.OK
 }
@@ -69,6 +81,30 @@ func TestInvalidateEntryStopsOnNonMissingFailure(t *testing.T) {
 	if len(notifier.calls) != 1 {
 		t.Fatalf("EntryNotify call count = %d, want 1", len(notifier.calls))
 	}
+}
+
+func TestInvalidationWaitsUntilFuseMountIsReady(t *testing.T) {
+	gate := &invalidationGate{}
+	calls := make(chan string, 1)
+	invalidator := nodeContentInvalidator{paths: channelEntryNotifier{calls: calls}, gate: gate}
+	invalidator.InvalidateEntry("directory/file.txt")
+	select {
+	case call := <-calls:
+		t.Fatalf("inactive mount received invalidation for %q", call)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	gate.enable()
+	invalidator.InvalidateEntry("directory/file.txt")
+	select {
+	case call := <-calls:
+		if call != filepath.Join("directory", "file.txt") {
+			t.Fatalf("invalidation path = %q", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ready mount did not receive invalidation")
+	}
+	gate.disable()
 }
 
 type failingUnmountServer struct{ err error }
