@@ -274,9 +274,9 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := removePairingResume(repo.Config.Repository); err != nil {
 		return nil, err
 	}
-	progress("Reciprocal pairing completed; reconciling DFS membership...")
-	if err := ReconcileMembership(ctx, repo); err != nil {
-		return nil, fmt.Errorf("reconcile DFS membership: %w", err)
+	progress("Reciprocal pairing completed; configuring local DFS membership...")
+	if err := ConfigureMembership(ctx, repo); err != nil {
+		return nil, fmt.Errorf("configure local DFS membership: %w", err)
 	}
 	keepOpen = true
 	return &JoinResult{

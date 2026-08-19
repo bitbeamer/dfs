@@ -95,24 +95,12 @@ func validatePairingMembership(record membership.Record, filesystemID, peerID, n
 }
 
 func ReconcileMembership(ctx context.Context, repo *repository.Repository) error {
-	filesystemID, err := repo.FileSystemID(ctx)
-	if err != nil {
+	if err := ConfigureMembership(ctx, repo); err != nil {
 		return err
 	}
 	remotes, err := repo.Remotes(ctx)
 	if err != nil {
 		return err
-	}
-	if _, superseded, stateErr := acceptedMembershipState(ctx, repo, filesystemID); stateErr == nil {
-		for _, remote := range supersededRemoteNames(remotes, superseded) {
-			if err := repo.RemovePeer(ctx, remote); err != nil {
-				return fmt.Errorf("remove superseded DFS peer %s: %w", remote, err)
-			}
-		}
-		remotes, err = repo.Remotes(ctx)
-		if err != nil {
-			return err
-		}
 	}
 	remoteNames := make([]string, 0, len(remotes))
 	for _, remote := range remotes {
@@ -120,6 +108,21 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 	}
 	if err := membership.Sync(ctx, repo.Config.Repository, remoteNames); err != nil {
 		return fmt.Errorf("synchronize DFS membership metadata: %w", err)
+	}
+	return ConfigureMembership(ctx, repo)
+}
+
+// ConfigureMembership applies already-available signed membership metadata to
+// this repository without contacting peers. Network reconciliation belongs to
+// the running core and must not delay pairing or service installation.
+func ConfigureMembership(ctx context.Context, repo *repository.Repository) error {
+	filesystemID, err := repo.FileSystemID(ctx)
+	if err != nil {
+		return err
+	}
+	remotes, err := repo.Remotes(ctx)
+	if err != nil {
+		return err
 	}
 	if shared, err := membership.LoadFilesystemConfig(repo.Config.Repository, filesystemID); err == nil {
 		if shared.Name != repo.Config.NetworkName {

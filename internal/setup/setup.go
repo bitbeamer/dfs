@@ -64,27 +64,26 @@ type State struct {
 }
 
 type Options struct {
-	Invitation           string
-	FileSystemID         string
-	Create               bool
-	NetworkName          string
-	Repository           string
-	Mountpoint           string
-	Name                 string
-	GitName              string
-	GitEmail             string
-	CacheLimit           int64
-	Timeout              time.Duration
-	Resume               bool
-	Installer            string
-	Binary               string
-	PairingPort          int
-	VerificationTimeout  time.Duration
-	VerificationInterval time.Duration
-	Out                  io.Writer
-	Approve              func(*State) error
-	WaitForApproval      func(string) error
-	CheckCluster         func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error)
+	Invitation          string
+	FileSystemID        string
+	Create              bool
+	NetworkName         string
+	Repository          string
+	Mountpoint          string
+	Name                string
+	GitName             string
+	GitEmail            string
+	CacheLimit          int64
+	Timeout             time.Duration
+	Resume              bool
+	Installer           string
+	Binary              string
+	PairingPort         int
+	VerificationTimeout time.Duration
+	Out                 io.Writer
+	Approve             func(*State) error
+	WaitForApproval     func(string) error
+	CheckCluster        func(context.Context, *repository.Repository, time.Duration, time.Duration) (peer.MeshReport, error)
 }
 
 func StatePath(repositoryPath string) (string, error) {
@@ -251,14 +250,15 @@ func Run(ctx context.Context, options Options) (*State, error) {
 		}
 	}
 	if before(state.Phase, PhaseMembershipReconciled) {
+		fmt.Fprintln(options.Out, "Configuring local DFS membership...")
 		repo, openErr := repository.Open(state.Repository)
 		if openErr != nil {
 			return nil, openErr
 		}
-		reconcileErr := peer.ReconcileMembership(ctx, repo)
+		reconcileErr := peer.ConfigureMembership(ctx, repo)
 		closeErr := repo.Close()
 		if reconcileErr != nil {
-			return nil, fmt.Errorf("reconcile DFS membership: %w", reconcileErr)
+			return nil, fmt.Errorf("configure local DFS membership: %w", reconcileErr)
 		}
 		if closeErr != nil {
 			return nil, closeErr
@@ -501,18 +501,12 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 	if discoveryTimeout <= 0 || discoveryTimeout > 2*time.Second {
 		discoveryTimeout = 2 * time.Second
 	}
-	interval := options.VerificationInterval
-	if interval <= 0 {
-		interval = 2 * time.Second
-	}
 	var last []peer.SetupAcknowledgement
-	lastIncomplete := ""
-	unchangedIncomplete := 0
 	for {
 		if err := verifyCtx.Err(); err != nil {
 			return setupVerificationTimeout(options.Out, last, nil)
 		}
-		report, checkErr := checker(verifyCtx, repo, discoveryTimeout, 5*time.Second)
+		report, checkErr := checker(verifyCtx, repo, discoveryTimeout, 2*time.Second)
 		if checkErr == nil {
 			acknowledgements, ready := peer.EvaluateSetupAcknowledgements(report)
 			localReady := false
@@ -522,10 +516,11 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 					break
 				}
 			}
-			ready = ready && localReady
+			clusterReady := ready
+			ready = localReady
 			state.Acknowledgements = acknowledgements
 			state.UpdatedAt = time.Now().UTC()
-			if ready {
+			if localReady {
 				state.ClusterVerifiedAt = state.UpdatedAt
 			}
 			if err := save(statePath, state); err != nil {
@@ -534,24 +529,16 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 			last = acknowledgements
 			if ready {
 				printSetupAcknowledgements(options.Out, acknowledgements)
+				if !clusterReady {
+					fmt.Fprintln(options.Out, "DFS setup is locally ready; incomplete remote topology will continue reconciling in the background.")
+				}
 				return nil
-			}
-			signature := fmt.Sprintf("%#v", acknowledgements)
-			if signature == lastIncomplete {
-				unchangedIncomplete++
-			} else {
-				lastIncomplete = signature
-				unchangedIncomplete = 1
-				printSetupAcknowledgements(options.Out, acknowledgements)
-			}
-			if unchangedIncomplete >= 2 {
-				return errors.New("DFS cluster topology remained incomplete across consecutive checks; retry with dfs setup resume after the named online peers reconcile")
 			}
 		}
 		if err := verifyCtx.Err(); err != nil {
 			return setupVerificationTimeout(options.Out, last, nil)
 		}
-		timer := time.NewTimer(interval)
+		timer := time.NewTimer(2 * time.Second)
 		select {
 		case <-verifyCtx.Done():
 			timer.Stop()
@@ -569,7 +556,7 @@ func setupVerificationTimeout(out io.Writer, last []peer.SetupAcknowledgement, c
 	if checkErr != nil && !errors.Is(checkErr, context.DeadlineExceeded) && !errors.Is(checkErr, context.Canceled) {
 		return fmt.Errorf("verify directed DFS cluster: %w", checkErr)
 	}
-	return errors.New("online DFS members have not acknowledged every directed cluster connection; retry with dfs setup resume")
+	return errors.New("local DFS peer did not become ready before the setup verification deadline; retry with dfs setup resume")
 }
 
 func printSetupAcknowledgements(out io.Writer, acknowledgements []peer.SetupAcknowledgement) {

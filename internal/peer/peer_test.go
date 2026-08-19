@@ -321,6 +321,104 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 }
 
+func TestPairAndJoinSupersedesPurgedAndRejoinedPeer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git-annex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Rejoin Test\nemail = rejoin@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	existing, err := repository.Init(ctx, filepath.Join(home, "ares"), "ares", 10<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer existing.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := startService(existing, nil, listener, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	service.runBackground = func(func()) {}
+
+	destination := filepath.Join(home, "zeus")
+	joinZeus := func() *JoinResult {
+		t.Helper()
+		invitation, err := CreateInvitation(existing, 5*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		invitation.QUICEndpoint = "quic://" + listener.Addr().String()
+		encoded, err := invitation.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := PairAndJoin(ctx, encoded, destination, "zeus", 5<<20, 20*time.Millisecond, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	first := joinZeus()
+	oldPeerID := first.Repository.Config.PeerID
+	if err := first.Repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(destination); err != nil {
+		t.Fatal(err)
+	}
+
+	second := joinZeus()
+	defer second.Repository.Close()
+	newPeerID := second.Repository.Config.PeerID
+	if newPeerID == oldPeerID {
+		t.Fatalf("purged Zeus reused peer identity %q", oldPeerID)
+	}
+	if err := ConfigureMembership(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+
+	remotes, err := existing.Remotes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRemote := remoteName(oldPeerID)
+	newRemote := remoteName(newPeerID)
+	if slices.ContainsFunc(remotes, func(remote repository.Remote) bool { return remote.Name == oldRemote }) {
+		t.Fatalf("purged Zeus remote %q remains configured: %#v", oldRemote, remotes)
+	}
+	if !slices.ContainsFunc(remotes, func(remote repository.Remote) bool { return remote.Name == newRemote }) {
+		t.Fatalf("rejoined Zeus remote %q is not configured: %#v", newRemote, remotes)
+	}
+	filesystemID, err := existing.FileSystemID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := acceptedMembership(ctx, existing, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 2 || !slices.ContainsFunc(accepted, func(record membership.Record) bool {
+		return record.Payload.Name == "zeus" && record.Payload.PeerID == newPeerID
+	}) {
+		t.Fatalf("active membership after Zeus purge and rejoin = %#v", accepted)
+	}
+}
+
 func TestVerifyMembershipApprovalChainAcceptsNonFounderApprover(t *testing.T) {
 	filesystemID := strings.Repeat("a", 40)
 	rootKey, root, err := newMembershipDraft(filepath.Join(t.TempDir(), "root"), filesystemID, "root-peer", "root", 7843)

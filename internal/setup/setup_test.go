@@ -121,7 +121,7 @@ func TestSetupPreservesNonRuntimeRepositoryDirectory(t *testing.T) {
 	}
 }
 
-func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *testing.T) {
+func TestSetupClusterVerificationAcceptsLocalReadyWithIncompleteRemoteTopology(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	repositoryPath := filepath.Join(home, "repository")
@@ -146,20 +146,25 @@ func TestSetupClusterVerificationPersistsIncompleteAcknowledgementsForResume(t *
 			Connections: []peer.MeshConnection{{FromPeerID: peerID, ToPeerID: "zeus-peer", Status: "OK"}, {FromPeerID: "zeus-peer", ToPeerID: peerID, Status: "NOT_CONFIGURED"}},
 		}, nil
 	}
-	err = verifySetupCluster(context.Background(), statePath, state, Options{Out: os.Stderr, CheckCluster: checker})
-	if err == nil || !strings.Contains(err.Error(), "retry with dfs setup resume") {
-		t.Fatalf("incomplete cluster verification error = %v", err)
+	var output bytes.Buffer
+	err = verifySetupCluster(context.Background(), statePath, state, Options{Out: &output, CheckCluster: checker})
+	if err != nil {
+		t.Fatalf("local-ready cluster verification error = %v", err)
 	}
 	persisted, err := load(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Phase != PhaseMounted || len(persisted.Acknowledgements) != 2 || persisted.Acknowledgements[1].Status != "INCOMPLETE" {
+	if persisted.Phase != PhaseMounted || persisted.ClusterVerifiedAt.IsZero() || len(persisted.Acknowledgements) != 2 || persisted.Acknowledgements[1].Status != "INCOMPLETE" {
 		t.Fatalf("persisted resumable cluster state = %+v", persisted)
+	}
+	if !strings.Contains(output.String(), "Cluster member zeus: INCOMPLETE") ||
+		!strings.Contains(output.String(), "incomplete remote topology will continue reconciling in the background") {
+		t.Fatalf("incomplete topology warning was not reported:\n%s", output.String())
 	}
 }
 
-func TestSetupClusterVerificationReportsExpiredDeadlineAsIncompleteTopology(t *testing.T) {
+func TestSetupClusterVerificationReportsLocalReadinessTimeout(t *testing.T) {
 	home := t.TempDir()
 	repositoryPath := filepath.Join(home, "repository")
 	repo, err := repository.InitWithIdentity(context.Background(), repositoryPath, "iris", 1<<20,
@@ -178,12 +183,12 @@ func TestSetupClusterVerificationReportsExpiredDeadlineAsIncompleteTopology(t *t
 		return peer.MeshReport{}, errors.New("git remote -v: context deadline exceeded")
 	}
 	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{Out: os.Stderr, CheckCluster: checker})
-	if err == nil || !strings.Contains(err.Error(), "online DFS members have not acknowledged") || strings.Contains(err.Error(), "context deadline exceeded") {
+	if err == nil || !strings.Contains(err.Error(), "local DFS peer did not become ready") || strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("verification deadline error = %v", err)
 	}
 }
 
-func TestSetupClusterVerificationStopsAfterRepeatedUnchangedIncompleteTopology(t *testing.T) {
+func TestSetupClusterVerificationChecksIncompleteTopologyOnce(t *testing.T) {
 	home := t.TempDir()
 	repositoryPath := filepath.Join(home, "repository")
 	repo, err := repository.InitWithIdentity(context.Background(), repositoryPath, "zeus", 1<<20,
@@ -207,13 +212,12 @@ func TestSetupClusterVerificationStopsAfterRepeatedUnchangedIncompleteTopology(t
 		}, nil
 	}
 	var output bytes.Buffer
-	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{
-		Out: &output, CheckCluster: checker, VerificationInterval: time.Millisecond,
-	})
-	if err == nil || !strings.Contains(err.Error(), "remained incomplete") || checks != 2 {
-		t.Fatalf("stable incomplete verification: checks=%d error=%v", checks, err)
+	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{Out: &output, CheckCluster: checker})
+	if err != nil || checks != 1 {
+		t.Fatalf("background topology verification: checks=%d error=%v", checks, err)
 	}
-	if !strings.Contains(output.String(), "Cluster member iris: INCOMPLETE") {
+	if !strings.Contains(output.String(), "Cluster member iris: INCOMPLETE") ||
+		!strings.Contains(output.String(), "incomplete remote topology will continue reconciling in the background") {
 		t.Fatalf("stable incomplete progress was not reported:\n%s", output.String())
 	}
 }
