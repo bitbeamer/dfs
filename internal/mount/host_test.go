@@ -107,6 +107,17 @@ func TestInvalidationWaitsUntilFuseMountIsReady(t *testing.T) {
 	gate.disable()
 }
 
+func TestInvalidateEntryCanSkipFuseNotification(t *testing.T) {
+	calls := make(chan string, 1)
+	invalidator := nodeContentInvalidator{paths: channelEntryNotifier{calls: calls}, skipEntries: true}
+	invalidator.InvalidateEntry("directory/file.txt")
+	select {
+	case call := <-calls:
+		t.Fatalf("skipped entry invalidation notified FUSE for %q", call)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
 type failingUnmountServer struct{ err error }
 
 func (s failingUnmountServer) Unmount() error { return s.err }

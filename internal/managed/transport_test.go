@@ -195,6 +195,15 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("managed Git receive did not notify the repository scheduler")
 	}
+	push = exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "push", remoteName, "HEAD:refs/heads/managed-quic-test")
+	if output, err := push.CombinedOutput(); err != nil {
+		t.Fatalf("repeat Git metadata push over managed QUIC: %v\n%s", err, output)
+	}
+	select {
+	case reason := <-received:
+		t.Fatalf("unchanged managed Git push notified scheduler with %q", reason)
+	case <-time.After(250 * time.Millisecond):
+	}
 	fakeBin := filepath.Join(home, "fake-bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)

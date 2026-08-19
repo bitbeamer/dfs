@@ -57,6 +57,7 @@ type nodeContentInvalidator struct {
 	directories directoryChangeNotifier
 	logger      *slog.Logger
 	gate        *invalidationGate
+	skipEntries bool
 }
 
 type invalidationGate struct {
@@ -119,9 +120,11 @@ func (i nodeContentInvalidator) InvalidateEntry(path string) {
 		// If the changed path's parent is not represented in that tree, walk up
 		// to the nearest represented ancestor. Invalidating that child clears
 		// negative kernel lookups for the whole unknown branch.
-		status := i.invalidateEntry(path)
-		if status != fuse.OK && i.logger != nil {
-			i.logger.Warn("FUSE entry invalidation failed", "path", path, "status", status)
+		if !i.skipEntries {
+			status := i.invalidateEntry(path)
+			if status != fuse.OK && i.logger != nil {
+				i.logger.Warn("FUSE entry invalidation failed", "path", path, "status", status)
+			}
 		}
 		if i.directories != nil {
 			i.directories.NotifyPath(path)
@@ -211,6 +214,10 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		directories: directoryNotifier,
 		logger:      logger.With("component", "fuse"),
 		gate:        invalidationState,
+		// macOS is configured with zero entry and attribute cache timeouts
+		// below. Sending a synchronous invalidation upcall there is redundant,
+		// and macFUSE can block that upcall behind an active Finder lookup.
+		skipEntries: runtime.GOOS == "darwin",
 	}
 	filesystem.cacheInvalidator = invalidator
 	frontendEvents, err := wakeup.ListenFrontend(repo.Config.Repository)

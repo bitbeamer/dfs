@@ -435,9 +435,12 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		writeResponse(stream, Response{Error: "unsupported Git service"})
 		return
 	}
+	var refsBefore string
+	var refsBeforeOK bool
 	var treeBefore string
 	var pinRefBefore string
 	if service == "git-receive-pack" {
+		refsBefore, refsBeforeOK = gitRefsValue(stream.Context(), s.repo.Config.Repository)
 		treeBefore = worktreeTree(stream.Context(), s.repo.Config.Repository)
 		pinRefBefore = gitRefValue(stream.Context(), s.repo.Config.Repository, membership.PinRef)
 	}
@@ -458,6 +461,14 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		return
 	}
 	if err := command.Wait(); err == nil && service == "git-receive-pack" && s.changed != nil {
+		// Git invokes receive-pack even when every advertised ref is already at
+		// the requested object. Do not turn that no-op exchange into another
+		// reconciliation pass: periodic peers would otherwise keep each other in
+		// a permanent receive/sync loop and continuously disturb the FUSE mount.
+		refsAfter, refsAfterOK := gitRefsValue(stream.Context(), s.repo.Config.Repository)
+		if refsBeforeOK && refsAfterOK && refsAfter == refsBefore {
+			return
+		}
 		treeAfter := worktreeTree(stream.Context(), s.repo.Config.Repository)
 		reason := "managed Git receive"
 		if gitRefValue(stream.Context(), s.repo.Config.Repository, membership.PinRef) != pinRefBefore {
@@ -465,6 +476,14 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		}
 		s.changed(reason, changedPaths(stream.Context(), s.repo.Config.Repository, treeBefore, treeAfter))
 	}
+}
+
+func gitRefsValue(ctx context.Context, repositoryPath string) (string, bool) {
+	output, err := exec.CommandContext(ctx, "git", "-C", repositoryPath, "for-each-ref", "--format=%(refname) %(objectname)", "refs").Output()
+	if err != nil {
+		return "", false
+	}
+	return string(output), true
 }
 
 func gitRefValue(ctx context.Context, repositoryPath, ref string) string {
