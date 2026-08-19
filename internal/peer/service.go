@@ -53,6 +53,8 @@ type Service struct {
 	attempts         map[string]attemptWindow
 	cleanupStop      chan struct{}
 	cleanupDone      chan struct{}
+	reconcile        func(context.Context, *repository.Repository) error
+	runBackground    func(func())
 }
 
 type attemptWindow struct {
@@ -131,6 +133,10 @@ func startServiceAddress(repo *repository.Repository, logger *slog.Logger, addre
 		statePath:   filepath.Join(repo.Config.Repository, filepath.FromSlash(config.Directory), runtimeStateFile),
 		attempts:    make(map[string]attemptWindow),
 		cleanupStop: make(chan struct{}), cleanupDone: make(chan struct{}),
+		reconcile: ReconcileMembership,
+		runBackground: func(work func()) {
+			go work()
+		},
 	}
 	pairHandler := func(ctx context.Context, operation string, remote net.Addr, payload json.RawMessage) (json.RawMessage, error) {
 		path := "/v1/pair/start"
@@ -401,20 +407,12 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 			return
 		}
 		refreshCancel()
-		reconcileCtx, reconcileCancel := context.WithTimeout(request.Context(), 30*time.Second)
-		if err := ReconcileMembership(reconcileCtx, s.repo); err != nil {
-			reconcileCancel()
-			writeProtocolError(response, http.StatusInternalServerError, "cannot reconcile approved membership: "+err.Error())
-			return
-		}
-		reconcileCancel()
+		var notify []string
 		for _, member := range s.members {
 			if member.Payload.PeerID == s.repo.Config.PeerID || member.Payload.PeerID == pending.PeerID {
 				continue
 			}
-			notifyCtx, notifyCancel := context.WithTimeout(request.Context(), 5*time.Second)
-			_ = managed.RequestReconcile(notifyCtx, s.repo, member.Payload.PeerID)
-			notifyCancel()
+			notify = append(notify, member.Payload.PeerID)
 		}
 		if err := os.Remove(invitationPath(s.repo.Config.Repository, record.ID)); err != nil {
 			writeProtocolError(response, http.StatusInternalServerError, "cannot finalize pairing invitation")
@@ -422,9 +420,26 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 		}
 		s.logger.Info("peer paired", "peer", pending.PeerName, "peer_id", pending.PeerID, "remote", remoteName)
 		writeJSON(response, http.StatusOK, PairCompleteResponse{RemoteName: remoteName})
+		s.reconcileApprovedMembership(notify)
 		return
 	}
 	writeProtocolError(response, http.StatusUnauthorized, "invalid or expired pairing session")
+}
+
+func (s *Service) reconcileApprovedMembership(notify []string) {
+	s.runBackground(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.reconcile(ctx, s.repo); err != nil {
+			s.logger.Warn("approved membership reconciliation deferred", "error", err)
+			return
+		}
+		for _, peerID := range notify {
+			notifyCtx, notifyCancel := context.WithTimeout(ctx, 5*time.Second)
+			_ = managed.RequestReconcile(notifyCtx, s.repo, peerID)
+			notifyCancel()
+		}
+	})
 }
 
 func (s *Service) authorizePairClone(_ context.Context, sessionID, completionSecret string) error {

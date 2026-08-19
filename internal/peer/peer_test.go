@@ -633,6 +633,8 @@ func TestCompletePairingResumesAndRemovesState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
+	reconciliationScheduled := false
+	service.runBackground = func(func()) { reconciliationScheduled = true }
 	invitation, err := CreateInvitation(repo, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -665,6 +667,9 @@ func TestCompletePairingResumesAndRemovesState(t *testing.T) {
 	}
 	if result.RemoteName != "dfs-peer-123456789abc" {
 		t.Fatalf("completion result = %#v", result)
+	}
+	if !reconciliationScheduled {
+		t.Fatal("pair completion did not schedule membership reconciliation")
 	}
 	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "dfs", pairingResumeFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pairing resume state remains: %v", err)
