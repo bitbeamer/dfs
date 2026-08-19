@@ -55,6 +55,9 @@ type Service struct {
 	cleanupDone      chan struct{}
 	reconcile        func(context.Context, *repository.Repository) error
 	runBackground    func(func())
+	backgroundMu     sync.Mutex
+	background       sync.WaitGroup
+	closing          bool
 }
 
 type attemptWindow struct {
@@ -134,10 +137,8 @@ func startServiceAddress(repo *repository.Repository, logger *slog.Logger, addre
 		attempts:    make(map[string]attemptWindow),
 		cleanupStop: make(chan struct{}), cleanupDone: make(chan struct{}),
 		reconcile: ReconcileMembership,
-		runBackground: func(work func()) {
-			go work()
-		},
 	}
+	service.runBackground = service.startBackground
 	pairHandler := func(ctx context.Context, operation string, remote net.Addr, payload json.RawMessage) (json.RawMessage, error) {
 		path := "/v1/pair/start"
 		handler := service.handlePairStart
@@ -214,6 +215,9 @@ func startServiceAddress(repo *repository.Repository, logger *slog.Logger, addre
 }
 
 func (s *Service) Close() error {
+	s.backgroundMu.Lock()
+	s.closing = true
+	s.backgroundMu.Unlock()
 	for _, server := range s.mdnsServers {
 		server.Shutdown()
 	}
@@ -225,10 +229,25 @@ func (s *Service) Close() error {
 			err = managedErr
 		}
 	}
+	s.background.Wait()
 	if state, stateErr := readRuntimeState(s.repo.Config.Repository); stateErr == nil && state.PID == os.Getpid() {
 		_ = os.Remove(s.statePath)
 	}
 	return err
+}
+
+func (s *Service) startBackground(work func()) {
+	s.backgroundMu.Lock()
+	if s.closing {
+		s.backgroundMu.Unlock()
+		return
+	}
+	s.background.Add(1)
+	s.backgroundMu.Unlock()
+	go func() {
+		defer s.background.Done()
+		work()
+	}()
 }
 
 func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Request) {

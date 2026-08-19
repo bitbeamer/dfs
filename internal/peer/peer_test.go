@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/config"
 	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/membership"
 	"github.com/bitbeamer/dfs/internal/repository"
@@ -318,6 +319,40 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 	if len(active) != 0 {
 		t.Fatalf("completed invitation remains active: %#v", active)
+	}
+}
+
+func TestServiceCloseWaitsForBackgroundWork(t *testing.T) {
+	repositoryPath := t.TempDir()
+	cleanupDone := make(chan struct{})
+	close(cleanupDone)
+	service := &Service{
+		repo:        &repository.Repository{Config: config.Default("test", repositoryPath)},
+		cleanupStop: make(chan struct{}), cleanupDone: cleanupDone,
+	}
+	service.runBackground = service.startBackground
+	started := make(chan struct{})
+	release := make(chan struct{})
+	service.runBackground(func() {
+		close(started)
+		<-release
+	})
+	<-started
+	closed := make(chan error, 1)
+	go func() { closed <- service.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before background work completed: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after background work completed")
 	}
 }
 
