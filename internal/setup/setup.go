@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -600,7 +602,15 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 			}
 		}
 		if !instructionShown {
-			if err := showJoinApprovalInstruction(out, state.Approval.RequestID, waitForApproval); err != nil {
+			approvingPeers := state.Approval.ApprovingPeers
+			if len(approvingPeers) == 0 {
+				for _, offer := range selected.Offers {
+					approvingPeers = append(approvingPeers, offer.PeerName)
+				}
+				sort.Strings(approvingPeers)
+				approvingPeers = slices.Compact(approvingPeers)
+			}
+			if err := showJoinApprovalInstruction(out, state.Approval.RequestID, approvingPeers, waitForApproval); err != nil {
 				return err
 			}
 			instructionShown = true
@@ -634,12 +644,18 @@ func printJoinApprovalWait(out io.Writer, pendingPolls int) {
 	}
 }
 
-func printJoinApprovalInstruction(out io.Writer, requestID string) {
-	fmt.Fprintf(out, "Join request %s is pending. On any existing peer run: dfs peer approve %s\n", requestID, requestID)
+func printJoinApprovalInstruction(out io.Writer, requestID string, approvingPeers []string) {
+	location := "On the peer that accepted the request"
+	if len(approvingPeers) == 1 {
+		location = "On peer " + approvingPeers[0]
+	} else if len(approvingPeers) > 1 {
+		location = "On one of these peers (" + strings.Join(approvingPeers, ", ") + ")"
+	}
+	fmt.Fprintf(out, "Join request %s is pending. %s run: dfs peer approve %s\n", requestID, location, requestID)
 }
 
-func showJoinApprovalInstruction(out io.Writer, requestID string, waitForApproval func(string) error) error {
-	printJoinApprovalInstruction(out, requestID)
+func showJoinApprovalInstruction(out io.Writer, requestID string, approvingPeers []string, waitForApproval func(string) error) error {
+	printJoinApprovalInstruction(out, requestID, approvingPeers)
 	if waitForApproval == nil {
 		return nil
 	}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -381,12 +382,18 @@ func TestDiscoveredJoinRequestRequiresExplicitBoundApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !slices.Equal(credentials.ApprovingPeers, []string{repo.Config.Name}) {
+		t.Fatalf("join request approving peers = %#v", credentials.ApprovingPeers)
+	}
 	data, err := os.ReadFile(joinRequestPath(repo.Config.Repository, credentials.RequestID))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), credentials.Secret) {
 		t.Fatal("persisted join request contains its bearer secret")
+	}
+	if _, err := ApproveJoinRequest(repo, "missing-request", time.Minute); err == nil || !strings.Contains(err.Error(), "not pending on this peer") {
+		t.Fatalf("missing local join request error = %v", err)
 	}
 	if invitation, approved, err := PollJoinApproval(ctx, network, credentials); err != nil || approved {
 		t.Fatalf("unapproved request = %#v, %v, %v", invitation, approved, err)

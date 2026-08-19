@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -42,9 +43,10 @@ type JoinRequestInfo struct {
 }
 
 type JoinRequestCredentials struct {
-	RequestID string    `json:"request_id"`
-	Secret    string    `json:"secret"`
-	ExpiresAt time.Time `json:"expires_at"`
+	RequestID      string    `json:"request_id"`
+	Secret         string    `json:"secret"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	ApprovingPeers []string  `json:"approving_peers,omitempty"`
 }
 
 func SubmitJoinRequest(ctx context.Context, network Network, peerID, peerName, stateDirectory string, pairingPort int, lifetime time.Duration) (JoinRequestCredentials, error) {
@@ -71,6 +73,7 @@ func SubmitJoinRequest(ctx context.Context, network Network, peerID, peerName, s
 		PeerID: peerID, PeerName: strings.TrimSpace(peerName), ExpiresAt: expires, Membership: draft}
 	var failures []string
 	accepted := 0
+	var approvingPeers []string
 	for _, offer := range network.Offers {
 		if offer.ProtocolVersion != ProtocolVersion || offer.CertificateSHA256 == "" {
 			continue
@@ -86,6 +89,7 @@ func SubmitJoinRequest(ctx context.Context, network Network, peerID, peerName, s
 			continue
 		}
 		accepted++
+		approvingPeers = append(approvingPeers, offer.PeerName)
 	}
 	if accepted == 0 {
 		if len(failures) == 0 {
@@ -93,7 +97,9 @@ func SubmitJoinRequest(ctx context.Context, network Network, peerID, peerName, s
 		}
 		return JoinRequestCredentials{}, fmt.Errorf("no DFS peer accepted the join request: %s", strings.Join(failures, "; "))
 	}
-	return JoinRequestCredentials{RequestID: id, Secret: secret, ExpiresAt: expires}, nil
+	sort.Strings(approvingPeers)
+	approvingPeers = slices.Compact(approvingPeers)
+	return JoinRequestCredentials{RequestID: id, Secret: secret, ExpiresAt: expires, ApprovingPeers: approvingPeers}, nil
 }
 
 func PollJoinApproval(ctx context.Context, network Network, credentials JoinRequestCredentials) (Invitation, bool, error) {
@@ -156,6 +162,9 @@ func ListJoinRequests(repositoryPath string, now time.Time) ([]JoinRequestInfo, 
 
 func ApproveJoinRequest(repo *repository.Repository, id string, lifetime time.Duration) (Invitation, error) {
 	record, err := loadJoinRequest(repo.Config.Repository, id)
+	if errors.Is(err, os.ErrNotExist) {
+		return Invitation{}, fmt.Errorf("DFS join request %s is not pending on this peer; run the approval command on a peer named by the joining setup", id)
+	}
 	if err != nil {
 		return Invitation{}, fmt.Errorf("load DFS join request: %w", err)
 	}
