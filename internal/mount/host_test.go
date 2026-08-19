@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -292,12 +293,16 @@ func TestPrepareMountpointDetachesStaleFuseMountWhenRootStatSucceeds(t *testing.
 	}
 	readCalls := 0
 	cleanupCalls := 0
+	staleErr := error(syscall.ENOTCONN)
+	if runtime.GOOS == "darwin" {
+		staleErr = syscall.ENXIO
+	}
 	access := mountpointAccess{
 		stat: func(string) (os.FileInfo, error) { return info, nil },
 		readDir: func(path string) ([]os.DirEntry, error) {
 			readCalls++
 			if readCalls == 1 {
-				return nil, &os.PathError{Op: "readdir", Path: path, Err: syscall.ENXIO}
+				return nil, &os.PathError{Op: "readdir", Path: path, Err: staleErr}
 			}
 			return nil, nil
 		},
