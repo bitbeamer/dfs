@@ -577,6 +577,11 @@ func (m *manager) snapshotDefinitions(instance Instance) ([]definitionSnapshot, 
 
 func (m *manager) restoreDefinitions(ctx context.Context, snapshots []definitionSnapshot, instance Instance) error {
 	var failures []error
+	if m.platform == "darwin" {
+		if err := m.unloadLaunchdDefinitions(ctx, instance); err != nil {
+			return err
+		}
+	}
 	for _, snapshot := range snapshots {
 		if snapshot.exists {
 			if err := os.WriteFile(snapshot.path, snapshot.data, snapshot.mode); err != nil {
@@ -590,8 +595,6 @@ func (m *manager) restoreDefinitions(ctx context.Context, snapshots []definition
 		if _, err := m.run(ctx, "systemctl", "--user", "daemon-reload"); err != nil {
 			failures = append(failures, err)
 		}
-	} else if err := m.waitForLaunchdUnload(ctx, []Instance{instance}); err != nil {
-		failures = append(failures, err)
 	}
 	if err := m.restoreState(ctx, instance); err != nil {
 		failures = append(failures, err)
@@ -600,6 +603,9 @@ func (m *manager) restoreDefinitions(ctx context.Context, snapshots []definition
 }
 
 func (m *manager) verifyRunningState(ctx context.Context, instance Instance) error {
+	if m.platform == "darwin" {
+		return m.waitForLaunchdRunning(ctx, instance)
+	}
 	var failures []error
 	checks := []struct {
 		kind   string
@@ -612,15 +618,58 @@ func (m *manager) verifyRunningState(ctx context.Context, instance Instance) err
 		if !check.active {
 			continue
 		}
-		if m.platform == "linux" {
-			if !m.commandSucceeds(ctx, "systemctl", "--user", "is-active", "--quiet", "dfs-"+check.kind+"-"+instance.serviceID+".service") {
-				failures = append(failures, fmt.Errorf("%s service did not become active", check.kind))
-			}
-		} else if !m.launchdServiceRunning(ctx, "io.bitbeamer.dfs."+check.kind+"."+instance.serviceID) {
+		if !m.commandSucceeds(ctx, "systemctl", "--user", "is-active", "--quiet", "dfs-"+check.kind+"-"+instance.serviceID+".service") {
 			failures = append(failures, fmt.Errorf("%s service did not become active", check.kind))
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (m *manager) waitForLaunchdRunning(ctx context.Context, instance Instance) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var failures []error
+		for _, item := range []struct {
+			kind   string
+			active bool
+		}{
+			{kind: "core", active: instance.CoreActive},
+			{kind: "mount", active: instance.MountActive},
+		} {
+			if item.active && !m.launchdServiceRunning(waitCtx, "io.bitbeamer.dfs."+item.kind+"."+instance.serviceID) {
+				failures = append(failures, fmt.Errorf("%s service did not become active", item.kind))
+			}
+		}
+		if len(failures) == 0 {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return errors.Join(failures...)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *manager) unloadLaunchdDefinitions(ctx context.Context, instance Instance) error {
+	var failures []error
+	for _, kind := range []string{"mount", "core"} {
+		label := "io.bitbeamer.dfs." + kind + "." + instance.serviceID
+		if _, err := m.run(ctx, "launchctl", "bootout", m.domain+"/"+label); err != nil &&
+			m.commandSucceeds(ctx, "launchctl", "print", m.domain+"/"+label) {
+			failures = append(failures, fmt.Errorf("stop %s service before restoring its definition: %w", kind, err))
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
+		return err
+	}
+	allLabels := instance
+	allLabels.CoreActive = true
+	allLabels.MountActive = true
+	return m.waitForLaunchdUnload(ctx, []Instance{allLabels})
 }
 
 func (m *manager) restoreState(ctx context.Context, instance Instance) error {

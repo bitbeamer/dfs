@@ -143,6 +143,76 @@ func TestLaunchdServiceRunningRequiresRunningState(t *testing.T) {
 	}
 }
 
+func TestVerifyRunningStateWaitsForLaunchdStartup(t *testing.T) {
+	serviceID := "123456789abc"
+	checks := map[string]int{}
+	manager := &manager{platform: "darwin", domain: "gui/501", run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+		if name != "launchctl" || len(arguments) != 2 || arguments[0] != "print" {
+			t.Fatalf("launchd command = %s %#v", name, arguments)
+		}
+		checks[arguments[1]]++
+		if checks[arguments[1]] == 1 {
+			return []byte("state = waiting\n"), nil
+		}
+		return []byte("state = running\n"), nil
+	}}
+	instance := Instance{serviceID: serviceID, CoreActive: true, MountActive: true}
+	if err := manager.verifyRunningState(context.Background(), instance); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"core", "mount"} {
+		label := "gui/501/io.bitbeamer.dfs." + kind + "." + serviceID
+		if checks[label] < 2 {
+			t.Fatalf("%s checked %d time(s), want launchd startup polling", label, checks[label])
+		}
+	}
+}
+
+func TestRestoreDefinitionsBootsOutReplacementLaunchAgents(t *testing.T) {
+	home := t.TempDir()
+	serviceID := "123456789abc"
+	loaded := map[string]bool{}
+	for _, kind := range []string{"core", "mount"} {
+		loaded["gui/501/io.bitbeamer.dfs."+kind+"."+serviceID] = true
+	}
+	var calls []string
+	manager := &manager{platform: "darwin", launchdDir: home, domain: "gui/501", run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+		call := strings.Join(append([]string{name}, arguments...), " ")
+		calls = append(calls, call)
+		if name != "launchctl" || len(arguments) == 0 {
+			return nil, nil
+		}
+		switch arguments[0] {
+		case "bootout":
+			loaded[arguments[1]] = false
+		case "print":
+			if loaded[arguments[1]] {
+				return []byte("state = running\n"), nil
+			}
+			return nil, errors.New("not loaded")
+		case "bootstrap":
+			label := "gui/501/" + strings.TrimSuffix(filepath.Base(arguments[2]), ".plist")
+			loaded[label] = true
+		}
+		return nil, nil
+	}}
+	instance := Instance{serviceID: serviceID, CoreActive: true, MountActive: true, CoreEnabled: true, MountEnabled: true}
+	snapshots := []definitionSnapshot{
+		{path: filepath.Join(home, "io.bitbeamer.dfs.core."+serviceID+".plist"), data: []byte("core"), mode: 0o600, exists: true},
+		{path: filepath.Join(home, "io.bitbeamer.dfs.mount."+serviceID+".plist"), data: []byte("mount"), mode: 0o600, exists: true},
+	}
+	if err := manager.restoreDefinitions(context.Background(), snapshots, instance); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"mount", "core"} {
+		bootout := "launchctl bootout gui/501/io.bitbeamer.dfs." + kind + "." + serviceID
+		bootstrap := "launchctl bootstrap gui/501 " + filepath.Join(home, "io.bitbeamer.dfs."+kind+"."+serviceID+".plist")
+		if !slices.Contains(calls, bootout) || !slices.Contains(calls, bootstrap) {
+			t.Fatalf("rollback calls = %#v, missing bootout/bootstrap for %s", calls, kind)
+		}
+	}
+}
+
 func TestUpgradeRollsBackExecutableWhenRepairFails(t *testing.T) {
 	home := t.TempDir()
 	installed := filepath.Join(home, "dfs")
