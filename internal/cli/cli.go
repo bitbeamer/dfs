@@ -1162,7 +1162,7 @@ func (a *App) mountCommand() *cobra.Command {
 			}
 			return dfsmount.Run(repo, args[0], dfsmount.Options{
 				Context: cmd.Context(), Logger: logger, FUSEDebug: fuseDebug,
-				RecoverStaleSession: recoverStaleSession, Signals: mountSignals,
+				RecoverStaleSession: recoverStaleSession, Managed: managed, Signals: mountSignals,
 			})
 		},
 	}

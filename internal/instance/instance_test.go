@@ -117,6 +117,32 @@ func TestParseLaunchdDisabledState(t *testing.T) {
 	}
 }
 
+func TestLaunchdServiceRunningRequiresRunningState(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		err     error
+		running bool
+	}{
+		{name: "running", output: "service = {\n\tstate = running\n}\n", running: true},
+		{name: "loaded but stopped", output: "service = {\n\tstate = not running\n}\n"},
+		{name: "missing", err: errors.New("service not found")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &manager{domain: "gui/501", run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+				if name != "launchctl" || !reflect.DeepEqual(arguments, []string{"print", "gui/501/io.bitbeamer.dfs.mount.test"}) {
+					t.Fatalf("launchd command = %s %#v", name, arguments)
+				}
+				return []byte(test.output), test.err
+			}}
+			if running := manager.launchdServiceRunning(context.Background(), "io.bitbeamer.dfs.mount.test"); running != test.running {
+				t.Fatalf("launchdServiceRunning() = %v, want %v", running, test.running)
+			}
+		})
+	}
+}
+
 func TestUpgradeRollsBackExecutableWhenRepairFails(t *testing.T) {
 	home := t.TempDir()
 	installed := filepath.Join(home, "dfs")
@@ -345,8 +371,9 @@ func TestRepairWaitsForLaunchdToUnloadBeforeRestoringState(t *testing.T) {
 			if loaded[label] {
 				if !bootstrapped[label] {
 					loaded[label] = false
+					return nil, nil
 				}
-				return nil, nil
+				return []byte("state = running\n"), nil
 			}
 			return nil, errors.New("not loaded")
 		case "bootstrap":

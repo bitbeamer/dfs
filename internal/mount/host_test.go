@@ -127,6 +127,18 @@ func TestMountStopReceivesRawSignal(t *testing.T) {
 	}
 }
 
+func TestManagedMountFailsWhenFuseServerStopsUnexpectedly(t *testing.T) {
+	if err := mountExitError(true, false); err == nil || !strings.Contains(err.Error(), "stopped unexpectedly") {
+		t.Fatalf("managed unexpected mount exit error = %v", err)
+	}
+	if err := mountExitError(false, false); err != nil {
+		t.Fatalf("foreground external unmount error = %v", err)
+	}
+	if err := mountExitError(true, true); err != nil {
+		t.Fatalf("managed requested shutdown error = %v", err)
+	}
+}
+
 func TestUnmountFallsBackToForcedDetach(t *testing.T) {
 	serveDone := make(chan struct{})
 	close(serveDone)

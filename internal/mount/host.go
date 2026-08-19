@@ -29,6 +29,7 @@ type Options struct {
 	Logger              *slog.Logger
 	FUSEDebug           bool
 	RecoverStaleSession bool
+	Managed             bool
 	Signals             <-chan os.Signal
 }
 
@@ -262,6 +263,9 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	}()
 	shutdown, shutdownReason := waitForMountStop(ctx, options.Signals, serveDone)
 	invalidationState.disable()
+	if err := mountExitError(options.Managed, shutdown); err != nil {
+		return err
+	}
 	// Cancel FUSE operations before asking the kernel to unmount. In particular,
 	// an on-demand content fetch must not keep macFUSE teardown blocked after the
 	// daemon has received SIGTERM.
@@ -278,6 +282,13 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 		}
 	}
 	logger.Info("mount stopped", "mountpoint", mountpoint)
+	return nil
+}
+
+func mountExitError(managed, shutdown bool) error {
+	if managed && !shutdown {
+		return errors.New("managed FUSE server stopped unexpectedly")
+	}
 	return nil
 }
 

@@ -158,8 +158,8 @@ func (m *manager) discoverLaunchd(ctx context.Context) ([]Instance, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
 		}
-		instance.CoreActive = m.commandSucceeds(ctx, "launchctl", "print", m.domain+"/io.bitbeamer.dfs.core."+serviceID)
-		instance.MountActive = m.commandSucceeds(ctx, "launchctl", "print", m.domain+"/io.bitbeamer.dfs.mount."+serviceID)
+		instance.CoreActive = m.launchdServiceRunning(ctx, "io.bitbeamer.dfs.core."+serviceID)
+		instance.MountActive = m.launchdServiceRunning(ctx, "io.bitbeamer.dfs.mount."+serviceID)
 		instance.CoreEnabled = !disabled["io.bitbeamer.dfs.core."+serviceID]
 		instance.MountEnabled = !disabled["io.bitbeamer.dfs.mount."+serviceID]
 		instances = append(instances, instance)
@@ -616,7 +616,7 @@ func (m *manager) verifyRunningState(ctx context.Context, instance Instance) err
 			if !m.commandSucceeds(ctx, "systemctl", "--user", "is-active", "--quiet", "dfs-"+check.kind+"-"+instance.serviceID+".service") {
 				failures = append(failures, fmt.Errorf("%s service did not become active", check.kind))
 			}
-		} else if !m.commandSucceeds(ctx, "launchctl", "print", m.domain+"/io.bitbeamer.dfs."+check.kind+"."+instance.serviceID) {
+		} else if !m.launchdServiceRunning(ctx, "io.bitbeamer.dfs."+check.kind+"."+instance.serviceID) {
 			failures = append(failures, fmt.Errorf("%s service did not become active", check.kind))
 		}
 	}
@@ -1062,6 +1062,19 @@ func resolveInstaller(platform, explicit string) (string, error) {
 func (m *manager) commandSucceeds(ctx context.Context, name string, arguments ...string) bool {
 	_, err := m.run(ctx, name, arguments...)
 	return err == nil
+}
+
+func (m *manager) launchdServiceRunning(ctx context.Context, label string) bool {
+	output, err := m.run(ctx, "launchctl", "print", m.domain+"/"+label)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == "state = running" {
+			return true
+		}
+	}
+	return false
 }
 
 func runCommand(ctx context.Context, name string, arguments ...string) ([]byte, error) {
