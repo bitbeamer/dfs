@@ -46,6 +46,7 @@ type unmountServer interface {
 
 type mountpointAccess struct {
 	stat       func(string) (os.FileInfo, error)
+	readDir    func(string) ([]os.DirEntry, error)
 	mkdirAll   func(string, os.FileMode) error
 	clearStale func(string) error
 }
@@ -337,20 +338,28 @@ func unmountAndWait(server unmountServer, serveDone <-chan struct{}, force func(
 func prepareMountpoint(mountpoint string) (bool, error) {
 	return prepareMountpointWithAccess(mountpoint, mountpointAccess{
 		stat:       os.Stat,
+		readDir:    os.ReadDir,
 		mkdirAll:   os.MkdirAll,
 		clearStale: forceUnmount,
 	})
 }
 
 func prepareMountpointWithAccess(mountpoint string, access mountpointAccess) (bool, error) {
-	info, err := access.stat(mountpoint)
+	inspect := func() (os.FileInfo, error) {
+		info, err := access.stat(mountpoint)
+		if err == nil && info.IsDir() && access.readDir != nil {
+			_, err = access.readDir(mountpoint)
+		}
+		return info, err
+	}
+	info, err := inspect()
 	clearedStale := false
 	if isStaleMountError(err) {
 		if cleanupErr := access.clearStale(mountpoint); cleanupErr != nil {
 			return false, fmt.Errorf("detach stale mountpoint %s: %w", mountpoint, cleanupErr)
 		}
 		clearedStale = true
-		info, err = access.stat(mountpoint)
+		info, err = inspect()
 	}
 	if err == nil {
 		if !info.IsDir() {

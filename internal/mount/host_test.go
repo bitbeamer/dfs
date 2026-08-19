@@ -260,6 +260,40 @@ func TestPrepareMountpointDetachesStaleFuseMount(t *testing.T) {
 	}
 }
 
+func TestPrepareMountpointDetachesStaleFuseMountWhenRootStatSucceeds(t *testing.T) {
+	mountpoint := "/stale/mount"
+	directory := t.TempDir()
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readCalls := 0
+	cleanupCalls := 0
+	access := mountpointAccess{
+		stat: func(string) (os.FileInfo, error) { return info, nil },
+		readDir: func(path string) ([]os.DirEntry, error) {
+			readCalls++
+			if readCalls == 1 {
+				return nil, &os.PathError{Op: "readdir", Path: path, Err: syscall.ENXIO}
+			}
+			return nil, nil
+		},
+		mkdirAll: os.MkdirAll,
+		clearStale: func(string) error {
+			cleanupCalls++
+			return nil
+		},
+	}
+
+	cleared, err := prepareMountpointWithAccess(mountpoint, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared || cleanupCalls != 1 || readCalls != 2 {
+		t.Fatalf("cleared=%t cleanup_calls=%d read_calls=%d; want true, 1, 2", cleared, cleanupCalls, readCalls)
+	}
+}
+
 func TestStaleMountErrorsByPlatform(t *testing.T) {
 	tests := []struct {
 		name string
