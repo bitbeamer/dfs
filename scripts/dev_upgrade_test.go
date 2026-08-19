@@ -14,6 +14,7 @@ func TestDevUpgradeDiscoversManagedBinaryWithoutDFSOnPath(t *testing.T) {
 	bin := filepath.Join(root, "bin")
 	tools := filepath.Join(root, "tools")
 	installed := filepath.Join(root, "installed dfs")
+	healthAttempt := filepath.Join(root, "health-attempt")
 	for _, directory := range []string{scripts, bin, tools} {
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			t.Fatal(err)
@@ -30,7 +31,10 @@ func TestDevUpgradeDiscoversManagedBinaryWithoutDFSOnPath(t *testing.T) {
 case "$*" in
   "service list --output json") printf '%s\n' '{"result":[{"binary":"` + installed + `","filesystem_id":"abc123"}]}' ;;
   "service list") printf '%s\n' 'RUNNING' ;;
-  "health --filesystem abc123") printf '%s\n' 'HEALTHY' ;;
+  "health --filesystem abc123")
+    if [[ ! -e "` + healthAttempt + `" ]]; then touch "` + healthAttempt + `"; printf '%s\n' 'Core: STOPPING' >&2; exit 1; fi
+    printf '%s\n' 'Core: READY'
+    ;;
   "--version") printf '%s\n' 'dfs candidate' ;;
   "upgrade --from "*) printf '%s\n' 'Dry run' ;;
   *) printf 'unexpected candidate arguments: %s\n' "$*" >&2; exit 1 ;;
@@ -42,13 +46,13 @@ esac
 	writeExecutable(t, filepath.Join(tools, "go"), "#!/usr/bin/env bash\nexit 0\n")
 	writeExecutable(t, filepath.Join(tools, "make"), "#!/usr/bin/env bash\nexit 0\n")
 
-	command := exec.Command(filepath.Join(scripts, "dev-upgrade.sh"), "--no-fetch", "--dry-run")
+	command := exec.Command(filepath.Join(scripts, "dev-upgrade.sh"), "--no-fetch")
 	command.Env = append(os.Environ(), "PATH="+tools+":/bin:/usr/bin")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("dev upgrade failed without dfs on PATH: %v\n%s", err, output)
 	}
-	if text := string(output); !strings.Contains(text, "Installed: dfs installed") || !strings.Contains(text, "Dry run complete") {
+	if text := string(output); !strings.Contains(text, "Installed: dfs installed") || !strings.Contains(text, "Waiting for DFS core health after upgrade") || !strings.Contains(text, "Development upgrade completed") {
 		t.Fatalf("dev upgrade output = %q", text)
 	}
 }

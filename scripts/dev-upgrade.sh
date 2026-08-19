@@ -91,7 +91,21 @@ verify_host() {
   fi
   while IFS= read -r filesystem_id; do
     [[ -n "$filesystem_id" ]] || continue
-    "$candidate" health --filesystem "$filesystem_id"
+    health_output=''
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+      if health_output=$("$candidate" health --filesystem "$filesystem_id" 2>&1); then
+        printf '%s\n' "$health_output"
+        break
+      fi
+      if (( attempt == 30 )); then
+        printf '%s\n' "$health_output" >&2
+        return 1
+      fi
+      if (( attempt == 1 )); then
+        printf 'Waiting for DFS core health after upgrade...\n'
+      fi
+      sleep 1
+    done
   done <<<"$filesystem_ids"
 }
 
