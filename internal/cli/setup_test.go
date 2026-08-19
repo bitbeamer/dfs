@@ -93,7 +93,7 @@ func TestPromptAfterJoinApprovalWaitsForEnter(t *testing.T) {
 	if err := promptAfterJoinApproval(bufio.NewReader(strings.NewReader("\n")), &output); err != nil {
 		t.Fatal(err)
 	}
-	if want := "After approving the join request on an existing peer, press Enter to continue: "; output.String() != want {
+	if want := "After approving the join request on an existing peer, press Enter to continue: Checking DFS join approval...\n"; output.String() != want {
 		t.Fatalf("approval prompt = %q, want %q", output.String(), want)
 	}
 }

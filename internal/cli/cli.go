@@ -469,6 +469,7 @@ func promptAfterJoinApproval(reader *bufio.Reader, out io.Writer) error {
 	if _, err := reader.ReadString('\n'); err != nil {
 		return errors.New("interactive setup requires Enter after the join request is approved; resume later with dfs setup resume")
 	}
+	fmt.Fprintln(out, "Checking DFS join approval...")
 	return nil
 }
 

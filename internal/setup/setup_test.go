@@ -201,6 +201,17 @@ func TestJoinApprovalInstructionUsesPublicPeerCommand(t *testing.T) {
 	}
 }
 
+func TestJoinApprovalWaitReportsInitialAndPeriodicProgress(t *testing.T) {
+	var output strings.Builder
+	for poll := 1; poll <= 6; poll++ {
+		printJoinApprovalWait(&output, poll)
+	}
+	want := "DFS join approval is not visible yet; still waiting...\nDFS join approval is not visible yet; still waiting...\n"
+	if output.String() != want {
+		t.Fatalf("join approval wait output = %q, want %q", output.String(), want)
+	}
+}
+
 func TestSetupPersistsApprovalAndIdentityForResume(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

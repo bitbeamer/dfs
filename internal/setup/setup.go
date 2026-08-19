@@ -563,6 +563,7 @@ func printSetupAcknowledgements(out io.Writer, acknowledgements []peer.SetupAckn
 
 func awaitApproval(ctx context.Context, statePath string, state *State, out io.Writer, waitForApproval func(string) error) error {
 	instructionShown := false
+	pendingPolls := 0
 	for {
 		if !state.Approval.ExpiresAt.IsZero() && !state.Approval.ExpiresAt.After(time.Now()) {
 			return errors.New("DFS join request expired; abort setup and start a new request")
@@ -615,12 +616,21 @@ func awaitApproval(ctx context.Context, statePath string, state *State, out io.W
 		}
 		if err != nil {
 			fmt.Fprintf(out, "Waiting for DFS join approval: %v\n", err)
+		} else {
+			pendingPolls++
+			printJoinApprovalWait(out, pendingPolls)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
+	}
+}
+
+func printJoinApprovalWait(out io.Writer, pendingPolls int) {
+	if pendingPolls == 1 || pendingPolls%5 == 0 {
+		fmt.Fprintln(out, "DFS join approval is not visible yet; still waiting...")
 	}
 }
 
