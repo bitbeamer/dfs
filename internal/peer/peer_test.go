@@ -515,6 +515,38 @@ func TestEvaluateSetupAcknowledgementsAllowsOfflinePendingMembers(t *testing.T) 
 	}
 }
 
+func TestCurrentMachineMembershipsSupersedePurgedPeerIdentities(t *testing.T) {
+	base := time.Date(2026, 8, 19, 6, 0, 0, 0, time.UTC)
+	records := []membership.Record{
+		{Payload: membership.Payload{PeerID: "old-zeus", Name: "zeus", Hostname: "zeus", UpdatedAt: base}},
+		{Payload: membership.Payload{PeerID: "new-zeus", Name: "zeus", Hostname: "ZEUS.", UpdatedAt: base.Add(time.Minute)}},
+		{Payload: membership.Payload{PeerID: "iris", Name: "iris", Hostname: "iris", UpdatedAt: base}},
+	}
+	current, superseded := currentMachineMemberships(records)
+	var peerIDs []string
+	for _, record := range current {
+		peerIDs = append(peerIDs, record.Payload.PeerID)
+	}
+	if !slices.Equal(peerIDs, []string{"iris", "new-zeus"}) || !superseded["old-zeus"] || superseded["new-zeus"] {
+		t.Fatalf("current peers = %#v, superseded = %#v", peerIDs, superseded)
+	}
+	remotes := []repository.Remote{{Name: "dfs-peer-old-zeus"}, {Name: "dfs-peer-new-zeus"}, {Name: "storage"}}
+	if names := supersededRemoteNames(remotes, superseded); !slices.Equal(names, []string{"dfs-peer-old-zeus"}) {
+		t.Fatalf("superseded remotes = %#v", names)
+	}
+}
+
+func TestCurrentMachineMembershipsKeepSameNameOnDifferentHosts(t *testing.T) {
+	records := []membership.Record{
+		{Payload: membership.Payload{PeerID: "first", Name: "worker", Hostname: "first-host"}},
+		{Payload: membership.Payload{PeerID: "second", Name: "worker", Hostname: "second-host"}},
+	}
+	current, superseded := currentMachineMemberships(records)
+	if len(current) != 2 || len(superseded) != 0 {
+		t.Fatalf("current peers = %#v, superseded = %#v", current, superseded)
+	}
+}
+
 func TestEvaluateSetupAcknowledgementsRejectsIncompleteOnlineDirection(t *testing.T) {
 	report := MeshReport{
 		Peers: []MeshPeer{{PeerID: "a", PeerName: "ares"}, {PeerID: "z", PeerName: "zeus"}},

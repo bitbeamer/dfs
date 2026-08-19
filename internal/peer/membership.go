@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -102,6 +103,17 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 	if err != nil {
 		return err
 	}
+	if _, superseded, stateErr := acceptedMembershipState(ctx, repo, filesystemID); stateErr == nil {
+		for _, remote := range supersededRemoteNames(remotes, superseded) {
+			if err := repo.RemovePeer(ctx, remote); err != nil {
+				return fmt.Errorf("remove superseded DFS peer %s: %w", remote, err)
+			}
+		}
+		remotes, err = repo.Remotes(ctx)
+		if err != nil {
+			return err
+		}
+	}
 	remoteNames := make([]string, 0, len(remotes))
 	for _, remote := range remotes {
 		remoteNames = append(remoteNames, remote.Name)
@@ -118,7 +130,7 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("load replicated filesystem configuration: %w", err)
 	}
-	accepted, err := acceptedMembership(ctx, repo, filesystemID)
+	accepted, superseded, err := acceptedMembershipState(ctx, repo, filesystemID)
 	if err != nil {
 		return err
 	}
@@ -137,6 +149,11 @@ func ReconcileMembership(ctx context.Context, repo *repository.Repository) error
 					return err
 				}
 			}
+		}
+	}
+	for _, remote := range supersededRemoteNames(remotes, superseded) {
+		if err := repo.RemovePeer(ctx, remote); err != nil {
+			return fmt.Errorf("remove superseded DFS peer %s: %w", remote, err)
 		}
 	}
 	executable, err := os.Executable()
@@ -214,9 +231,14 @@ func remoteName(peerID string) string {
 }
 
 func acceptedMembership(ctx context.Context, repo *repository.Repository, filesystemID string) ([]membership.Record, error) {
+	accepted, _, err := acceptedMembershipState(ctx, repo, filesystemID)
+	return accepted, err
+}
+
+func acceptedMembershipState(ctx context.Context, repo *repository.Repository, filesystemID string) ([]membership.Record, map[string]bool, error) {
 	remotes, err := repo.Remotes(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var legacy []string
 	for _, remote := range remotes {
@@ -229,7 +251,61 @@ func acceptedMembership(ctx context.Context, repo *repository.Repository, filesy
 			}
 		}
 	}
-	return membership.Accepted(repo.Config.Repository, filesystemID, append(legacy, repo.Config.PeerID)...)
+	accepted, err := membership.Accepted(repo.Config.Repository, filesystemID, append(legacy, repo.Config.PeerID)...)
+	if err != nil {
+		return nil, nil, err
+	}
+	current, superseded := currentMachineMemberships(accepted)
+	return current, superseded, nil
+}
+
+func currentMachineMemberships(records []membership.Record) ([]membership.Record, map[string]bool) {
+	selected := make(map[string]membership.Record, len(records))
+	for _, record := range records {
+		hostname := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(record.Payload.Hostname)), ".")
+		if hostname == "" {
+			hostname = "peer-id:" + record.Payload.PeerID
+		}
+		name := strings.ToLower(strings.TrimSpace(record.Payload.Name))
+		machine := hostname + "\x00" + name
+		current, found := selected[machine]
+		if !found || record.Payload.UpdatedAt.After(current.Payload.UpdatedAt) ||
+			(record.Payload.UpdatedAt.Equal(current.Payload.UpdatedAt) && record.Payload.PeerID > current.Payload.PeerID) {
+			selected[machine] = record
+		}
+	}
+	current := make([]membership.Record, 0, len(selected))
+	active := make(map[string]bool, len(selected))
+	for _, record := range selected {
+		current = append(current, record)
+		active[record.Payload.PeerID] = true
+	}
+	sort.Slice(current, func(i, j int) bool { return current[i].Payload.PeerID < current[j].Payload.PeerID })
+	superseded := make(map[string]bool)
+	for _, record := range records {
+		if !active[record.Payload.PeerID] {
+			superseded[record.Payload.PeerID] = true
+		}
+	}
+	return current, superseded
+}
+
+func supersededRemoteNames(remotes []repository.Remote, superseded map[string]bool) []string {
+	var names []string
+	for _, remote := range remotes {
+		if !strings.HasPrefix(remote.Name, "dfs-peer-") {
+			continue
+		}
+		prefix := strings.TrimPrefix(remote.Name, "dfs-peer-")
+		for peerID := range superseded {
+			if strings.HasPrefix(peerID, prefix) {
+				names = append(names, remote.Name)
+				break
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func mustLoadMembership(repositoryPath string) []membership.Record {
