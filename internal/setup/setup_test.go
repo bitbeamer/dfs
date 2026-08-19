@@ -174,7 +174,7 @@ func TestSetupClusterVerificationReportsExpiredDeadlineAsIncompleteTopology(t *t
 		VerificationTimeout: int64(20 * time.Millisecond), Timeout: int64(time.Millisecond)}
 	checker := func(ctx context.Context, _ *repository.Repository, _, _ time.Duration) (peer.MeshReport, error) {
 		<-ctx.Done()
-		return peer.MeshReport{}, ctx.Err()
+		return peer.MeshReport{}, errors.New("git remote -v: context deadline exceeded")
 	}
 	err = verifySetupCluster(context.Background(), filepath.Join(home, "state.json"), state, Options{Out: os.Stderr, CheckCluster: checker})
 	if err == nil || !strings.Contains(err.Error(), "online DFS members have not acknowledged") || strings.Contains(err.Error(), "context deadline exceeded") {

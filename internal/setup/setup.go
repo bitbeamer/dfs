@@ -530,13 +530,13 @@ func verifySetupCluster(ctx context.Context, statePath string, state *State, opt
 			}
 		}
 		if err := verifyCtx.Err(); err != nil {
-			return setupVerificationTimeout(options.Out, last, checkErr)
+			return setupVerificationTimeout(options.Out, last, nil)
 		}
 		timer := time.NewTimer(2 * time.Second)
 		select {
 		case <-verifyCtx.Done():
 			timer.Stop()
-			return setupVerificationTimeout(options.Out, last, checkErr)
+			return setupVerificationTimeout(options.Out, last, nil)
 		case <-timer.C:
 			fmt.Fprintln(options.Out, "Waiting for online DFS members to acknowledge the new cluster topology...")
 		}
