@@ -119,6 +119,22 @@ func TestInvalidateEntryCanSkipFuseNotification(t *testing.T) {
 	}
 }
 
+func TestManagedMountConfiguresRangeStreaming(t *testing.T) {
+	root := t.TempDir()
+	filesystem, repo, _ := testFileSystem(t, root)
+	key := "SHA256E-s1--" + strings.Repeat("0", 64)
+	target := filepath.Join(".git", "annex", "objects", "AA", "BB", key, key)
+	if err := os.Symlink(target, filepath.Join(root, "remote.bin")); err != nil {
+		t.Fatal(err)
+	}
+	configureManagedContent(repo)
+	handle, code := filesystem.Open("remote.bin", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatalf("open missing managed content = %v, want range-backed handle", code)
+	}
+	handle.Release()
+}
+
 type failingUnmountServer struct{ err error }
 
 func (s failingUnmountServer) Unmount() error { return s.err }

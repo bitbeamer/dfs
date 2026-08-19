@@ -17,6 +17,7 @@ import (
 
 	"github.com/bitbeamer/dfs/internal/core"
 	"github.com/bitbeamer/dfs/internal/daemon"
+	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -199,6 +200,7 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 
 	operationCtx, cancelOperations := context.WithCancel(ctx)
 	defer cancelOperations()
+	configureManagedContent(repo)
 	coreService := core.New(repo, core.Options{ManagedContent: true})
 	defer coreService.Close()
 	filesystem := NewFileSystemWithContext(operationCtx, coreService, notifier, logger.With("component", "filesystem"))
@@ -290,6 +292,11 @@ func Run(repo *repository.Repository, mountpoint string, options Options) (runEr
 	}
 	logger.Info("mount stopped", "mountpoint", mountpoint)
 	return nil
+}
+
+func configureManagedContent(repo *repository.Repository) {
+	repo.SetManagedFetcher(managed.FetchPath)
+	repo.SetManagedRangeFetcher(managed.FetchRange)
 }
 
 func mountExitError(managed, shutdown bool) error {
