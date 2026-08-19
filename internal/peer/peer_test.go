@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -422,6 +423,17 @@ func TestDiscoveredJoinRequestRequiresExplicitBoundApproval(t *testing.T) {
 		RequestID: credentials.RequestID, Secret: credentials.Secret,
 	}, &ignored); err == nil {
 		t.Fatal("join status accepted the wrong certificate pin")
+	}
+}
+
+func TestApprovalOffersSelectsOnlyPeersThatAcceptedRequest(t *testing.T) {
+	offers := []Offer{{PeerName: "offline"}, {PeerName: "ares"}, {PeerName: "iris"}}
+	selected := approvalOffers(offers, []string{"ares"})
+	if len(selected) != 1 || selected[0].PeerName != "ares" {
+		t.Fatalf("approval offers = %#v, want only ares", selected)
+	}
+	if fallback := approvalOffers(offers, nil); !reflect.DeepEqual(fallback, offers) {
+		t.Fatalf("legacy approval offers = %#v, want all offers", fallback)
 	}
 }
 

@@ -108,7 +108,8 @@ func PollJoinApproval(ctx context.Context, network Network, credentials JoinRequ
 	}
 	request := JoinStatusRequest{RequestID: credentials.RequestID, Secret: credentials.Secret}
 	var failures []string
-	for _, offer := range network.Offers {
+	offers := approvalOffers(network.Offers, credentials.ApprovingPeers)
+	for _, offer := range offers {
 		if offer.ProtocolVersion != ProtocolVersion || offer.CertificateSHA256 == "" {
 			continue
 		}
@@ -125,10 +126,32 @@ func PollJoinApproval(ctx context.Context, network Network, credentials JoinRequ
 			return *response.Invitation, true, nil
 		}
 	}
-	if len(failures) == len(network.Offers) && len(failures) > 0 {
+	if len(failures) == len(offers) && len(failures) > 0 {
 		return Invitation{}, false, fmt.Errorf("cannot check DFS join approval: %s", strings.Join(failures, "; "))
 	}
 	return Invitation{}, false, nil
+}
+
+func approvalOffers(offers []Offer, approvingPeers []string) []Offer {
+	if len(approvingPeers) == 0 {
+		return offers
+	}
+	approved := make(map[string]bool, len(approvingPeers))
+	for _, name := range approvingPeers {
+		approved[name] = true
+	}
+	selected := make([]Offer, 0, len(approvingPeers))
+	for _, offer := range offers {
+		if approved[offer.PeerName] {
+			selected = append(selected, offer)
+		}
+	}
+	// Older persisted requests may not contain names matching current offers.
+	// Preserve their previous all-offer polling behavior.
+	if len(selected) == 0 {
+		return offers
+	}
+	return selected
 }
 
 func ListJoinRequests(repositoryPath string, now time.Time) ([]JoinRequestInfo, error) {

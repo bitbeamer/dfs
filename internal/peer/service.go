@@ -394,12 +394,20 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 			writeProtocolError(response, http.StatusInternalServerError, "cannot configure reverse peer")
 			return
 		}
+		refreshCtx, refreshCancel := context.WithTimeout(request.Context(), 30*time.Second)
+		if err := s.refreshEndorsements(refreshCtx); err != nil {
+			refreshCancel()
+			writeProtocolError(response, http.StatusInternalServerError, "cannot refresh approved membership: "+err.Error())
+			return
+		}
+		refreshCancel()
 		reconcileCtx, reconcileCancel := context.WithTimeout(request.Context(), 30*time.Second)
-		defer reconcileCancel()
 		if err := ReconcileMembership(reconcileCtx, s.repo); err != nil {
+			reconcileCancel()
 			writeProtocolError(response, http.StatusInternalServerError, "cannot reconcile approved membership: "+err.Error())
 			return
 		}
+		reconcileCancel()
 		for _, member := range s.members {
 			if member.Payload.PeerID == s.repo.Config.PeerID || member.Payload.PeerID == pending.PeerID {
 				continue
@@ -407,10 +415,6 @@ func (s *Service) handlePairComplete(response http.ResponseWriter, request *http
 			notifyCtx, notifyCancel := context.WithTimeout(request.Context(), 5*time.Second)
 			_ = managed.RequestReconcile(notifyCtx, s.repo, member.Payload.PeerID)
 			notifyCancel()
-		}
-		if err := s.refreshEndorsements(reconcileCtx); err != nil {
-			writeProtocolError(response, http.StatusInternalServerError, "cannot refresh approved membership")
-			return
 		}
 		if err := os.Remove(invitationPath(s.repo.Config.Repository, record.ID)); err != nil {
 			writeProtocolError(response, http.StatusInternalServerError, "cannot finalize pairing invitation")
