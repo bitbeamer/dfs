@@ -127,6 +127,7 @@ func CurrentMembers(repositoryPath, filesystemID, localPeerID string) ([]Member,
 	if err != nil {
 		return nil, err
 	}
+	records, _ = membership.CurrentMachines(records)
 	members := make([]Member, 0, len(records))
 	for _, record := range records {
 		members = append(members, Member{PeerID: record.Payload.PeerID, PeerName: record.Payload.Name, Endpoint: record.Payload.QUICEndpoint})

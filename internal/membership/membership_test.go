@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,25 @@ func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
 	accepted, err = Accepted(shared, filesystemID)
 	if err != nil || len(accepted) != 1 || accepted[0].Payload.PeerID != "alice-peer" {
 		t.Fatalf("locally persisted revocation was undone: %#v, %v", accepted, err)
+	}
+}
+
+func TestCurrentMachinesSelectsNewestReinstalledPeer(t *testing.T) {
+	base := time.Date(2026, 8, 19, 6, 0, 0, 0, time.UTC)
+	records := []Record{
+		{Payload: Payload{PeerID: "old-zeus", Name: "zeus", Hostname: "zeus", UpdatedAt: base}},
+		{Payload: Payload{PeerID: "new-zeus", Name: "zeus", Hostname: "ZEUS.", UpdatedAt: base.Add(time.Minute)}},
+		{Payload: Payload{PeerID: "worker-a", Name: "worker", Hostname: "first-host", UpdatedAt: base}},
+		{Payload: Payload{PeerID: "worker-b", Name: "worker", Hostname: "second-host", UpdatedAt: base}},
+	}
+	current, superseded := CurrentMachines(records)
+	var peerIDs []string
+	for _, record := range current {
+		peerIDs = append(peerIDs, record.Payload.PeerID)
+	}
+	want := []string{"new-zeus", "worker-a", "worker-b"}
+	if !slices.Equal(peerIDs, want) || !superseded["old-zeus"] || superseded["new-zeus"] {
+		t.Fatalf("current peers = %#v, superseded = %#v", peerIDs, superseded)
 	}
 }
 

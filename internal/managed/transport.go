@@ -1015,7 +1015,10 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 			return orderedSubset(peerIDs, found)
 		case value := <-results:
 			if value.has {
-				found[value.peerID] = true
+				// One verified online holder is enough to begin the demand read.
+				// Do not let an unrelated offline probe consume the interactive
+				// availability budget after content has already been located.
+				return []string{value.peerID}
 			}
 		}
 	}

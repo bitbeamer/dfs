@@ -263,34 +263,7 @@ func acceptedMembershipState(ctx context.Context, repo *repository.Repository, f
 }
 
 func currentMachineMemberships(records []membership.Record) ([]membership.Record, map[string]bool) {
-	selected := make(map[string]membership.Record, len(records))
-	for _, record := range records {
-		hostname := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(record.Payload.Hostname)), ".")
-		if hostname == "" {
-			hostname = "peer-id:" + record.Payload.PeerID
-		}
-		name := strings.ToLower(strings.TrimSpace(record.Payload.Name))
-		machine := hostname + "\x00" + name
-		current, found := selected[machine]
-		if !found || record.Payload.UpdatedAt.After(current.Payload.UpdatedAt) ||
-			(record.Payload.UpdatedAt.Equal(current.Payload.UpdatedAt) && record.Payload.PeerID > current.Payload.PeerID) {
-			selected[machine] = record
-		}
-	}
-	current := make([]membership.Record, 0, len(selected))
-	active := make(map[string]bool, len(selected))
-	for _, record := range selected {
-		current = append(current, record)
-		active[record.Payload.PeerID] = true
-	}
-	sort.Slice(current, func(i, j int) bool { return current[i].Payload.PeerID < current[j].Payload.PeerID })
-	superseded := make(map[string]bool)
-	for _, record := range records {
-		if !active[record.Payload.PeerID] {
-			superseded[record.Payload.PeerID] = true
-		}
-	}
-	return current, superseded
+	return membership.CurrentMachines(records)
 }
 
 func supersededRemoteNames(remotes []repository.Remote, superseded map[string]bool) []string {

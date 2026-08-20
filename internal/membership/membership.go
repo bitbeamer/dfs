@@ -631,6 +631,40 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 	return accepted, nil
 }
 
+// CurrentMachines collapses accepted records left behind by peer reinstalls to
+// the newest identity for each named machine. A reinstalled host keeps its
+// hostname and peer name but receives a new peer ID and signing key.
+func CurrentMachines(records []Record) ([]Record, map[string]bool) {
+	selected := make(map[string]Record, len(records))
+	for _, record := range records {
+		hostname := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(record.Payload.Hostname)), ".")
+		if hostname == "" {
+			hostname = "peer-id:" + record.Payload.PeerID
+		}
+		name := strings.ToLower(strings.TrimSpace(record.Payload.Name))
+		machine := hostname + "\x00" + name
+		current, found := selected[machine]
+		if !found || record.Payload.UpdatedAt.After(current.Payload.UpdatedAt) ||
+			(record.Payload.UpdatedAt.Equal(current.Payload.UpdatedAt) && record.Payload.PeerID > current.Payload.PeerID) {
+			selected[machine] = record
+		}
+	}
+	current := make([]Record, 0, len(selected))
+	active := make(map[string]bool, len(selected))
+	for _, record := range selected {
+		current = append(current, record)
+		active[record.Payload.PeerID] = true
+	}
+	sort.Slice(current, func(i, j int) bool { return current[i].Payload.PeerID < current[j].Payload.PeerID })
+	superseded := make(map[string]bool)
+	for _, record := range records {
+		if !active[record.Payload.PeerID] {
+			superseded[record.Payload.PeerID] = true
+		}
+	}
+	return current, superseded
+}
+
 func AcceptedRevocations(repositoryPath, filesystemID string) (map[string]bool, error) {
 	trusted, err := LoadTrusted(repositoryPath)
 	if err != nil {
