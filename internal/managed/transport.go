@@ -790,15 +790,24 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	started := time.Now()
 	planningCtx, cancel := context.WithTimeout(ctx, contentAvailabilityBudget)
 	defer cancel()
-	peerIDs, err := optimizedPeerIDs(ctx, repo, "interactive")
+	allPeerIDs, err := optimizedPeerIDs(ctx, repo, "interactive")
 	if err != nil {
 		return 0, err
 	}
-	peerIDs = contentCandidates(repo.Config.Repository, key, peerIDs)
-	if len(peerIDs) == 0 {
-		return 0, fmt.Errorf("%w: every accepted peer is temporarily offline", repository.ErrContentUnavailable)
+	if len(allPeerIDs) == 0 {
+		return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityNoTrustedPeers,
+			Detail: "no accepted remote peer can serve content"}
 	}
-	hints := repo.PeerContentHints(planningCtx, key, peerIDs)
+	allHints := repo.PeerContentHints(planningCtx, key, allPeerIDs)
+	peerIDs := contentCandidates(repo.Config.Repository, key, allPeerIDs)
+	if len(peerIDs) == 0 {
+		reason := repository.AvailabilityAcceptedPeersOffline
+		if len(allHints) > 0 {
+			reason = repository.AvailabilityKnownHoldersOffline
+		}
+		return 0, &repository.ContentUnavailableError{Reason: reason, Detail: "every candidate peer is in transfer backoff"}
+	}
+	hints := orderedIntersection(peerIDs, allHints)
 	candidates := hints
 	discovery := "annex-location"
 	if len(candidates) == 0 {
@@ -809,7 +818,7 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 		"holder_hints", len(hints), "candidates", len(candidates), "discovery", discovery,
 		"duration", time.Since(started))
 	repo.RecordContentPlan(discovery, "")
-	total, payload, sourcePeer, failures := fetchRangeCandidates(planningCtx, repo, key, offset, length, candidates)
+	total, payload, sourcePeer, failures, allUnreachable := fetchRangeCandidates(planningCtx, repo, key, offset, length, candidates)
 	if payload != nil {
 		repo.RecordContentPlan("", sourcePeer)
 		_, copyErr := output.Write(payload)
@@ -824,7 +833,10 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	if len(hints) > 0 && planningCtx.Err() == nil {
 		discovered := discoverContentHolders(planningCtx, repo, key, peerIDs)
 		discovered = withoutPeerIDs(discovered, hints)
-		fallbackTotal, fallbackPayload, fallbackSource, fallbackFailures := fetchRangeCandidates(planningCtx, repo, key, offset, length, discovered)
+		fallbackTotal, fallbackPayload, fallbackSource, fallbackFailures, fallbackUnreachable := fetchRangeCandidates(planningCtx, repo, key, offset, length, discovered)
+		if len(fallbackFailures) > 0 {
+			allUnreachable = allUnreachable && fallbackUnreachable
+		}
 		failures = append(failures, fallbackFailures...)
 		if fallbackPayload != nil {
 			repo.RecordContentPlan("parallel-has-content", fallbackSource)
@@ -837,22 +849,43 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	}
 	if errors.Is(planningCtx.Err(), context.DeadlineExceeded) {
 		failures = append(failures, "availability budget exceeded")
+		return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityTimeout,
+			Detail: strings.Join(failures, "; ")}
 	}
 	if len(failures) == 0 {
-		return 0, fmt.Errorf("%w: no online peer reports this object", repository.ErrContentUnavailable)
+		return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityNoOnlineCopy,
+			Detail: "online accepted peers do not report this object"}
 	}
-	return 0, fmt.Errorf("%w: managed range fetch failed: %s", repository.ErrContentUnavailable, strings.Join(failures, "; "))
+	if allUnreachable {
+		reason := repository.AvailabilityAcceptedPeersOffline
+		if len(allHints) > 0 {
+			reason = repository.AvailabilityKnownHoldersOffline
+		}
+		return 0, &repository.ContentUnavailableError{Reason: reason, Detail: strings.Join(failures, "; ")}
+	}
+	return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityTransferFailed,
+		Detail: "managed range fetch failed: " + strings.Join(failures, "; ")}
+}
+
+func orderedIntersection(order, included []string) []string {
+	wanted := make(map[string]bool, len(included))
+	for _, peerID := range included {
+		wanted[peerID] = true
+	}
+	return orderedSubset(order, wanted)
 }
 
 type rangeCandidateResult struct {
-	peerID string
-	total  int64
-	data   []byte
-	err    error
+	peerID      string
+	total       int64
+	data        []byte
+	unreachable bool
+	err         error
 }
 
-func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key string, offset, length int64, peerIDs []string) (int64, []byte, string, []string) {
+func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key string, offset, length int64, peerIDs []string) (int64, []byte, string, []string, bool) {
 	var failures []string
+	allUnreachable := true
 	for start := 0; start < len(peerIDs); start += 2 {
 		end := min(start+2, len(peerIDs))
 		batch := peerIDs[start:end]
@@ -873,7 +906,7 @@ func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key 
 			select {
 			case <-ctx.Done():
 				cancel()
-				return 0, nil, "", append(failures, ctx.Err().Error())
+				return 0, nil, "", append(failures, ctx.Err().Error()), allUnreachable
 			case <-hedge:
 				if launched < len(batch) {
 					launch(batch[launched])
@@ -884,8 +917,9 @@ func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key 
 				received++
 				if result.err == nil {
 					cancel()
-					return result.total, result.data, result.peerID, failures
+					return result.total, result.data, result.peerID, failures, false
 				}
+				allUnreachable = allUnreachable && result.unreachable
 				failures = append(failures, result.peerID+": "+result.err.Error())
 				if launched < len(batch) {
 					launch(batch[launched])
@@ -896,7 +930,7 @@ func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key 
 		}
 		cancel()
 	}
-	return 0, nil, "", failures
+	return 0, nil, "", failures, allUnreachable
 }
 
 func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerID, key string, offset, length int64) rangeCandidateResult {
@@ -910,6 +944,7 @@ func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerI
 			unavailableContent.mark(repo.Config.Repository, peerID, key)
 		} else {
 			peerAvailability.markFailure(repo.Config.Repository, peerID)
+			result.unreachable = true
 		}
 		result.err = err
 		return result
@@ -1038,7 +1073,8 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 		}
 	}
 	if len(peerIDs) == 0 {
-		return errors.New("no trusted managed content source is available")
+		return &repository.ContentUnavailableError{Reason: repository.AvailabilityNoOnlineCopy,
+			Detail: "no trusted managed content source is available"}
 	}
 	stateDirectory := filepath.Join(repo.Config.Repository, ".git", "dfs")
 	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
@@ -1069,7 +1105,8 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 		}
 		failures = append(failures, peerID+": "+fetchErr.Error())
 	}
-	return fmt.Errorf("%w: managed content fetch failed: %s", repository.ErrContentUnavailable, strings.Join(failures, "; "))
+	return &repository.ContentUnavailableError{Reason: repository.AvailabilityTransferFailed,
+		Detail: "managed content fetch failed: " + strings.Join(failures, "; ")}
 }
 
 func contentCandidates(repositoryPath, key string, peerIDs []string) []string {

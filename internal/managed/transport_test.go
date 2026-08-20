@@ -403,6 +403,9 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if !errors.Is(offlineRangeErr, repository.ErrContentUnavailable) {
 		t.Fatalf("all-offline range error = %v, want content unavailable", offlineRangeErr)
 	}
+	if reason := repository.ContentAvailabilityReason(offlineRangeErr); reason != repository.AvailabilityTimeout && reason != repository.AvailabilityKnownHoldersOffline {
+		t.Fatalf("all-offline availability reason = %q", reason)
+	}
 	if elapsed := time.Since(offlineRangeStarted); elapsed > contentAvailabilityBudget+500*time.Millisecond {
 		t.Fatalf("all-offline range exceeded one availability budget: %s", elapsed)
 	}

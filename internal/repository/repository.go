@@ -88,17 +88,18 @@ type StorageRemote struct {
 }
 
 type ContentReadDiagnostics struct {
-	Active         int       `json:"active"`
-	LastPath       string    `json:"last_path,omitempty"`
-	LastOffset     int64     `json:"last_offset,omitempty"`
-	LastBytes      int       `json:"last_bytes,omitempty"`
-	LastPlan       string    `json:"last_plan,omitempty"`
-	LastSourcePeer string    `json:"last_source_peer,omitempty"`
-	LastOutcome    string    `json:"last_outcome,omitempty"`
-	LastError      string    `json:"last_error,omitempty"`
-	StartedAt      time.Time `json:"started_at,omitempty"`
-	CompletedAt    time.Time `json:"completed_at,omitempty"`
-	DurationMS     int64     `json:"duration_ms,omitempty"`
+	Active                 int       `json:"active"`
+	LastPath               string    `json:"last_path,omitempty"`
+	LastOffset             int64     `json:"last_offset,omitempty"`
+	LastBytes              int       `json:"last_bytes,omitempty"`
+	LastPlan               string    `json:"last_plan,omitempty"`
+	LastSourcePeer         string    `json:"last_source_peer,omitempty"`
+	LastOutcome            string    `json:"last_outcome,omitempty"`
+	LastAvailabilityReason string    `json:"last_availability_reason,omitempty"`
+	LastError              string    `json:"last_error,omitempty"`
+	StartedAt              time.Time `json:"started_at,omitempty"`
+	CompletedAt            time.Time `json:"completed_at,omitempty"`
+	DurationMS             int64     `json:"duration_ms,omitempty"`
 }
 
 type CachedFile struct {
@@ -365,6 +366,7 @@ func (r *Repository) BeginContentRead(path string, offset int64, bytes int) func
 	r.contentRead.LastPlan = ""
 	r.contentRead.LastSourcePeer = ""
 	r.contentRead.LastOutcome = "active"
+	r.contentRead.LastAvailabilityReason = ""
 	r.contentRead.LastError = ""
 	r.contentRead.StartedAt = started.UTC()
 	r.contentRead.CompletedAt = time.Time{}
@@ -393,6 +395,7 @@ func (r *Repository) BeginContentRead(path string, offset int64, bytes int) func
 		}
 		if err != nil {
 			r.contentRead.LastError = err.Error()
+			r.contentRead.LastAvailabilityReason = ContentAvailabilityReason(err)
 		}
 	}
 }
@@ -990,7 +993,7 @@ func (r *Repository) FetchFromDurableStorage(ctx context.Context, path string) e
 		return err
 	}
 	if len(storages) == 0 {
-		return ErrContentUnavailable
+		return &ContentUnavailableError{Reason: AvailabilityDurableUnavailable, Detail: "no durable storage remote is configured"}
 	}
 	var failures []string
 	for _, storage := range storages {
@@ -1008,7 +1011,8 @@ func (r *Repository) FetchFromDurableStorage(ctx context.Context, path string) e
 		}
 		failures = append(failures, storage.Name+": "+fetchErr.Error())
 	}
-	return fmt.Errorf("%w: durable storage fetch failed: %s", ErrContentUnavailable, strings.Join(failures, "; "))
+	return &ContentUnavailableError{Reason: AvailabilityDurableUnavailable,
+		Detail: "durable storage fetch failed: " + strings.Join(failures, "; ")}
 }
 
 func (r *Repository) Unlock(ctx context.Context, path string) error {

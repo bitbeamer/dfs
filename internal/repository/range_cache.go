@@ -26,6 +26,39 @@ const (
 
 var ErrContentUnavailable = errors.New("annex content is unavailable")
 
+const (
+	AvailabilityNoTrustedPeers       = "no_trusted_peers"
+	AvailabilityAcceptedPeersOffline = "accepted_peers_offline"
+	AvailabilityKnownHoldersOffline  = "known_holders_offline"
+	AvailabilityNoOnlineCopy         = "no_online_copy"
+	AvailabilityTimeout              = "availability_timeout"
+	AvailabilityTransferFailed       = "transfer_failed"
+	AvailabilityDurableLimit         = "durable_limit"
+	AvailabilityDurableUnavailable   = "durable_unavailable"
+)
+
+type ContentUnavailableError struct {
+	Reason string
+	Detail string
+}
+
+func (err *ContentUnavailableError) Error() string {
+	if err.Detail == "" {
+		return "annex content is unavailable: " + err.Reason
+	}
+	return "annex content is unavailable: " + err.Reason + ": " + err.Detail
+}
+
+func (err *ContentUnavailableError) Unwrap() error { return ErrContentUnavailable }
+
+func ContentAvailabilityReason(err error) string {
+	var unavailable *ContentUnavailableError
+	if errors.As(err, &unavailable) {
+		return unavailable.Reason
+	}
+	return ""
+}
+
 // ManagedRangeFetcher copies exactly length bytes at offset from a trusted
 // peer and returns the peer's complete object size.
 type ManagedRangeFetcher func(context.Context, *Repository, string, int64, int64, io.Writer) (int64, error)
@@ -136,8 +169,9 @@ func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offs
 			return 0, ensureErr
 		}
 		if size > durableFallbackMaxSize {
-			return 0, fmt.Errorf("%w: peer sources failed and %d-byte object exceeds the %d-byte bounded durable hydration limit",
-				ensureErr, size, durableFallbackMaxSize)
+			return 0, &ContentUnavailableError{Reason: AvailabilityDurableLimit,
+				Detail: fmt.Sprintf("peer plan failed (%v); %d-byte object exceeds the %d-byte bounded durable hydration limit",
+					ensureErr, size, durableFallbackMaxSize)}
 		}
 		fallbackCtx, cancel := context.WithTimeout(ctx, durableFallbackTimeout)
 		fallbackStarted := time.Now()
@@ -147,7 +181,8 @@ func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offs
 		r.LogContentRead("durable content fallback", "path", path, "size", size,
 			"duration", time.Since(fallbackStarted), "error", fallbackErr)
 		if fallbackErr != nil {
-			return 0, fmt.Errorf("%w; %v", ensureErr, fallbackErr)
+			return 0, &ContentUnavailableError{Reason: AvailabilityDurableUnavailable,
+				Detail: fmt.Sprintf("peer plan failed (%v); durable plan failed (%v)", ensureErr, fallbackErr)}
 		}
 		file, openErr := os.Open(filepath.Join(r.Config.Repository, filepath.FromSlash(path)))
 		if openErr != nil {

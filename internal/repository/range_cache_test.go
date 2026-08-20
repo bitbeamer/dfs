@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -353,5 +354,15 @@ func TestRangeReadFallsBackToBoundedDurableHydration(t *testing.T) {
 	}
 	if diagnostics := repo.ContentReadDiagnostics(); diagnostics.LastPlan != "durable-full-hydration" || diagnostics.LastOutcome != "ready" {
 		t.Fatalf("durable fallback diagnostics = %#v", diagnostics)
+	}
+}
+
+func TestContentUnavailableReasonSurvivesWrapping(t *testing.T) {
+	err := fmt.Errorf("read failed: %w", &ContentUnavailableError{Reason: AvailabilityKnownHoldersOffline, Detail: "iris is offline"})
+	if !errors.Is(err, ErrContentUnavailable) {
+		t.Fatal("typed availability error does not wrap the public sentinel")
+	}
+	if reason := ContentAvailabilityReason(err); reason != AvailabilityKnownHoldersOffline {
+		t.Fatalf("availability reason = %q", reason)
 	}
 }

@@ -1531,6 +1531,9 @@ func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
 		if report.ContentRead.LastError != "" {
 			fmt.Fprintf(output, "  Detail: %s", compactHealthDetail(report.ContentRead.LastError))
 		}
+		if report.ContentRead.LastAvailabilityReason != "" {
+			fmt.Fprintf(output, "  Availability: %s", report.ContentRead.LastAvailabilityReason)
+		}
 		fmt.Fprintln(output)
 	}
 	for _, state := range report.ContentPeers {
