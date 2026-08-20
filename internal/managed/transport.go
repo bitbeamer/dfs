@@ -1456,14 +1456,24 @@ func trustedMember(repositoryPath, peerID string) (membership.Record, error) {
 	if err != nil {
 		return membership.Record{}, fmt.Errorf("load DFS membership: %w", err)
 	}
+	var target membership.Record
+	found := false
 	for _, record := range records {
-		revoked, err := membership.AcceptedRevocations(repositoryPath, record.Payload.FileSystemID)
-		if err != nil {
-			return membership.Record{}, fmt.Errorf("load DFS membership revocations: %w", err)
+		if record.Payload.PeerID == peerID && trusted[peerID] == record.Payload.SigningPublicKey {
+			target = record
+			found = true
+			break
 		}
-		if record.Payload.PeerID == peerID && trusted[peerID] == record.Payload.SigningPublicKey && !record.Payload.Revoked && !revoked[peerID] {
-			return record, nil
-		}
+	}
+	if !found || target.Payload.Revoked {
+		return membership.Record{}, fmt.Errorf("peer %s is not in trusted DFS membership", peerID)
+	}
+	revoked, err := membership.AcceptedRevocations(repositoryPath, target.Payload.FileSystemID)
+	if err != nil {
+		return membership.Record{}, fmt.Errorf("load DFS membership revocations: %w", err)
+	}
+	if !revoked[peerID] {
+		return target, nil
 	}
 	return membership.Record{}, fmt.Errorf("peer %s is not in trusted DFS membership", peerID)
 }
