@@ -313,6 +313,7 @@ func (r *Repository) fetchRangeExtent(ctx context.Context, state *rangeState, ke
 	if err != nil {
 		return err
 	}
+	writeStarted := time.Now()
 	_, writeErr := file.WriteAt([]byte(payload.String()), extent.Start)
 	closeErr := file.Close()
 	if writeErr != nil {
@@ -321,6 +322,8 @@ func (r *Repository) fetchRangeExtent(ctx context.Context, state *rangeState, ke
 	if closeErr != nil {
 		return closeErr
 	}
+	r.LogContentRead("content range cached", "offset", extent.Start, "bytes", extent.End-extent.Start,
+		"duration", time.Since(writeStarted))
 	r.LogContentRead("content range fetched", "offset", extent.Start, "bytes", extent.End-extent.Start,
 		"duration", time.Since(started))
 	return nil
@@ -379,6 +382,7 @@ func (r *Repository) persistRangeState(state *rangeState, path, key string, size
 		cachePath, metadataPath := state.cachePath, state.metadataPath
 		state.mu.Unlock()
 
+		persistStarted := time.Now()
 		file, err := os.OpenFile(cachePath, os.O_RDWR, 0o600)
 		if err == nil {
 			err = file.Sync()
@@ -389,6 +393,9 @@ func (r *Repository) persistRangeState(state *rangeState, path, key string, size
 		}
 		if err != nil {
 			r.LogContentRead("persist range cache failed", "path", path, "error", err)
+		} else {
+			r.LogContentRead("range cache persisted", "path", path, "ranges", len(ranges),
+				"duration", time.Since(persistStarted))
 		}
 
 		state.mu.Lock()

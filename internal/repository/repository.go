@@ -347,6 +347,12 @@ func (r *Repository) LogContentRead(message string, attributes ...any) {
 	}
 }
 
+func (r *Repository) LogContentReadDebug(message string, attributes ...any) {
+	if r.logger != nil {
+		r.logger.Debug(message, append([]any{"component", "content-read"}, attributes...)...)
+	}
+}
+
 func (r *Repository) BeginContentRead(path string, offset int64, bytes int) func(error) {
 	started := time.Now()
 	r.contentReadMu.Lock()

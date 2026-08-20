@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bitbeamer/dfs/internal/store"
 )
@@ -50,7 +51,19 @@ func annexSize(target string) (int64, bool) {
 	return size, err == nil
 }
 
-func (s *Service) OpenRead(ctx context.Context, path string) (ReadHandle, error) {
+func (s *Service) OpenRead(ctx context.Context, path string) (handleResult ReadHandle, returnErr error) {
+	started := time.Now()
+	defer func() {
+		mode := "failed"
+		switch handleResult.(type) {
+		case *localReadHandle:
+			mode = "local"
+		case *rangeReadHandle:
+			mode = "remote-range"
+		}
+		s.repo.LogContentReadDebug("content open completed", "path", path, "mode", mode,
+			"duration", time.Since(started), "error", returnErr)
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open read", path, err)
 	}

@@ -92,7 +92,11 @@ func (s *Service) resolve(path string) (string, string, error) {
 	return cleaned, filepath.Join(s.root, filepath.FromSlash(cleaned)), nil
 }
 
-func (s *Service) Lookup(ctx context.Context, path string) (Entry, error) {
+func (s *Service) Lookup(ctx context.Context, path string) (entry Entry, returnErr error) {
+	started := time.Now()
+	defer func() {
+		s.repo.LogContentReadDebug("content lookup completed", "path", path, "duration", time.Since(started), "error", returnErr)
+	}()
 	if err := ctx.Err(); err != nil {
 		return Entry{}, classify("lookup", path, err)
 	}

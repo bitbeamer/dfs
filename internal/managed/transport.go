@@ -901,6 +901,7 @@ func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key 
 
 func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerID, key string, offset, length int64) rangeCandidateResult {
 	result := rangeCandidateResult{peerID: peerID}
+	started := time.Now()
 	stream, reader, response, err := openContentStream(ctx, repo, peerID, Request{
 		Operation: "annex-range", Key: key, Offset: offset, Length: length,
 	})
@@ -920,13 +921,22 @@ func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerI
 		return result
 	}
 	result.data = make([]byte, response.Size)
-	_, result.err = io.ReadFull(reader, result.data)
+	if len(result.data) > 0 {
+		result.data[0], result.err = reader.ReadByte()
+		if result.err == nil {
+			repo.LogContentRead("content first byte received", "peer_id", peerID, "offset", offset,
+				"requested_bytes", length, "duration", time.Since(started))
+			_, result.err = io.ReadFull(reader, result.data[1:])
+		}
+	}
 	if result.err != nil {
 		contentSessions.invalidate(repo.Config.Repository, peerID)
 		peerAvailability.markFailure(repo.Config.Repository, peerID)
 		return result
 	}
 	result.total = response.TotalSize
+	repo.LogContentRead("content range received", "peer_id", peerID, "offset", offset, "bytes", length,
+		"duration", time.Since(started))
 	unavailableContent.clear(repo.Config.Repository, peerID, key)
 	peerAvailability.markSuccess(repo.Config.Repository, peerID)
 	return result
@@ -1232,18 +1242,18 @@ func (pool *contentSessionPool) session(repositoryPath, peerID string) *contentS
 	return session
 }
 
-func (pool *contentSessionPool) connection(ctx context.Context, repo *repository.Repository, peerID string) (*quic.Conn, error) {
+func (pool *contentSessionPool) connection(ctx context.Context, repo *repository.Repository, peerID string) (*quic.Conn, bool, error) {
 	target, err := trustedMember(repo.Config.Repository, peerID)
 	if err != nil {
 		pool.invalidate(repo.Config.Repository, peerID)
-		return nil, err
+		return nil, false, err
 	}
 	fingerprint := fmt.Sprintf("%s\x00%s\x00%d", target.Payload.QUICEndpoint, target.Payload.SigningPublicKey, target.Payload.Generation)
 	session := pool.session(repo.Config.Repository, peerID)
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.connection != nil && session.connection.Context().Err() == nil && session.fingerprint == fingerprint {
-		return session.connection, nil
+		return session.connection, true, nil
 	}
 	if session.connection != nil {
 		_ = session.connection.CloseWithError(0, "membership changed")
@@ -1251,11 +1261,11 @@ func (pool *contentSessionPool) connection(ctx context.Context, repo *repository
 	}
 	connection, _, err := Dial(ctx, repo, peerID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	session.connection = connection
 	session.fingerprint = fingerprint
-	return connection, nil
+	return connection, false, nil
 }
 
 func (pool *contentSessionPool) invalidate(repositoryPath, peerID string) {
@@ -1270,8 +1280,11 @@ func (pool *contentSessionPool) invalidate(repositoryPath, peerID string) {
 }
 
 func openContentStream(ctx context.Context, repo *repository.Repository, peerID string, request Request) (*quic.Stream, *bufio.Reader, Response, error) {
-	connection, err := contentSessions.connection(ctx, repo, peerID)
+	started := time.Now()
+	connection, reused, err := contentSessions.connection(ctx, repo, peerID)
 	if err != nil {
+		repo.LogContentRead("content connection failed", "peer_id", peerID, "operation", request.Operation,
+			"duration", time.Since(started), "error", err)
 		return nil, nil, Response{}, err
 	}
 	stream, err := connection.OpenStreamSync(ctx)
@@ -1311,6 +1324,8 @@ func openContentStream(ctx context.Context, repo *repository.Repository, peerID 
 		_ = stream.Close()
 		return nil, nil, response, errors.New(response.Error)
 	}
+	repo.LogContentReadDebug("content stream opened", "peer_id", peerID, "operation", request.Operation,
+		"connection_reused", reused, "duration", time.Since(started))
 	return stream, reader, response, nil
 }
 

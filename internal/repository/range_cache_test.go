@@ -223,6 +223,40 @@ func TestRangeReadCancellationStopsTransfer(t *testing.T) {
 	}
 }
 
+func TestRangeReadCancellationStopsBackgroundReadAhead(t *testing.T) {
+	payload := make([]byte, 8<<20)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	readAheadStarted := make(chan struct{})
+	repo.SetManagedRangeFetcher(func(ctx context.Context, _ *Repository, _ string, offset, length int64, output io.Writer) (int64, error) {
+		if offset == 0 {
+			_, err := output.Write(payload[:length])
+			return int64(len(payload)), err
+		}
+		close(readAheadStarted)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	key := rangeTestKey(payload)
+	if _, err := repo.ReadRange(ctx, "sequential.bin", key, int64(len(payload)), 0, make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReadRange(ctx, "sequential.bin", key, int64(len(payload)), 4096, make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-readAheadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sequential read-ahead did not start")
+	}
+	cancel()
+	waitCtx, stopWaiting := context.WithTimeout(context.Background(), time.Second)
+	defer stopWaiting()
+	if err := repo.WaitForRangeTasks(waitCtx); err != nil {
+		t.Fatalf("canceled read-ahead did not stop: %v", err)
+	}
+}
+
 func TestPartialRangeCacheEvictsOldestInactiveObject(t *testing.T) {
 	root := t.TempDir()
 	repo := rangeTestRepository(t, root, rangeDemandQuantum)
