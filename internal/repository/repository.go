@@ -985,6 +985,27 @@ func (r *Repository) PeerContentHints(ctx context.Context, key string, peerIDs [
 	return result
 }
 
+// RecordPeerAnnexUUID associates an authenticated DFS peer with the annex
+// location-log identity it reported. This is routing metadata only; transport
+// authorization continues to use signed membership.
+func (r *Repository) RecordPeerAnnexUUID(ctx context.Context, peerID, annexUUID string) error {
+	peerID = strings.TrimSpace(peerID)
+	annexUUID = strings.TrimSpace(annexUUID)
+	if len(peerID) < 12 || strings.ContainsAny(peerID, "\r\n\x00") || len(annexUUID) != 36 || strings.Count(annexUUID, "-") != 4 || strings.ContainsAny(annexUUID, "\r\n\x00 ") {
+		return errors.New("invalid peer annex identity")
+	}
+	shortID := peerID[:12]
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := "remote.dfs-peer-" + shortID + ".annex-uuid"
+	current, err := r.runner.Run(ctx, "git", "config", "--get", key)
+	if err == nil && strings.TrimSpace(current) == annexUUID {
+		return nil
+	}
+	_, err = r.runner.Run(ctx, "git", "config", key, annexUUID)
+	return err
+}
+
 // FetchFromDurableStorage hydrates path from explicitly configured durable
 // git-annex remotes only. Peer remotes and the metadata relay are excluded.
 func (r *Repository) FetchFromDurableStorage(ctx context.Context, path string) error {

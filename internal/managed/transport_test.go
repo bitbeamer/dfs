@@ -137,6 +137,9 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 		if response.TotalSize != int64(len(payload)) {
 			t.Fatalf("content holder size = %d, want %d", response.TotalSize, len(payload))
 		}
+		if response.AnnexUUID == "" {
+			t.Fatal("content holder omitted annex UUID")
+		}
 		_ = stream.Close()
 	}
 	if connections := server.connections.Load() - connectionsBefore; connections != 1 {

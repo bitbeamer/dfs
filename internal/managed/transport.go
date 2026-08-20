@@ -61,6 +61,7 @@ type Response struct {
 	Error     string          `json:"error,omitempty"`
 	Size      int64           `json:"size,omitempty"`
 	TotalSize int64           `json:"total_size,omitempty"`
+	AnnexUUID string          `json:"annex_uuid,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -269,7 +270,10 @@ func (s *Server) serveHasContent(stream *quic.Stream, key string) {
 		writeResponse(stream, Response{Error: "annex content is unavailable"})
 		return
 	}
-	writeResponse(stream, Response{OK: true, TotalSize: info.Size()})
+	uuidCommand := exec.CommandContext(stream.Context(), "git", "config", "--get", "annex.uuid")
+	uuidCommand.Dir = s.repo.Config.Repository
+	uuid, _ := uuidCommand.Output()
+	writeResponse(stream, Response{OK: true, TotalSize: info.Size(), AnnexUUID: strings.TrimSpace(string(uuid))})
 }
 
 func RequestReconcile(ctx context.Context, repo *repository.Repository, peerID string) error {
@@ -989,10 +993,11 @@ func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerI
 
 func discoverContentHolders(ctx context.Context, repo *repository.Repository, key string, peerIDs []string) []string {
 	type result struct {
-		peerID   string
-		has      bool
-		duration time.Duration
-		err      error
+		peerID    string
+		has       bool
+		annexUUID string
+		duration  time.Duration
+		err       error
 	}
 	results := make(chan result, len(peerIDs))
 	count := 0
@@ -1010,7 +1015,7 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 			if err == nil && response.TotalSize > 0 {
 				peerAvailability.markSuccess(repo.Config.Repository, peerID)
 				unavailableContent.clear(repo.Config.Repository, peerID, key)
-				results <- result{peerID: peerID, has: true, duration: time.Since(started)}
+				results <- result{peerID: peerID, has: true, annexUUID: response.AnnexUUID, duration: time.Since(started)}
 				return
 			}
 			if isUnavailableContent(err) {
@@ -1032,6 +1037,13 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 					"duration", value.duration, "error", value.err)
 			}
 			if value.has {
+				if value.annexUUID != "" {
+					go func(peerID, annexUUID string) {
+						persistCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+						defer cancel()
+						_ = repo.RecordPeerAnnexUUID(persistCtx, peerID, annexUUID)
+					}(value.peerID, value.annexUUID)
+				}
 				// One verified online holder is enough to begin the demand read.
 				// Do not let an unrelated offline probe consume the interactive
 				// availability budget after content has already been located.
