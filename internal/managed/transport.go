@@ -198,6 +198,7 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 		writeResponse(stream, Response{Error: "unsupported DFS transport protocol"})
 		return
 	}
+	s.repo.LogContentRead("content request received", "operation", request.Operation)
 	switch request.Operation {
 	case "ping":
 		writeResponse(stream, Response{OK: true})
@@ -581,6 +582,7 @@ func userVisibleRefs(ctx context.Context, repositoryPath string) []byte {
 }
 
 func (s *Server) serveContent(stream *quic.Stream, key string, offset, length int64) {
+	started := time.Now()
 	if key == "" || strings.ContainsAny(key, "\r\n\x00") {
 		writeResponse(stream, Response{Error: "invalid annex key"})
 		return
@@ -588,6 +590,7 @@ func (s *Server) serveContent(stream *quic.Stream, key string, offset, length in
 	command := exec.CommandContext(stream.Context(), "git", "annex", "contentlocation", key)
 	command.Dir = s.repo.Config.Repository
 	output, err := command.Output()
+	s.repo.LogContentRead("content lookup completed", "duration", time.Since(started), "error", err)
 	if err != nil {
 		writeResponse(stream, Response{Error: "annex content is unavailable"})
 		return
