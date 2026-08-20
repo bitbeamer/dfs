@@ -642,6 +642,7 @@ func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*qui
 }
 
 func dialTrustedMember(ctx context.Context, repo *repository.Repository, target membership.Record) (*quic.Conn, error) {
+	started := time.Now()
 	private, _, err := membership.EnsureKey(repo.Config.Repository)
 	if err != nil {
 		return nil, err
@@ -655,9 +656,12 @@ func dialTrustedMember(ctx context.Context, repo *repository.Repository, target 
 		return nil, errors.New("invalid member QUIC endpoint")
 	}
 	address := endpoint.Host
+	resolveStarted := time.Now()
 	if ipv4, ok := localIPv4(ctx, endpoint.Hostname()); ok {
 		address = net.JoinHostPort(ipv4, endpoint.Port())
 	}
+	repo.LogContentRead("content peer address resolved", "peer_id", target.Payload.PeerID,
+		"address", address, "duration", time.Since(resolveStarted))
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{clientCertificate}, MinVersion: tls.VersionTLS13,
 		NextProtos: []string{ALPN}, ServerName: target.Payload.Hostname, InsecureSkipVerify: true}
 	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -679,6 +683,8 @@ func dialTrustedMember(ctx context.Context, repo *repository.Repository, target 
 	connection, err := quic.DialAddr(dialContext, address, tlsConfig, &quic.Config{
 		HandshakeIdleTimeout: managedDialTimeout, MaxIdleTimeout: 2 * time.Minute, KeepAlivePeriod: 20 * time.Second,
 	})
+	repo.LogContentRead("content peer dial completed", "peer_id", target.Payload.PeerID,
+		"duration", time.Since(started), "error", err)
 	return connection, err
 }
 
@@ -1295,7 +1301,10 @@ func (pool *contentSessionPool) session(repositoryPath, peerID string) *contentS
 }
 
 func (pool *contentSessionPool) connection(ctx context.Context, repo *repository.Repository, peerID string) (*quic.Conn, bool, error) {
+	started := time.Now()
 	target, err := trustedMember(repo.Config.Repository, peerID)
+	repo.LogContentRead("content peer trust resolved", "peer_id", peerID,
+		"duration", time.Since(started), "error", err)
 	if err != nil {
 		pool.invalidate(repo.Config.Repository, peerID)
 		return nil, false, err
