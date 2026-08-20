@@ -231,7 +231,15 @@ func (r *Repository) initializeRangeState(state *rangeState, key string, size in
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.initialized && state.size == size {
-		return nil
+		if _, err := os.Stat(state.cachePath); err == nil {
+			return nil
+		}
+		// Another DFS process may have promoted or explicitly fetched the
+		// object and discarded this private partial. Rebuild stale in-memory
+		// state instead of returning ENOENT to the mounted reader.
+		state.initialized = false
+		state.ranges = nil
+		state.generation++
 	}
 	cachePath, metadataPath := r.rangeCachePaths(key)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {

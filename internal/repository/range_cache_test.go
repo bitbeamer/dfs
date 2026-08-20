@@ -89,6 +89,34 @@ func TestSparseRangeCacheSupportsSequentialReadsAndResume(t *testing.T) {
 	}
 }
 
+func TestSparseRangeCacheRecoversAfterAnotherProcessDiscardsPartial(t *testing.T) {
+	payload := bytes.Repeat([]byte("cross-process-range"), 64<<10)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	key := rangeTestKey(payload)
+	var calls atomic.Int32
+	repo.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
+	buffer := make([]byte, 4096)
+	if _, err := repo.ReadRange(context.Background(), "shared.bin", key, int64(len(payload)), 0, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.WaitForRangeTasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	partial, metadata := repo.rangeCachePaths(key)
+	for _, path := range []string{partial, metadata} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	clear(buffer)
+	if _, err := repo.ReadRange(context.Background(), "shared.bin", key, int64(len(payload)), 0, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer, payload[:len(buffer)]) || calls.Load() != 2 {
+		t.Fatalf("recovered read calls = %d, data matches = %v", calls.Load(), bytes.Equal(buffer, payload[:len(buffer)]))
+	}
+}
+
 func TestSparseRangeCacheSupportsFinderQuickLookAndRandomSeeks(t *testing.T) {
 	payload := bytes.Repeat([]byte("preview-content-"), 1280<<10)
 	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
