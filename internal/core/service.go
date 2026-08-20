@@ -56,6 +56,7 @@ func New(repo *repository.Repository, options Options) *Service {
 	if options.ManagedContent {
 		repo.SetManagedFetcher(managed.FetchPath)
 		repo.SetManagedRangeFetcher(managed.FetchRange)
+		repo.SetManagedCloser(func() { managed.CloseContentSessions(repo.Config.Repository) })
 	}
 	return &Service{repo: repo, root: repo.Config.Repository, events: newEventLog(options.EventRetention), pendingOperations: make(map[string]string), metadata: make(map[string]metadataCacheEntry), statePaths: make(map[string]bool), locks: newLockTable()}
 }

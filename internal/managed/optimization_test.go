@@ -49,8 +49,13 @@ func TestKnownNonHolderCacheDoesNotRewriteRankings(t *testing.T) {
 
 func TestContentCandidatesRetryStableOrderWhenEverySourceWasUnavailable(t *testing.T) {
 	original := unavailableContent
+	originalPeers := peerAvailability
 	unavailableContent = &contentAvailability{entries: make(map[string]time.Time)}
-	t.Cleanup(func() { unavailableContent = original })
+	peerAvailability = &peerCircuit{entries: make(map[string]peerCircuitEntry)}
+	t.Cleanup(func() {
+		unavailableContent = original
+		peerAvailability = originalPeers
+	})
 	peerIDs := []string{"first", "second"}
 	unavailableContent.mark("repo", "first", "key")
 	if got, want := contentCandidates("repo", "key", peerIDs), []string{"second"}; !reflect.DeepEqual(got, want) {
@@ -59,6 +64,19 @@ func TestContentCandidatesRetryStableOrderWhenEverySourceWasUnavailable(t *testi
 	unavailableContent.mark("repo", "second", "key")
 	if got := contentCandidates("repo", "key", peerIDs); !reflect.DeepEqual(got, peerIDs) {
 		t.Fatalf("all-missed retry order = %v, want stable %v", got, peerIDs)
+	}
+}
+
+func TestContentCandidatesSkipCircuitOpenPeer(t *testing.T) {
+	original := peerAvailability
+	peerAvailability = &peerCircuit{entries: make(map[string]peerCircuitEntry)}
+	t.Cleanup(func() { peerAvailability = original })
+	peerAvailability.markFailure("repo", "offline")
+	if got, want := contentCandidates("repo", "key", []string{"offline", "online"}), []string{"online"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("circuit-filtered candidates = %v, want %v", got, want)
+	}
+	if got := contentCandidates("repo", "key", []string{"offline"}); len(got) != 0 {
+		t.Fatalf("all-offline candidates = %v, want none", got)
 	}
 }
 

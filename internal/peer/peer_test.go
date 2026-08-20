@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -806,8 +807,8 @@ func TestCompletePairingResumesAndRemovesState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer service.Close()
-	reconciliationScheduled := false
-	service.runBackground = func(func()) { reconciliationScheduled = true }
+	var reconciliationScheduled atomic.Bool
+	service.runBackground = func(func()) { reconciliationScheduled.Store(true) }
 	invitation, err := CreateInvitation(repo, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -841,7 +842,7 @@ func TestCompletePairingResumesAndRemovesState(t *testing.T) {
 	if result.RemoteName != "dfs-peer-123456789abc" {
 		t.Fatalf("completion result = %#v", result)
 	}
-	if !reconciliationScheduled {
+	if !reconciliationScheduled.Load() {
 		t.Fatal("pair completion did not schedule membership reconciliation")
 	}
 	if _, err := os.Stat(filepath.Join(repositoryPath, ".git", "dfs", pairingResumeFile)); !errors.Is(err, os.ErrNotExist) {

@@ -35,14 +35,20 @@ type Repository struct {
 	Config              config.Config
 	Store               *store.Store
 	runner              command.Runner
+	logger              *slog.Logger
 	mu                  sync.Mutex
 	syncStateMu         sync.Mutex
 	remoteRetry         map[string]remoteRetry
 	remoteChecked       map[string]bool
 	managedFetcher      func(context.Context, *Repository, string, string) error
 	managedRangeFetcher ManagedRangeFetcher
+	managedCloser       func()
 	rangeStatesMu       sync.Mutex
 	rangeStates         map[string]*rangeState
+	rangeTasks          sync.WaitGroup
+	contentReadMu       sync.Mutex
+	contentRead         ContentReadDiagnostics
+	contentReadSequence uint64
 }
 
 type remoteRetry struct {
@@ -79,6 +85,20 @@ type Remote struct {
 type StorageRemote struct {
 	Name string `json:"name"`
 	UUID string `json:"uuid"`
+}
+
+type ContentReadDiagnostics struct {
+	Active         int       `json:"active"`
+	LastPath       string    `json:"last_path,omitempty"`
+	LastOffset     int64     `json:"last_offset,omitempty"`
+	LastBytes      int       `json:"last_bytes,omitempty"`
+	LastPlan       string    `json:"last_plan,omitempty"`
+	LastSourcePeer string    `json:"last_source_peer,omitempty"`
+	LastOutcome    string    `json:"last_outcome,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
+	CompletedAt    time.Time `json:"completed_at,omitempty"`
+	DurationMS     int64     `json:"duration_ms,omitempty"`
 }
 
 type CachedFile struct {
@@ -258,7 +278,33 @@ func Open(path string) (*Repository, error) {
 	return repo, nil
 }
 
-func (r *Repository) Close() error { return r.Store.Close() }
+func (r *Repository) Close() error {
+	r.rangeTasks.Wait()
+	r.mu.Lock()
+	closer := r.managedCloser
+	r.managedCloser = nil
+	r.mu.Unlock()
+	if closer != nil {
+		closer()
+	}
+	return r.Store.Close()
+}
+
+// WaitForRangeTasks waits for asynchronous read-ahead, persistence, and
+// promotion. Normal reads do not call it; shutdown and deterministic tests do.
+func (r *Repository) WaitForRangeTasks(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		r.rangeTasks.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
 
 // migrateLegacyTransport removes settings and credentials created by DFS
 // versions that predate the authenticated managed transport. Unrelated user
@@ -284,11 +330,82 @@ func (r *Repository) migrateLegacyTransport(ctx context.Context) error {
 // SetLogger enables diagnostic logging for commands run on behalf of this
 // repository. Call it before starting concurrent repository operations.
 func (r *Repository) SetLogger(logger *slog.Logger) {
+	r.logger = logger
 	if logger == nil {
 		r.runner.Logger = nil
 		return
 	}
 	r.runner.Logger = logger.With("component", "command")
+}
+
+// LogContentRead records latency-sensitive content planning and transfer
+// stages without exposing file contents. Paths and annex keys are deliberately
+// supplied by callers only when they are useful operational identifiers.
+func (r *Repository) LogContentRead(message string, attributes ...any) {
+	if r.logger != nil {
+		r.logger.Info(message, append([]any{"component", "content-read"}, attributes...)...)
+	}
+}
+
+func (r *Repository) BeginContentRead(path string, offset int64, bytes int) func(error) {
+	started := time.Now()
+	r.contentReadMu.Lock()
+	r.contentReadSequence++
+	sequence := r.contentReadSequence
+	r.contentRead.Active++
+	r.contentRead.LastPath = path
+	r.contentRead.LastOffset = offset
+	r.contentRead.LastBytes = bytes
+	r.contentRead.LastPlan = ""
+	r.contentRead.LastSourcePeer = ""
+	r.contentRead.LastOutcome = "active"
+	r.contentRead.LastError = ""
+	r.contentRead.StartedAt = started.UTC()
+	r.contentRead.CompletedAt = time.Time{}
+	r.contentRead.DurationMS = 0
+	r.contentReadMu.Unlock()
+	return func(err error) {
+		r.contentReadMu.Lock()
+		defer r.contentReadMu.Unlock()
+		if r.contentRead.Active > 0 {
+			r.contentRead.Active--
+		}
+		if sequence != r.contentReadSequence {
+			return
+		}
+		r.contentRead.CompletedAt = time.Now().UTC()
+		r.contentRead.DurationMS = time.Since(started).Milliseconds()
+		switch {
+		case err == nil:
+			r.contentRead.LastOutcome = "ready"
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			r.contentRead.LastOutcome = "canceled"
+		case errors.Is(err, ErrContentUnavailable):
+			r.contentRead.LastOutcome = "unavailable"
+		default:
+			r.contentRead.LastOutcome = "failed"
+		}
+		if err != nil {
+			r.contentRead.LastError = err.Error()
+		}
+	}
+}
+
+func (r *Repository) RecordContentPlan(plan, sourcePeer string) {
+	r.contentReadMu.Lock()
+	defer r.contentReadMu.Unlock()
+	if plan != "" {
+		r.contentRead.LastPlan = plan
+	}
+	if sourcePeer != "" {
+		r.contentRead.LastSourcePeer = sourcePeer
+	}
+}
+
+func (r *Repository) ContentReadDiagnostics() ContentReadDiagnostics {
+	r.contentReadMu.Lock()
+	defer r.contentReadMu.Unlock()
+	return r.contentRead
 }
 
 func (r *Repository) SaveConfig() error { return config.Save(r.Config) }
@@ -805,6 +922,12 @@ func (r *Repository) SetManagedFetcher(fetcher func(context.Context, *Repository
 	r.managedFetcher = fetcher
 }
 
+func (r *Repository) SetManagedCloser(closer func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.managedCloser = closer
+}
+
 func (r *Repository) LookupKey(ctx context.Context, path string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -820,6 +943,66 @@ func (r *Repository) ReinjectContent(ctx context.Context, source, destination st
 	defer r.mu.Unlock()
 	_, err := r.runner.Run(ctx, "git", "annex", "reinject", source, filepath.ToSlash(destination))
 	return err
+}
+
+// PeerContentHints returns peers whose configured git-annex UUID is recorded
+// as holding key. Location logs are advisory and can be stale, so callers must
+// retain a bounded discovery fallback.
+func (r *Repository) PeerContentHints(ctx context.Context, key string, peerIDs []string) []string {
+	if key == "" || len(peerIDs) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	output, err := r.runner.Run(ctx, "git", "annex", "whereis", "--key", key, "--format=${uuid}\\n")
+	if err != nil {
+		return nil
+	}
+	locations := make(map[string]bool)
+	for _, uuid := range strings.Fields(output) {
+		locations[strings.TrimSpace(uuid)] = true
+	}
+	var result []string
+	for _, peerID := range peerIDs {
+		shortID := peerID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		value, configErr := r.runner.Run(ctx, "git", "config", "--get", "remote.dfs-peer-"+shortID+".annex-uuid")
+		if configErr == nil && locations[strings.TrimSpace(value)] {
+			result = append(result, peerID)
+		}
+	}
+	return result
+}
+
+// FetchFromDurableStorage hydrates path from explicitly configured durable
+// git-annex remotes only. Peer remotes and the metadata relay are excluded.
+func (r *Repository) FetchFromDurableStorage(ctx context.Context, path string) error {
+	storages, err := r.Storages(ctx)
+	if err != nil {
+		return err
+	}
+	if len(storages) == 0 {
+		return ErrContentUnavailable
+	}
+	var failures []string
+	for _, storage := range storages {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		_, fetchErr := r.runner.Run(ctx, "git", "annex", "get", "--from="+storage.Name, "--", filepath.ToSlash(path))
+		r.mu.Unlock()
+		if fetchErr == nil {
+			if r.Store != nil {
+				_ = r.Store.Touch(path)
+			}
+			return nil
+		}
+		failures = append(failures, storage.Name+": "+fetchErr.Error())
+	}
+	return fmt.Errorf("%w: durable storage fetch failed: %s", ErrContentUnavailable, strings.Join(failures, "; "))
 }
 
 func (r *Repository) Unlock(ctx context.Context, path string) error {

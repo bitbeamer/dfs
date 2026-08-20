@@ -59,6 +59,7 @@ func Run(repo *repository.Repository, options Options) (runErr error) {
 	}()
 	repo.SetManagedFetcher(managed.FetchPath)
 	repo.SetManagedRangeFetcher(managed.FetchRange)
+	repo.SetManagedCloser(func() { managed.CloseContentSessions(repo.Config.Repository) })
 	scheduler := syncer.New(repo, repo.Config.SyncInterval, logger.With("component", "sync"))
 	scheduler.SetReconciler(func(ctx context.Context) error { return peer.ReconcileMembership(ctx, repo) })
 	scheduler.SetEntryInvalidator(frontendInvalidator{repository: repo.Config.Repository})

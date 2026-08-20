@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -29,10 +30,14 @@ func rangeTestRepository(t *testing.T, root string, limit int64) *Repository {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = state.Close() })
 	cfg := config.Default("range-test", root)
 	cfg.CacheLimit = limit
-	return &Repository{Config: cfg, Store: state}
+	repo := &Repository{Config: cfg, Store: state}
+	t.Cleanup(func() {
+		_ = repo.WaitForRangeTasks(context.Background())
+		_ = state.Close()
+	})
+	return repo
 }
 
 func rangeTestKey(payload []byte) string {
@@ -64,7 +69,10 @@ func TestSparseRangeCacheSupportsSequentialReadsAndResume(t *testing.T) {
 		}
 	}
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("read-ahead transfers = %d, want 2", got)
+		t.Fatalf("demand transfers = %d, want 2", got)
+	}
+	if err := repo.WaitForRangeTasks(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 
 	// A new Repository represents a daemon restart. Reading an already cached
@@ -72,7 +80,7 @@ func TestSparseRangeCacheSupportsSequentialReadsAndResume(t *testing.T) {
 	restarted := rangeTestRepository(t, root, 32<<20)
 	restarted.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
 	buffer := make([]byte, 4096)
-	if _, err := restarted.ReadRange(context.Background(), "movie.bin", key, int64(len(payload)), 6<<20, buffer); err != nil {
+	if _, err := restarted.ReadRange(context.Background(), "movie.bin", key, int64(len(payload)), (4<<20)+(64<<10), buffer); err != nil {
 		t.Fatal(err)
 	}
 	if got := calls.Load(); got != 2 {
@@ -141,6 +149,58 @@ func TestConcurrentDuplicateNamesCoalesceAnnexRange(t *testing.T) {
 	}
 }
 
+func TestNonOverlappingAnnexRangesFetchConcurrently(t *testing.T) {
+	payload := make([]byte, 8<<20)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	key := rangeTestKey(payload)
+	started := make(chan int64, 2)
+	release := make(chan struct{})
+	repo.SetManagedRangeFetcher(func(_ context.Context, _ *Repository, _ string, offset, length int64, output io.Writer) (int64, error) {
+		started <- offset
+		<-release
+		_, err := output.Write(payload[offset : offset+length])
+		return int64(len(payload)), err
+	})
+
+	errorsSeen := make(chan error, 2)
+	for _, offset := range []int64{0, 4 << 20} {
+		go func(offset int64) {
+			_, err := repo.ReadRange(context.Background(), "movie.bin", key, int64(len(payload)), offset, make([]byte, 4096))
+			errorsSeen <- err
+		}(offset)
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("non-overlapping range was serialized")
+		}
+	}
+	close(release)
+	for range 2 {
+		if err := <-errorsSeen; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSmallRandomReadUsesDemandSizedForegroundWindow(t *testing.T) {
+	payload := make([]byte, 8<<20)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	var requested atomic.Int64
+	repo.SetManagedRangeFetcher(func(_ context.Context, _ *Repository, _ string, offset, length int64, output io.Writer) (int64, error) {
+		requested.Store(length)
+		_, err := output.Write(payload[offset : offset+length])
+		return int64(len(payload)), err
+	})
+	if _, err := repo.ReadRange(context.Background(), "preview.mov", rangeTestKey(payload), int64(len(payload)), 200<<10, make([]byte, 128<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if got := requested.Load(); got > rangeDemandQuantum {
+		t.Fatalf("foreground fetch = %d bytes, want at most %d", got, rangeDemandQuantum)
+	}
+}
+
 func TestRangeReadCancellationStopsTransfer(t *testing.T) {
 	payload := make([]byte, 8<<20)
 	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
@@ -165,7 +225,7 @@ func TestRangeReadCancellationStopsTransfer(t *testing.T) {
 
 func TestPartialRangeCacheEvictsOldestInactiveObject(t *testing.T) {
 	root := t.TempDir()
-	repo := rangeTestRepository(t, root, rangeReadAhead)
+	repo := rangeTestRepository(t, root, rangeDemandQuantum)
 	payload := make([]byte, 8<<20)
 	var calls atomic.Int32
 	repo.SetManagedRangeFetcher(payloadFetcher(payload, &calls))
@@ -178,6 +238,9 @@ func TestPartialRangeCacheEvictsOldestInactiveObject(t *testing.T) {
 	if _, err := repo.ReadRange(context.Background(), "first.bin", firstKey, int64(len(firstPayload)), 0, make([]byte, 4096)); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.WaitForRangeTasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	firstPartial, firstMetadata := repo.rangeCachePaths(firstKey)
 	repo.SetManagedRangeFetcher(payloadFetcher(secondPayload, &calls))
 	if _, err := repo.ReadRange(context.Background(), "second.bin", secondKey, int64(len(secondPayload)), 0, make([]byte, 4096)); err != nil {
@@ -187,5 +250,74 @@ func TestPartialRangeCacheEvictsOldestInactiveObject(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("old partial cache %s still exists: %v", filepath.Base(path), err)
 		}
+	}
+}
+
+func TestRangeReadFallsBackToBoundedDurableHydration(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	home := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, err error) error {
+			if err == nil {
+				if entry.IsDir() {
+					_ = os.Chmod(path, 0o755)
+				} else {
+					_ = os.Chmod(path, 0o644)
+				}
+			}
+			return nil
+		})
+	})
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[user]\nname = Range Test\nemail = range@example.invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repo, err := Init(ctx, filepath.Join(home, "repo"), "range-test", 32<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	payload := bytes.Repeat([]byte("durable-content"), 64<<10)
+	path := filepath.Join(repo.Config.Repository, "archive.bin")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CommitPending(ctx, "Add durable fallback fixture"); err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(home, "storage")
+	if err := os.MkdirAll(storage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.runner.Run(ctx, "git", "annex", "initremote", "durable", "type=directory", "directory="+storage, "encryption=none"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.runner.Run(ctx, "git", "annex", "copy", "--to=durable", "--", "archive.bin"); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.LookupKey(ctx, "archive.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.runner.Run(ctx, "git", "annex", "drop", "--force", "--", "archive.bin"); err != nil {
+		t.Fatal(err)
+	}
+	repo.SetManagedRangeFetcher(func(context.Context, *Repository, string, int64, int64, io.Writer) (int64, error) {
+		return 0, ErrContentUnavailable
+	})
+	buffer := make([]byte, 4096)
+	n, err := repo.ReadRange(ctx, "archive.bin", key, int64(len(payload)), 1024, buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer[:n], payload[1024:1024+n]) {
+		t.Fatal("durable fallback returned incorrect bytes")
+	}
+	if diagnostics := repo.ContentReadDiagnostics(); diagnostics.LastPlan != "durable-full-hydration" || diagnostics.LastOutcome != "ready" {
+		t.Fatalf("durable fallback diagnostics = %#v", diagnostics)
 	}
 }

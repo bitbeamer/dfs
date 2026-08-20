@@ -49,8 +49,13 @@ organizing files therefore does not require their content to be present locally.
 - Transfer Git metadata, git-annex content, membership, and diagnostics only
   over mutually authenticated QUIC.
 - Stream requested ranges of uncached files over authenticated QUIC, retaining
-  resumable sparse partials privately and promoting only verified complete
-  objects into git-annex.
+  resumable sparse partials privately. Foreground reads use a demand-sized
+  window; cache durability, adaptive sequential read-ahead, verification, and
+  promotion run after demanded bytes are available.
+- Route content reads through git-annex holder hints, bounded authenticated
+  `has-content` discovery, reusable QUIC sessions, peer circuit breakers, and
+  at most two hedged sources so one offline preferred peer does not impose its
+  full dial timeout on every range.
 - Measure directed QUIC performance with `dfs peer optimize` and retain stable
   interactive-read and bulk-hydration source priorities locally; use
   `--scope cluster` to optimize every responding peer.
@@ -509,16 +514,26 @@ writer follow POSIX behavior supported by FUSE.
 
 Opening a file updates its cache-recency record once. Cached files read directly
 from local git-annex storage. For an uncached file, FUSE requests only the byte
-ranges the application reads over mutually authenticated QUIC, with bounded
-read-ahead for sequential throughput. Finder and Quick Look can therefore read
-headers, trailers, and previews without waiting for a complete large object.
-Concurrent reads of names referencing the same annex key share one transfer.
+ranges the application reads over mutually authenticated QUIC. A small or
+random foreground read fetches at most a 256 KiB demand window; repeated
+sequential reads schedule 1 MiB and then 4 MiB background read-ahead. Finder,
+Quick Look, Nautilus, and ordinary applications can therefore read headers,
+trailers, and previews without waiting for a complete large object.
+Overlapping reads of names referencing the same annex key share one transfer,
+while independent extents can transfer concurrently.
 Successful extents are retained as a resumable sparse file under
-`.git/dfs/range-cache`, never in the logical filesystem. Once all extents are
-present, DFS verifies the annex key and atomically promotes the object into
-git-annex. Old inactive partials are evicted against the peer's cache limit.
+`.git/dfs/range-cache`, never in the logical filesystem. Extent metadata is
+published only after the sparse file is durable, but that sync does not delay
+already received demanded bytes. Once all extents are present, DFS verifies
+the annex key and promotes the object into git-annex in the background. Old
+inactive partials are evicted against the peer's cache limit.
 Closing a streaming handle or stopping the mount frontend cancels its in-flight request,
-and a failed source peer is skipped in favor of another trusted content holder.
+and a failed source peer enters exponential backoff rather than being retried
+for every range. Location hints are advisory; when absent or stale, DFS asks
+accepted non-backoff peers in parallel over authenticated QUIC. If peer sources
+are unavailable, objects up to 32 MiB may use a full-hydration fallback from a
+configured durable git-annex remote under a ten-second bound. Larger objects
+fail explicitly instead of silently starting an unbounded Finder download.
 
 After remote namespace changes, DFS invalidates kernel FUSE entries on every
 platform. On KDE Plasma it also emits the standard `KDirNotify` directory
@@ -544,7 +559,7 @@ Go FUSE protocol adapter
         v
 In-process core API (namespace, content, transactions, events, policy, health)
         |-- direct local reads: cached git-annex objects
-        |-- range reads: cancellable authenticated QUIC streams
+        |-- range reads: demand-first cache + availability-aware QUIC planner
         |-- Git: namespace, history, signed membership and cluster-pin metadata refs
         |-- git-annex: content hashes, locations, safe copies
         `-- SQLite: peer-local pins, access, and filesystem metadata

@@ -1521,6 +1521,22 @@ func printNodeHealth(output io.Writer, report peer.DiagnosticReport) {
 		config.FormatSize(report.Stats.CacheLimitBytes), config.FormatSize(report.Stats.AnnexCacheBytes),
 		config.FormatSize(report.Stats.RangeCacheBytes), config.FormatSize(report.Stats.DiskAvailableBytes),
 		config.FormatSize(report.Stats.DiskTotalBytes))
+	if report.ContentRead.Active > 0 {
+		fmt.Fprintf(output, "Content read: ACTIVE  Path: %s  Plan: %s  Source: %s\n",
+			report.ContentRead.LastPath, report.ContentRead.LastPlan, report.ContentRead.LastSourcePeer)
+	} else if report.ContentRead.LastOutcome != "" {
+		fmt.Fprintf(output, "Last content read: %s  Path: %s  Plan: %s  Source: %s  Duration: %d ms",
+			strings.ToUpper(report.ContentRead.LastOutcome), report.ContentRead.LastPath, report.ContentRead.LastPlan,
+			report.ContentRead.LastSourcePeer, report.ContentRead.DurationMS)
+		if report.ContentRead.LastError != "" {
+			fmt.Fprintf(output, "  Detail: %s", compactHealthDetail(report.ContentRead.LastError))
+		}
+		fmt.Fprintln(output)
+	}
+	for _, state := range report.ContentPeers {
+		fmt.Fprintf(output, "Content source %s: BACKOFF after %d failure(s), retry after %s\n",
+			state.PeerID, state.Failures, formatHealthTime(state.RetryAfter))
+	}
 	printPinnedHealth(output, "", report.Stats.Pinned)
 	if report.Optimization != nil {
 		printOptimizationState(output, "Current peer", *report.Optimization)

@@ -22,8 +22,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	processcommand "github.com/bitbeamer/dfs/internal/command"
@@ -37,6 +39,13 @@ const ALPN = "dfs-managed-v1"
 const PairALPN = "dfs-pair-v2"
 
 const managedDialTimeout = time.Second
+
+const (
+	contentAvailabilityBudget = 1500 * time.Millisecond
+	contentHedgeDelay         = 75 * time.Millisecond
+	peerBackoffInitial        = 2 * time.Second
+	peerBackoffMaximum        = time.Minute
+)
 
 type Request struct {
 	Operation string          `json:"operation"`
@@ -56,15 +65,16 @@ type Response struct {
 }
 
 type Server struct {
-	repo       *repository.Repository
-	listener   *quic.Listener
-	diagnostic func(context.Context) ([]byte, error)
-	pair       func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error)
-	pairClone  func(context.Context, string, string) error
-	changed    func(string, []string)
-	stop       context.CancelFunc
-	done       chan struct{}
-	once       sync.Once
+	repo        *repository.Repository
+	listener    *quic.Listener
+	diagnostic  func(context.Context) ([]byte, error)
+	pair        func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error)
+	pairClone   func(context.Context, string, string) error
+	changed     func(string, []string)
+	stop        context.CancelFunc
+	done        chan struct{}
+	once        sync.Once
+	connections atomic.Int64
 }
 
 func Start(repo *repository.Repository, address string, diagnostic func(context.Context) ([]byte, error), pairingCertificate *tls.Certificate, pair func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error), pairClone func(context.Context, string, string) error, changed func(string, []string)) (*Server, error) {
@@ -137,6 +147,7 @@ func (s *Server) serve(ctx context.Context) {
 		if err != nil {
 			return
 		}
+		s.connections.Add(1)
 		go s.serveConnection(connection)
 	}
 }
@@ -215,6 +226,8 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 		s.serveContent(stream, request.Key, 0, 0)
 	case "annex-range":
 		s.serveContent(stream, request.Key, request.Offset, request.Length)
+	case "annex-has":
+		s.serveHasContent(stream, request.Key)
 	case "benchmark":
 		serveBenchmark(stream, request.Offset, request.Length)
 	case "optimize":
@@ -232,6 +245,34 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
+}
+
+func (s *Server) serveHasContent(stream *quic.Stream, key string) {
+	if key == "" || strings.ContainsAny(key, "\r\n\x00") {
+		writeResponse(stream, Response{Error: "invalid annex key"})
+		return
+	}
+	command := exec.CommandContext(stream.Context(), "git", "annex", "contentlocation", key)
+	command.Dir = s.repo.Config.Repository
+	output, err := command.Output()
+	if err != nil {
+		writeResponse(stream, Response{Error: "annex content is unavailable"})
+		return
+	}
+	relative := strings.TrimSpace(string(output))
+	path := filepath.Join(s.repo.Config.Repository, filepath.FromSlash(relative))
+	annexRoot := filepath.Join(s.repo.Config.Repository, ".git", "annex", "objects") + string(os.PathSeparator)
+	abs, err := filepath.Abs(path)
+	if err != nil || !strings.HasPrefix(abs, annexRoot) {
+		writeResponse(stream, Response{Error: "annex returned an unsafe content path"})
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		writeResponse(stream, Response{Error: "annex content is unavailable"})
+		return
+	}
+	writeResponse(stream, Response{OK: true, TotalSize: info.Size()})
 }
 
 func RequestReconcile(ctx context.Context, repo *repository.Repository, peerID string) error {
@@ -724,59 +765,240 @@ func Diagnostic(ctx context.Context, repo *repository.Repository, peerID string)
 }
 
 func FetchContent(ctx context.Context, repo *repository.Repository, peerID, key string, output io.Writer) (int64, error) {
-	connection, stream, reader, response, err := Open(ctx, repo, peerID, Request{Operation: "annex-get", Key: key})
+	stream, reader, response, err := openContentStream(ctx, repo, peerID, Request{Operation: "annex-get", Key: key})
 	if err != nil {
+		if isUnavailableContent(err) {
+			unavailableContent.mark(repo.Config.Repository, peerID, key)
+		} else {
+			peerAvailability.markFailure(repo.Config.Repository, peerID)
+		}
 		return 0, err
 	}
-	defer connection.CloseWithError(0, "")
 	defer stream.Close()
 	written, err := io.CopyN(output, reader, response.Size)
+	if err != nil {
+		contentSessions.invalidate(repo.Config.Repository, peerID)
+		peerAvailability.markFailure(repo.Config.Repository, peerID)
+	} else {
+		peerAvailability.markSuccess(repo.Config.Repository, peerID)
+		unavailableContent.clear(repo.Config.Repository, peerID, key)
+	}
 	return written, err
 }
 
 func FetchRange(ctx context.Context, repo *repository.Repository, key string, offset, length int64, output io.Writer) (int64, error) {
+	started := time.Now()
+	planningCtx, cancel := context.WithTimeout(ctx, contentAvailabilityBudget)
+	defer cancel()
 	peerIDs, err := optimizedPeerIDs(ctx, repo, "interactive")
 	if err != nil {
 		return 0, err
 	}
 	peerIDs = contentCandidates(repo.Config.Repository, key, peerIDs)
-	var failures []string
-	for _, peerID := range peerIDs {
-		connection, stream, reader, response, openErr := Open(ctx, repo, peerID, Request{
-			Operation: "annex-range", Key: key, Offset: offset, Length: length,
-		})
-		if openErr != nil {
-			if isUnavailableContent(openErr) {
-				unavailableContent.mark(repo.Config.Repository, peerID, key)
+	if len(peerIDs) == 0 {
+		return 0, fmt.Errorf("%w: every accepted peer is temporarily offline", repository.ErrContentUnavailable)
+	}
+	hints := repo.PeerContentHints(planningCtx, key, peerIDs)
+	candidates := hints
+	discovery := "annex-location"
+	if len(candidates) == 0 {
+		discovery = "parallel-has-content"
+		candidates = discoverContentHolders(planningCtx, repo, key, peerIDs)
+	}
+	repo.LogContentRead("content sources planned", "key", key, "accepted_peers", len(peerIDs),
+		"holder_hints", len(hints), "candidates", len(candidates), "discovery", discovery,
+		"duration", time.Since(started))
+	repo.RecordContentPlan(discovery, "")
+	total, payload, sourcePeer, failures := fetchRangeCandidates(planningCtx, repo, key, offset, length, candidates)
+	if payload != nil {
+		repo.RecordContentPlan("", sourcePeer)
+		_, copyErr := output.Write(payload)
+		if copyErr != nil {
+			return 0, copyErr
+		}
+		return total, nil
+	}
+
+	// Location logs are advisory. If all hinted holders failed, ask the
+	// remaining online accepted peers before concluding that content is absent.
+	if len(hints) > 0 && planningCtx.Err() == nil {
+		discovered := discoverContentHolders(planningCtx, repo, key, peerIDs)
+		discovered = withoutPeerIDs(discovered, hints)
+		fallbackTotal, fallbackPayload, fallbackSource, fallbackFailures := fetchRangeCandidates(planningCtx, repo, key, offset, length, discovered)
+		failures = append(failures, fallbackFailures...)
+		if fallbackPayload != nil {
+			repo.RecordContentPlan("parallel-has-content", fallbackSource)
+			_, copyErr := output.Write(fallbackPayload)
+			if copyErr != nil {
+				return 0, copyErr
 			}
-			failures = append(failures, peerID+": "+openErr.Error())
-			continue
+			return fallbackTotal, nil
 		}
-		if response.Size != length || response.TotalSize <= 0 {
-			_ = stream.Close()
-			_ = connection.CloseWithError(1, "invalid range response")
-			failures = append(failures, peerID+": invalid annex range response")
-			continue
-		}
-		var buffered bytes.Buffer
-		written, copyErr := io.CopyN(&buffered, reader, response.Size)
-		_ = stream.Close()
-		_ = connection.CloseWithError(0, "")
-		if copyErr == nil && written != length {
-			copyErr = io.ErrUnexpectedEOF
-		}
-		if copyErr == nil {
-			if _, copyErr = io.Copy(output, &buffered); copyErr == nil {
-				unavailableContent.clear(repo.Config.Repository, peerID, key)
-				return response.TotalSize, nil
-			}
-		}
-		failures = append(failures, peerID+": "+copyErr.Error())
+	}
+	if errors.Is(planningCtx.Err(), context.DeadlineExceeded) {
+		failures = append(failures, "availability budget exceeded")
 	}
 	if len(failures) == 0 {
-		return 0, errors.New("no trusted managed content source is available")
+		return 0, fmt.Errorf("%w: no online peer reports this object", repository.ErrContentUnavailable)
 	}
-	return 0, fmt.Errorf("managed range fetch failed: %s", strings.Join(failures, "; "))
+	return 0, fmt.Errorf("%w: managed range fetch failed: %s", repository.ErrContentUnavailable, strings.Join(failures, "; "))
+}
+
+type rangeCandidateResult struct {
+	peerID string
+	total  int64
+	data   []byte
+	err    error
+}
+
+func fetchRangeCandidates(ctx context.Context, repo *repository.Repository, key string, offset, length int64, peerIDs []string) (int64, []byte, string, []string) {
+	var failures []string
+	for start := 0; start < len(peerIDs); start += 2 {
+		end := min(start+2, len(peerIDs))
+		batch := peerIDs[start:end]
+		batchCtx, cancel := context.WithCancel(ctx)
+		results := make(chan rangeCandidateResult, len(batch))
+		launch := func(peerID string) {
+			go func() { results <- fetchRangeCandidate(batchCtx, repo, peerID, key, offset, length) }()
+		}
+		launch(batch[0])
+		launched, received := 1, 0
+		var hedge <-chan time.Time
+		if len(batch) > 1 {
+			timer := time.NewTimer(contentHedgeDelay)
+			defer timer.Stop()
+			hedge = timer.C
+		}
+		for received < launched || launched < len(batch) {
+			select {
+			case <-ctx.Done():
+				cancel()
+				return 0, nil, "", append(failures, ctx.Err().Error())
+			case <-hedge:
+				if launched < len(batch) {
+					launch(batch[launched])
+					launched++
+				}
+				hedge = nil
+			case result := <-results:
+				received++
+				if result.err == nil {
+					cancel()
+					return result.total, result.data, result.peerID, failures
+				}
+				failures = append(failures, result.peerID+": "+result.err.Error())
+				if launched < len(batch) {
+					launch(batch[launched])
+					launched++
+					hedge = nil
+				}
+			}
+		}
+		cancel()
+	}
+	return 0, nil, "", failures
+}
+
+func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerID, key string, offset, length int64) rangeCandidateResult {
+	result := rangeCandidateResult{peerID: peerID}
+	stream, reader, response, err := openContentStream(ctx, repo, peerID, Request{
+		Operation: "annex-range", Key: key, Offset: offset, Length: length,
+	})
+	if err != nil {
+		if isUnavailableContent(err) {
+			unavailableContent.mark(repo.Config.Repository, peerID, key)
+		} else {
+			peerAvailability.markFailure(repo.Config.Repository, peerID)
+		}
+		result.err = err
+		return result
+	}
+	defer stream.Close()
+	if response.Size != length || response.TotalSize <= 0 {
+		peerAvailability.markFailure(repo.Config.Repository, peerID)
+		result.err = errors.New("invalid annex range response")
+		return result
+	}
+	result.data = make([]byte, response.Size)
+	_, result.err = io.ReadFull(reader, result.data)
+	if result.err != nil {
+		contentSessions.invalidate(repo.Config.Repository, peerID)
+		peerAvailability.markFailure(repo.Config.Repository, peerID)
+		return result
+	}
+	result.total = response.TotalSize
+	unavailableContent.clear(repo.Config.Repository, peerID, key)
+	peerAvailability.markSuccess(repo.Config.Repository, peerID)
+	return result
+}
+
+func discoverContentHolders(ctx context.Context, repo *repository.Repository, key string, peerIDs []string) []string {
+	type result struct {
+		peerID string
+		has    bool
+	}
+	results := make(chan result, len(peerIDs))
+	count := 0
+	for _, peerID := range peerIDs {
+		if peerAvailability.isOpen(repo.Config.Repository, peerID) || unavailableContent.isKnown(repo.Config.Repository, peerID, key) {
+			continue
+		}
+		count++
+		go func(peerID string) {
+			stream, _, response, err := openContentStream(ctx, repo, peerID, Request{Operation: "annex-has", Key: key})
+			if stream != nil {
+				_ = stream.Close()
+			}
+			if err == nil && response.TotalSize > 0 {
+				peerAvailability.markSuccess(repo.Config.Repository, peerID)
+				unavailableContent.clear(repo.Config.Repository, peerID, key)
+				results <- result{peerID: peerID, has: true}
+				return
+			}
+			if isUnavailableContent(err) {
+				unavailableContent.mark(repo.Config.Repository, peerID, key)
+			} else if err != nil {
+				peerAvailability.markFailure(repo.Config.Repository, peerID)
+			}
+			results <- result{peerID: peerID}
+		}(peerID)
+	}
+	found := make(map[string]bool)
+	for received := 0; received < count; received++ {
+		select {
+		case <-ctx.Done():
+			return orderedSubset(peerIDs, found)
+		case value := <-results:
+			if value.has {
+				found[value.peerID] = true
+			}
+		}
+	}
+	return orderedSubset(peerIDs, found)
+}
+
+func orderedSubset(peerIDs []string, included map[string]bool) []string {
+	result := make([]string, 0, len(included))
+	for _, peerID := range peerIDs {
+		if included[peerID] {
+			result = append(result, peerID)
+		}
+	}
+	return result
+}
+
+func withoutPeerIDs(peerIDs, excluded []string) []string {
+	blocked := make(map[string]bool, len(excluded))
+	for _, peerID := range excluded {
+		blocked[peerID] = true
+	}
+	var result []string
+	for _, peerID := range peerIDs {
+		if !blocked[peerID] {
+			result = append(result, peerID)
+		}
+	}
+	return result
 }
 
 func FetchPath(ctx context.Context, repo *repository.Repository, path, from string) error {
@@ -799,6 +1021,11 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 		peerIDs = filtered
 	} else {
 		peerIDs = contentCandidates(repo.Config.Repository, key, peerIDs)
+		if hinted := repo.PeerContentHints(ctx, key, peerIDs); len(hinted) > 0 {
+			peerIDs = hinted
+		} else {
+			peerIDs = discoverContentHolders(ctx, repo, key, peerIDs)
+		}
 	}
 	if len(peerIDs) == 0 {
 		return errors.New("no trusted managed content source is available")
@@ -832,12 +1059,17 @@ func FetchPath(ctx context.Context, repo *repository.Repository, path, from stri
 		}
 		failures = append(failures, peerID+": "+fetchErr.Error())
 	}
-	return fmt.Errorf("managed content fetch failed: %s", strings.Join(failures, "; "))
+	return fmt.Errorf("%w: managed content fetch failed: %s", repository.ErrContentUnavailable, strings.Join(failures, "; "))
 }
 
 func contentCandidates(repositoryPath, key string, peerIDs []string) []string {
+	online := make([]string, 0, len(peerIDs))
 	available := make([]string, 0, len(peerIDs))
 	for _, peerID := range peerIDs {
+		if peerAvailability.isOpen(repositoryPath, peerID) {
+			continue
+		}
+		online = append(online, peerID)
 		if !unavailableContent.isKnown(repositoryPath, peerID, key) {
 			available = append(available, peerID)
 		}
@@ -845,7 +1077,7 @@ func contentCandidates(repositoryPath, key string, peerIDs []string) []string {
 	if len(available) == 0 {
 		// Availability observations race with newly published annex objects.
 		// Never let advisory negative caching eliminate every source.
-		return peerIDs
+		return online
 	}
 	return available
 }
@@ -871,10 +1103,215 @@ func optimizedPeerIDs(ctx context.Context, repo *repository.Repository, profile 
 const unavailableContentTTL = 5 * time.Minute
 
 var unavailableContent = &contentAvailability{entries: make(map[string]time.Time)}
+var peerAvailability = &peerCircuit{entries: make(map[string]peerCircuitEntry)}
+var contentSessions = &contentSessionPool{entries: make(map[string]*contentSession)}
 
 type contentAvailability struct {
 	mu      sync.Mutex
 	entries map[string]time.Time
+}
+
+type peerCircuitEntry struct {
+	failures int
+	until    time.Time
+}
+
+type peerCircuit struct {
+	mu      sync.Mutex
+	entries map[string]peerCircuitEntry
+}
+
+type ContentPeerState struct {
+	PeerID     string    `json:"peer_id"`
+	Status     string    `json:"status"`
+	Failures   int       `json:"failures"`
+	RetryAfter time.Time `json:"retry_after,omitempty"`
+}
+
+func ContentPeerStates(repositoryPath string) []ContentPeerState {
+	peerAvailability.mu.Lock()
+	defer peerAvailability.mu.Unlock()
+	now := time.Now()
+	var result []ContentPeerState
+	prefix := repositoryPath + "\x00"
+	for key, entry := range peerAvailability.entries {
+		if !strings.HasPrefix(key, prefix) || !now.Before(entry.until) {
+			continue
+		}
+		result = append(result, ContentPeerState{PeerID: strings.TrimPrefix(key, prefix), Status: "backoff",
+			Failures: entry.failures, RetryAfter: entry.until.UTC()})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].PeerID < result[j].PeerID })
+	return result
+}
+
+func peerStateKey(repositoryPath, peerID string) string {
+	return repositoryPath + "\x00" + peerID
+}
+
+func (circuit *peerCircuit) isOpen(repositoryPath, peerID string) bool {
+	circuit.mu.Lock()
+	defer circuit.mu.Unlock()
+	entry, found := circuit.entries[peerStateKey(repositoryPath, peerID)]
+	if !found {
+		return false
+	}
+	if time.Now().After(entry.until) {
+		delete(circuit.entries, peerStateKey(repositoryPath, peerID))
+		return false
+	}
+	return true
+}
+
+func (circuit *peerCircuit) markFailure(repositoryPath, peerID string) {
+	circuit.mu.Lock()
+	defer circuit.mu.Unlock()
+	key := peerStateKey(repositoryPath, peerID)
+	entry := circuit.entries[key]
+	entry.failures++
+	backoff := peerBackoffInitial << min(entry.failures-1, 5)
+	if backoff > peerBackoffMaximum {
+		backoff = peerBackoffMaximum
+	}
+	entry.until = time.Now().Add(backoff)
+	circuit.entries[key] = entry
+}
+
+func (circuit *peerCircuit) markSuccess(repositoryPath, peerID string) {
+	circuit.mu.Lock()
+	defer circuit.mu.Unlock()
+	delete(circuit.entries, peerStateKey(repositoryPath, peerID))
+}
+
+type contentSession struct {
+	mu          sync.Mutex
+	connection  *quic.Conn
+	fingerprint string
+}
+
+type contentSessionPool struct {
+	mu      sync.Mutex
+	entries map[string]*contentSession
+}
+
+func CloseContentSessions(repositoryPath string) {
+	contentSessions.closeRepository(repositoryPath)
+}
+
+func (pool *contentSessionPool) closeRepository(repositoryPath string) {
+	pool.mu.Lock()
+	prefix := repositoryPath + "\x00"
+	var sessions []*contentSession
+	for key, session := range pool.entries {
+		if strings.HasPrefix(key, prefix) {
+			sessions = append(sessions, session)
+			delete(pool.entries, key)
+		}
+	}
+	pool.mu.Unlock()
+	for _, session := range sessions {
+		session.mu.Lock()
+		if session.connection != nil {
+			_ = session.connection.CloseWithError(0, "repository closed")
+			session.connection = nil
+			session.fingerprint = ""
+		}
+		session.mu.Unlock()
+	}
+}
+
+func (pool *contentSessionPool) session(repositoryPath, peerID string) *contentSession {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	key := peerStateKey(repositoryPath, peerID)
+	session := pool.entries[key]
+	if session == nil {
+		session = &contentSession{}
+		pool.entries[key] = session
+	}
+	return session
+}
+
+func (pool *contentSessionPool) connection(ctx context.Context, repo *repository.Repository, peerID string) (*quic.Conn, error) {
+	target, err := trustedMember(repo.Config.Repository, peerID)
+	if err != nil {
+		pool.invalidate(repo.Config.Repository, peerID)
+		return nil, err
+	}
+	fingerprint := fmt.Sprintf("%s\x00%s\x00%d", target.Payload.QUICEndpoint, target.Payload.SigningPublicKey, target.Payload.Generation)
+	session := pool.session(repo.Config.Repository, peerID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.connection != nil && session.connection.Context().Err() == nil && session.fingerprint == fingerprint {
+		return session.connection, nil
+	}
+	if session.connection != nil {
+		_ = session.connection.CloseWithError(0, "membership changed")
+		session.connection = nil
+	}
+	connection, _, err := Dial(ctx, repo, peerID)
+	if err != nil {
+		return nil, err
+	}
+	session.connection = connection
+	session.fingerprint = fingerprint
+	return connection, nil
+}
+
+func (pool *contentSessionPool) invalidate(repositoryPath, peerID string) {
+	session := pool.session(repositoryPath, peerID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.connection != nil {
+		_ = session.connection.CloseWithError(1, "content session failed")
+		session.connection = nil
+		session.fingerprint = ""
+	}
+}
+
+func openContentStream(ctx context.Context, repo *repository.Repository, peerID string, request Request) (*quic.Stream, *bufio.Reader, Response, error) {
+	connection, err := contentSessions.connection(ctx, repo, peerID)
+	if err != nil {
+		return nil, nil, Response{}, err
+	}
+	stream, err := connection.OpenStreamSync(ctx)
+	if err != nil {
+		contentSessions.invalidate(repo.Config.Repository, peerID)
+		return nil, nil, Response{}, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	context.AfterFunc(ctx, func() {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+	})
+	data, _ := json.Marshal(request)
+	if _, err := stream.Write(append(data, '\n')); err != nil {
+		stream.CancelRead(1)
+		_ = stream.Close()
+		contentSessions.invalidate(repo.Config.Repository, peerID)
+		return nil, nil, Response{}, err
+	}
+	reader := bufio.NewReader(stream)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		stream.CancelRead(1)
+		_ = stream.Close()
+		contentSessions.invalidate(repo.Config.Repository, peerID)
+		return nil, nil, Response{}, err
+	}
+	var response Response
+	if err := json.Unmarshal(line, &response); err != nil {
+		_ = stream.Close()
+		contentSessions.invalidate(repo.Config.Repository, peerID)
+		return nil, nil, Response{}, err
+	}
+	if !response.OK {
+		_ = stream.Close()
+		return nil, nil, response, errors.New(response.Error)
+	}
+	return stream, reader, response, nil
 }
 
 func (availability *contentAvailability) key(repositoryPath, peerID, key string) string {
@@ -912,10 +1349,15 @@ func isUnavailableContent(err error) bool {
 func Probe(ctx context.Context, repo *repository.Repository, peerID string) error {
 	connection, stream, _, _, err := Open(ctx, repo, peerID, Request{Operation: "ping"})
 	if err != nil {
+		peerAvailability.markFailure(repo.Config.Repository, peerID)
 		return err
 	}
 	_ = stream.Close()
-	return connection.CloseWithError(0, "")
+	err = connection.CloseWithError(0, "")
+	if err == nil {
+		peerAvailability.markSuccess(repo.Config.Repository, peerID)
+	}
+	return err
 }
 
 func writeResponse(writer io.Writer, response Response) error {

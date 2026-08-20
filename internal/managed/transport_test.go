@@ -127,6 +127,21 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	connectionsBefore := server.connections.Load()
+	for range 2 {
+		stream, _, response, openErr := openContentStream(ctx, clientRepo, serverRepo.Config.PeerID,
+			Request{Operation: "annex-has", Key: strings.TrimSpace(string(keyBytes))})
+		if openErr != nil {
+			t.Fatalf("query content holder: %v", openErr)
+		}
+		if response.TotalSize != int64(len(payload)) {
+			t.Fatalf("content holder size = %d, want %d", response.TotalSize, len(payload))
+		}
+		_ = stream.Close()
+	}
+	if connections := server.connections.Load() - connectionsBefore; connections != 1 {
+		t.Fatalf("two content queries opened %d QUIC connections, want one reusable session", connections)
+	}
 	localState, err := OptimizeLocal(ctx, clientRepo, nil)
 	if err != nil {
 		t.Fatalf("optimize current peer: %v", err)
@@ -330,13 +345,26 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if err := membership.Trust(clientRepo.Config.Repository, unavailableRecord.Payload.PeerID, unavailableRecord.Payload.SigningPublicKey); err != nil {
 		t.Fatal(err)
 	}
+	serverUUID, err := exec.CommandContext(ctx, "git", "-C", serverRepo.Config.Repository, "config", "--get", "annex.uuid").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableRemote := "dfs-peer-" + unavailableRecord.Payload.PeerID[:12]
+	if output, configErr := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "config",
+		"remote."+unavailableRemote+".annex-uuid", strings.TrimSpace(string(serverUUID))).CombinedOutput(); configErr != nil {
+		t.Fatalf("seed stale holder hint: %v\n%s", configErr, output)
+	}
 	var ranged bytes.Buffer
+	rangeStarted := time.Now()
 	total, err := FetchRange(ctx, clientRepo, strings.TrimSpace(string(keyBytes)), 8, 7, &ranged)
 	if err != nil {
 		t.Fatalf("range fetch with failed first peer: %v", err)
 	}
 	if total != int64(len(payload)) || ranged.String() != string(payload[8:15]) {
 		t.Fatalf("range fetch = total %d, data %q", total, ranged.String())
+	}
+	if elapsed := time.Since(rangeStarted); elapsed >= managedDialTimeout {
+		t.Fatalf("hedged range fetch waited for offline preferred peer: %s", elapsed)
 	}
 
 	clientRepo.SetManagedRangeFetcher(FetchRange)
@@ -367,6 +395,16 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+originalPath)
 	if err := membership.Save(clientRepo.Config.Repository, offlineRecord); err != nil {
 		t.Fatal(err)
+	}
+	offlineRangeCtx, cancelOfflineRange := context.WithTimeout(ctx, 3*time.Second)
+	offlineRangeStarted := time.Now()
+	_, offlineRangeErr := FetchRange(offlineRangeCtx, clientRepo, strings.TrimSpace(string(keyBytes)), 0, 1, io.Discard)
+	cancelOfflineRange()
+	if !errors.Is(offlineRangeErr, repository.ErrContentUnavailable) {
+		t.Fatalf("all-offline range error = %v, want content unavailable", offlineRangeErr)
+	}
+	if elapsed := time.Since(offlineRangeStarted); elapsed > contentAvailabilityBudget+500*time.Millisecond {
+		t.Fatalf("all-offline range exceeded one availability budget: %s", elapsed)
 	}
 	fetchCtx, cancelFetch := context.WithTimeout(ctx, 3*time.Second)
 	if err := clientRepo.Fetch(fetchCtx, "payload.txt", remoteName); err == nil {

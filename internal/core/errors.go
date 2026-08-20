@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/fs"
 	"syscall"
+
+	"github.com/bitbeamer/dfs/internal/repository"
 )
 
 func (e *Error) Error() string {
@@ -47,6 +49,8 @@ func classify(op, path string, err error) error {
 		code = CodeNoSpace
 	case errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.ENOSYS):
 		code = CodeNotSupported
+	case errors.Is(err, repository.ErrContentUnavailable):
+		code = CodeUnavailable
 	}
 	return &Error{Code: code, Op: op, Path: path, Err: err}
 }

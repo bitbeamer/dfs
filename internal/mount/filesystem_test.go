@@ -76,6 +76,9 @@ func TestStatusDoesNotReportGenericFailuresAsUnimplemented(t *testing.T) {
 	if got := status(&core.Error{Code: core.CodeNotSupported, Op: "test"}); got != fuse.ENOSYS {
 		t.Fatalf("unsupported status = %v, want ENOSYS", got)
 	}
+	if got := status(&core.Error{Code: core.CodeUnavailable, Op: "read"}); got != fuse.ToStatus(syscall.EHOSTUNREACH) {
+		t.Fatalf("unavailable content status = %v, want EHOSTUNREACH", got)
+	}
 }
 
 func TestStatFsReportsBackingFilesystemCapacity(t *testing.T) {
@@ -455,6 +458,53 @@ func TestAdapterCancellationStopsRemoteRangeRead(t *testing.T) {
 		t.Fatal("range did not cancel")
 	}
 	handle.Release()
+}
+
+func TestAdapterAllowsConcurrentRangesOnOneReadHandle(t *testing.T) {
+	root := t.TempDir()
+	filesystem, repo, _ := testFileSystem(t, root)
+	const size = 8 << 20
+	key := "SHA256E-s8388608--" + strings.Repeat("0", 64)
+	target := filepath.Join(".git", "annex", "objects", "AA", "BB", key, key)
+	if err := os.Symlink(target, filepath.Join(root, "parallel.bin")); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan int64, 2)
+	release := make(chan struct{})
+	repo.SetManagedRangeFetcher(func(_ context.Context, _ *repository.Repository, _ string, offset, length int64, output io.Writer) (int64, error) {
+		started <- offset
+		<-release
+		_, err := output.Write(make([]byte, length))
+		return size, err
+	})
+	handle, code := filesystem.Open("parallel.bin", syscall.O_RDONLY, nil)
+	if code != fuse.OK {
+		t.Fatal(code)
+	}
+	finished := make(chan fuse.Status, 2)
+	for _, offset := range []int64{0, 4 << 20} {
+		go func(offset int64) {
+			_, status := handle.Read(make([]byte, 4096), offset)
+			finished <- status
+		}(offset)
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("FUSE adapter serialized independent range reads")
+		}
+	}
+	close(release)
+	for range 2 {
+		if status := <-finished; status != fuse.OK {
+			t.Fatalf("parallel read = %v", status)
+		}
+	}
+	handle.Release()
+	if err := repo.WaitForRangeTasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestFilesystemAdapterSourceDoesNotImportRepositoryOrTransport(t *testing.T) {

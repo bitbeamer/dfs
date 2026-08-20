@@ -16,7 +16,15 @@ import (
 	"time"
 )
 
-const rangeReadAhead = int64(4 << 20)
+const (
+	rangeDemandQuantum     = int64(256 << 10)
+	rangeReadAhead         = int64(4 << 20)
+	rangeSequentialMedium  = int64(1 << 20)
+	durableFallbackMaxSize = int64(32 << 20)
+	durableFallbackTimeout = 10 * time.Second
+)
+
+var ErrContentUnavailable = errors.New("annex content is unavailable")
 
 // ManagedRangeFetcher copies exactly length bytes at offset from a trusted
 // peer and returns the peer's complete object size.
@@ -35,8 +43,26 @@ type rangeMetadata struct {
 }
 
 type rangeState struct {
-	mu     sync.Mutex
-	active int
+	mu              sync.Mutex
+	active          int
+	initialized     bool
+	size            int64
+	cachePath       string
+	metadataPath    string
+	ranges          []byteRange
+	flights         []*rangeFlight
+	generation      uint64
+	persisting      bool
+	promotion       bool
+	hasLastRead     bool
+	lastReadEnd     int64
+	sequentialReads int
+}
+
+type rangeFlight struct {
+	extent byteRange
+	done   chan struct{}
+	err    error
 }
 
 func (r *Repository) SetManagedRangeFetcher(fetcher ManagedRangeFetcher) {
@@ -51,10 +77,14 @@ func (r *Repository) CanStreamRanges() bool {
 	return r.managedRangeFetcher != nil
 }
 
-// ReadRange returns an annex object's requested bytes immediately, retaining
-// successfully transferred extents in peer-private sparse storage. The cache
-// is shared by every visible path for the same key and survives daemon restarts.
-func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offset int64, destination []byte) (int, error) {
+// ReadRange returns demanded annex bytes while retaining transferred extents
+// in peer-private sparse storage. Foreground reads are capped to a small
+// quantum; sequential read-ahead, durable extent publication, verification,
+// and promotion are performed after demanded bytes are available.
+func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offset int64, destination []byte) (n int, returnErr error) {
+	started := time.Now()
+	finish := r.BeginContentRead(path, offset, len(destination))
+	defer func() { finish(returnErr) }()
 	if offset < 0 || size < 0 || offset > size {
 		return 0, errors.New("invalid annex range")
 	}
@@ -73,16 +103,104 @@ func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offs
 
 	state := r.acquireRangeState(key)
 	defer r.releaseRangeState(key, state)
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
 	fetcher := r.rangeFetcher()
 	if fetcher == nil {
 		return 0, errors.New("managed annex range transport is unavailable")
 	}
+	if err := r.initializeRangeState(state, key, size); err != nil {
+		return 0, err
+	}
+
+	requestedEnd := offset + int64(len(destination))
+	windowStart := (offset / rangeDemandQuantum) * rangeDemandQuantum
+	windowEnd := windowStart + rangeDemandQuantum
+	if requestedEnd > windowEnd {
+		if int64(len(destination)) <= rangeDemandQuantum {
+			windowStart = offset
+			windowEnd = offset + rangeDemandQuantum
+		} else {
+			windowStart = offset
+			windowEnd = requestedEnd
+		}
+	}
+	if windowEnd > size {
+		windowEnd = size
+	}
+	cacheHit := r.rangeStateCovered(state, offset, requestedEnd)
+	var ensureErr error
+	if !cacheHit {
+		ensureErr = r.ensureRange(ctx, state, path, key, size, windowStart, windowEnd, fetcher)
+	}
+	if ensureErr != nil {
+		if !errors.Is(ensureErr, ErrContentUnavailable) {
+			return 0, ensureErr
+		}
+		if size > durableFallbackMaxSize {
+			return 0, fmt.Errorf("%w: peer sources failed and %d-byte object exceeds the %d-byte bounded durable hydration limit",
+				ensureErr, size, durableFallbackMaxSize)
+		}
+		fallbackCtx, cancel := context.WithTimeout(ctx, durableFallbackTimeout)
+		fallbackStarted := time.Now()
+		r.RecordContentPlan("durable-full-hydration", "")
+		fallbackErr := r.FetchFromDurableStorage(fallbackCtx, path)
+		cancel()
+		r.LogContentRead("durable content fallback", "path", path, "size", size,
+			"duration", time.Since(fallbackStarted), "error", fallbackErr)
+		if fallbackErr != nil {
+			return 0, fmt.Errorf("%w; %v", ensureErr, fallbackErr)
+		}
+		file, openErr := os.Open(filepath.Join(r.Config.Repository, filepath.FromSlash(path)))
+		if openErr != nil {
+			return 0, openErr
+		}
+		defer file.Close()
+		n, readErr := file.ReadAt(destination, offset)
+		r.LogContentRead("content read completed", "path", path, "offset", offset,
+			"requested_bytes", len(destination), "returned_bytes", n, "source", "durable-storage",
+			"duration", time.Since(started))
+		return n, readErr
+	}
+
+	file, err := os.Open(state.cachePath)
+	if err != nil {
+		// Background promotion can atomically consume the partial between
+		// ensureRange and this open. Prefer the newly installed annex object.
+		file, err = os.Open(filepath.Join(r.Config.Repository, filepath.FromSlash(path)))
+		if err != nil {
+			return 0, err
+		}
+	}
+	defer file.Close()
+	n, readErr := file.ReadAt(destination, offset)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return n, readErr
+	}
+	r.Touch(path)
+	readAhead := r.recordRangeRead(state, offset, requestedEnd)
+	if readAhead > 0 && windowEnd < size {
+		prefetchEnd := min(size, windowEnd+readAhead)
+		r.rangeTasks.Add(1)
+		go func() {
+			defer r.rangeTasks.Done()
+			r.prefetchRange(ctx, state, path, key, size, windowEnd, prefetchEnd, fetcher)
+		}()
+	}
+	r.LogContentRead("content read completed", "path", path, "offset", offset,
+		"requested_bytes", len(destination), "returned_bytes", n, "cache_hit", cacheHit,
+		"foreground_window_bytes", windowEnd-windowStart, "read_ahead_bytes", readAhead,
+		"duration", time.Since(started))
+	return n, nil
+}
+
+func (r *Repository) initializeRangeState(state *rangeState, key string, size int64) error {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.initialized && state.size == size {
+		return nil
+	}
 	cachePath, metadataPath := r.rangeCachePaths(key)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
-		return 0, err
+		return err
 	}
 	metadata, err := loadRangeMetadata(metadataPath, key, size)
 	if err != nil {
@@ -92,70 +210,233 @@ func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offs
 	}
 	file, err := os.OpenFile(cachePath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	defer file.Close()
 	if err := file.Truncate(size); err != nil {
-		return 0, err
+		_ = file.Close()
+		return err
 	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	state.initialized = true
+	state.size = size
+	state.cachePath = cachePath
+	state.metadataPath = metadataPath
+	state.ranges = metadata.Ranges
+	return nil
+}
 
-	requestedEnd := offset + int64(len(destination))
-	windowStart := (offset / rangeReadAhead) * rangeReadAhead
-	windowEnd := ((requestedEnd + rangeReadAhead - 1) / rangeReadAhead) * rangeReadAhead
-	if windowEnd > size {
-		windowEnd = size
-	}
-	for _, missing := range rangeGaps(metadata.Ranges, windowStart, windowEnd) {
-		if err := r.pruneRangeCache(key, missing.End-missing.Start); err != nil {
-			return 0, err
+func (r *Repository) rangeStateCovered(state *rangeState, start, end int64) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return rangeCovered(state.ranges, start, end)
+}
+
+func (r *Repository) ensureRange(ctx context.Context, state *rangeState, path, key string, size, start, end int64, fetcher ManagedRangeFetcher) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		writer := io.NewOffsetWriter(file, missing.Start)
-		total, fetchErr := fetcher(ctx, r, key, missing.Start, missing.End-missing.Start, writer)
+		state.mu.Lock()
+		gaps := rangeGaps(state.ranges, start, end)
+		if len(gaps) == 0 {
+			state.mu.Unlock()
+			return nil
+		}
+		missing := gaps[0]
+		var existing *rangeFlight
+		for _, flight := range state.flights {
+			if flight.extent.Start < missing.End && missing.Start < flight.extent.End {
+				existing = flight
+				break
+			}
+		}
+		if existing != nil {
+			state.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-existing.done:
+				if existing.err != nil {
+					return existing.err
+				}
+				continue
+			}
+		}
+		flight := &rangeFlight{extent: missing, done: make(chan struct{})}
+		state.flights = append(state.flights, flight)
+		state.mu.Unlock()
+
+		fetchErr := r.fetchRangeExtent(ctx, state, key, size, missing, fetcher)
+		state.mu.Lock()
+		for index, candidate := range state.flights {
+			if candidate == flight {
+				state.flights = append(state.flights[:index], state.flights[index+1:]...)
+				break
+			}
+		}
+		flight.err = fetchErr
+		if fetchErr == nil {
+			state.ranges = mergeRanges(append(state.ranges, missing))
+			state.generation++
+		}
+		close(flight.done)
+		state.mu.Unlock()
 		if fetchErr != nil {
-			return 0, fetchErr
+			return fetchErr
 		}
-		if total != size {
-			return 0, fmt.Errorf("annex object size changed: peer reported %d, expected %d", total, size)
-		}
-		// Never publish an extent in resumable metadata before its bytes are
-		// durable. After a crash an unrecorded extent is safely downloaded again.
-		if err := file.Sync(); err != nil {
-			return 0, err
-		}
-		metadata.Ranges = mergeRanges(append(metadata.Ranges, missing))
-		metadata.UpdatedAt = time.Now().UTC()
-		if err := saveRangeMetadata(metadataPath, metadata); err != nil {
-			return 0, err
-		}
+		r.scheduleRangePersistence(state, path, key, size)
 	}
+}
 
-	if rangeCovered(metadata.Ranges, 0, size) {
-		if err := verifySHA256AnnexKey(file, key); err != nil {
+func (r *Repository) fetchRangeExtent(ctx context.Context, state *rangeState, key string, size int64, extent byteRange, fetcher ManagedRangeFetcher) error {
+	if err := r.pruneRangeCache(key, extent.End-extent.Start); err != nil {
+		return err
+	}
+	started := time.Now()
+	var payload strings.Builder
+	payload.Grow(int(extent.End - extent.Start))
+	total, err := fetcher(ctx, r, key, extent.Start, extent.End-extent.Start, &payload)
+	if err != nil {
+		r.LogContentRead("content range fetch failed", "offset", extent.Start, "bytes", extent.End-extent.Start,
+			"duration", time.Since(started), "error", err)
+		return err
+	}
+	if total != size {
+		return fmt.Errorf("annex object size changed: peer reported %d, expected %d", total, size)
+	}
+	if int64(payload.Len()) != extent.End-extent.Start {
+		return io.ErrUnexpectedEOF
+	}
+	file, err := os.OpenFile(state.cachePath, os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteAt([]byte(payload.String()), extent.Start)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	r.LogContentRead("content range fetched", "offset", extent.Start, "bytes", extent.End-extent.Start,
+		"duration", time.Since(started))
+	return nil
+}
+
+func (r *Repository) recordRangeRead(state *rangeState, offset, end int64) int64 {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.hasLastRead && offset == state.lastReadEnd {
+		state.sequentialReads++
+	} else {
+		state.sequentialReads = 0
+	}
+	state.hasLastRead = true
+	state.lastReadEnd = end
+	switch {
+	case state.sequentialReads >= 2:
+		return rangeReadAhead
+	case state.sequentialReads == 1:
+		return rangeSequentialMedium
+	default:
+		return 0
+	}
+}
+
+func (r *Repository) prefetchRange(ctx context.Context, state *rangeState, path, key string, size, start, end int64, fetcher ManagedRangeFetcher) {
+	state = r.acquireRangeState(key)
+	defer r.releaseRangeState(key, state)
+	if err := r.ensureRange(ctx, state, path, key, size, start, end, fetcher); err != nil && !errors.Is(err, context.Canceled) {
+		r.LogContentRead("content read-ahead failed", "path", path, "offset", start, "bytes", end-start, "error", err)
+	}
+}
+
+func (r *Repository) scheduleRangePersistence(state *rangeState, path, key string, size int64) {
+	state.mu.Lock()
+	if state.persisting {
+		state.mu.Unlock()
+		return
+	}
+	state.persisting = true
+	state.mu.Unlock()
+	r.rangeTasks.Add(1)
+	go func() {
+		defer r.rangeTasks.Done()
+		r.persistRangeState(state, path, key, size)
+	}()
+}
+
+func (r *Repository) persistRangeState(state *rangeState, path, key string, size int64) {
+	state = r.acquireRangeState(key)
+	defer r.releaseRangeState(key, state)
+	for {
+		state.mu.Lock()
+		generation := state.generation
+		ranges := append([]byteRange(nil), state.ranges...)
+		cachePath, metadataPath := state.cachePath, state.metadataPath
+		state.mu.Unlock()
+
+		file, err := os.OpenFile(cachePath, os.O_RDWR, 0o600)
+		if err == nil {
+			err = file.Sync()
 			_ = file.Close()
-			_ = os.Remove(cachePath)
-			_ = os.Remove(metadataPath)
-			return 0, err
 		}
+		if err == nil {
+			err = saveRangeMetadata(metadataPath, rangeMetadata{Key: key, Size: size, Ranges: ranges, UpdatedAt: time.Now().UTC()})
+		}
+		if err != nil {
+			r.LogContentRead("persist range cache failed", "path", path, "error", err)
+		}
+
+		state.mu.Lock()
+		if err == nil && generation == state.generation {
+			state.persisting = false
+			complete := rangeCovered(ranges, 0, size) && !state.promotion
+			if complete {
+				state.promotion = true
+			}
+			state.mu.Unlock()
+			if complete {
+				r.promoteRangeCache(state, path, key)
+			}
+			return
+		}
+		if err != nil {
+			state.persisting = false
+			state.mu.Unlock()
+			return
+		}
+		state.mu.Unlock()
 	}
-	n, readErr := file.ReadAt(destination, offset)
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return n, readErr
+}
+
+func (r *Repository) promoteRangeCache(state *rangeState, path, key string) {
+	started := time.Now()
+	file, err := os.Open(state.cachePath)
+	if err == nil {
+		err = verifySHA256AnnexKey(file, key)
+		_ = file.Close()
 	}
-	if rangeCovered(metadata.Ranges, 0, size) {
-		if err := file.Sync(); err != nil {
-			return 0, err
-		}
-		if err := file.Close(); err != nil {
-			return 0, err
-		}
-		// git-annex verifies the key again and atomically installs the object.
-		if err := r.ReinjectContent(ctx, cachePath, path); err != nil {
-			return 0, fmt.Errorf("promote verified annex content: %w", err)
-		}
-		_ = os.Remove(metadataPath)
+	if err == nil {
+		err = r.ReinjectContent(context.Background(), state.cachePath, path)
 	}
-	r.Touch(path)
-	return n, nil
+	state.mu.Lock()
+	state.promotion = false
+	if err == nil {
+		state.ranges = nil
+		state.initialized = false
+		_ = os.Remove(state.metadataPath)
+	} else if strings.Contains(err.Error(), "SHA256 verification") {
+		state.ranges = nil
+		state.initialized = false
+		_ = os.Remove(state.cachePath)
+		_ = os.Remove(state.metadataPath)
+	}
+	state.mu.Unlock()
+	r.LogContentRead("range cache promotion completed", "path", path, "duration", time.Since(started), "error", err)
 }
 
 func (r *Repository) rangeFetcher() ManagedRangeFetcher {
@@ -183,9 +464,6 @@ func (r *Repository) releaseRangeState(key string, state *rangeState) {
 	r.rangeStatesMu.Lock()
 	defer r.rangeStatesMu.Unlock()
 	state.active--
-	if state.active == 0 {
-		delete(r.rangeStates, key)
-	}
 }
 
 func (r *Repository) rangeCachePaths(key string) (string, string) {
@@ -205,6 +483,9 @@ func (r *Repository) discardRangeCache(key string) {
 	partial, metadata := r.rangeCachePaths(key)
 	_ = os.Remove(partial)
 	_ = os.Remove(metadata)
+	state.initialized = false
+	state.ranges = nil
+	state.generation++
 }
 
 func loadRangeMetadata(path, key string, size int64) (rangeMetadata, error) {

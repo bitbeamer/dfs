@@ -72,7 +72,7 @@ type readFile struct {
 
 type versionedReadFile struct {
 	*readFile
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 func NewFileSystem(api core.API, notifier changeNotifier, logger *slog.Logger) *FileSystem {
@@ -120,6 +120,8 @@ func status(err error) fuse.Status {
 			return fuse.ToStatus(syscall.ENOSPC)
 		case core.CodeNotSupported:
 			return fuse.ENOSYS
+		case core.CodeUnavailable:
+			return fuse.ToStatus(syscall.EHOSTUNREACH)
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -445,8 +447,8 @@ func (r *readFile) Release() {
 }
 
 func (r *versionedReadFile) Read(destination []byte, offset int64) (fuse.ReadResult, fuse.Status) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.readFile.Read(destination, offset)
 }
 

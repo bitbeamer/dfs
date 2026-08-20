@@ -29,23 +29,25 @@ type RemoteDiagnostic struct {
 }
 
 type DiagnosticReport struct {
-	Version              int                    `json:"version"`
-	ObservedAt           time.Time              `json:"observed_at"`
-	FileSystemID         string                 `json:"filesystem_id"`
-	NetworkName          string                 `json:"network_name"`
-	PeerID               string                 `json:"peer_id"`
-	PeerName             string                 `json:"peer_name"`
-	Role                 string                 `json:"role"`
-	Endpoint             string                 `json:"endpoint,omitempty"`
-	InstancePort         int                    `json:"instance_port,omitempty"`
-	TreeID               string                 `json:"tree_id,omitempty"`
-	MembershipMembers    int                    `json:"membership_members"`
-	ConfiguredPeers      int                    `json:"configured_peers"`
-	ReconciliationStatus string                 `json:"reconciliation_status"`
-	Stats                repository.HealthStats `json:"stats"`
-	Optimization         *optimization.State    `json:"optimization,omitempty"`
-	Issues               []HealthIssue          `json:"issues,omitempty"`
-	Remotes              []RemoteDiagnostic     `json:"remotes"`
+	Version              int                               `json:"version"`
+	ObservedAt           time.Time                         `json:"observed_at"`
+	FileSystemID         string                            `json:"filesystem_id"`
+	NetworkName          string                            `json:"network_name"`
+	PeerID               string                            `json:"peer_id"`
+	PeerName             string                            `json:"peer_name"`
+	Role                 string                            `json:"role"`
+	Endpoint             string                            `json:"endpoint,omitempty"`
+	InstancePort         int                               `json:"instance_port,omitempty"`
+	TreeID               string                            `json:"tree_id,omitempty"`
+	MembershipMembers    int                               `json:"membership_members"`
+	ConfiguredPeers      int                               `json:"configured_peers"`
+	ReconciliationStatus string                            `json:"reconciliation_status"`
+	Stats                repository.HealthStats            `json:"stats"`
+	Optimization         *optimization.State               `json:"optimization,omitempty"`
+	ContentRead          repository.ContentReadDiagnostics `json:"content_read"`
+	ContentPeers         []managed.ContentPeerState        `json:"content_peers,omitempty"`
+	Issues               []HealthIssue                     `json:"issues,omitempty"`
+	Remotes              []RemoteDiagnostic                `json:"remotes"`
 }
 
 type HealthIssue struct {
@@ -167,7 +169,8 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 	}
 	report := DiagnosticReport{Version: 2, ObservedAt: time.Now().UTC(), FileSystemID: filesystemID,
 		NetworkName: repo.Config.NetworkName, PeerID: repo.Config.PeerID, PeerName: repo.Config.Name,
-		TreeID: treeID, ConfiguredPeers: len(remotes), Stats: stats, ReconciliationStatus: "ready"}
+		TreeID: treeID, ConfiguredPeers: len(remotes), Stats: stats, ReconciliationStatus: "ready",
+		ContentRead: repo.ContentReadDiagnostics()}
 	if state, stateErr := optimization.LoadCurrent(repo.Config.Repository, filesystemID, repo.Config.PeerID); stateErr == nil {
 		report.Optimization = &state
 	}
@@ -243,6 +246,7 @@ func Diagnose(ctx context.Context, repo *repository.Repository, timeout time.Dur
 		}(index, remote)
 	}
 	checksWait.Wait()
+	report.ContentPeers = managed.ContentPeerStates(repo.Config.Repository)
 	for _, check := range checks {
 		if check.Name != "" {
 			report.Remotes = append(report.Remotes, check)
