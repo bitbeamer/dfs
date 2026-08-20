@@ -701,7 +701,7 @@ func localIPv4WithResolver(ctx context.Context, hostname string, lookup func(con
 }
 
 func Open(ctx context.Context, repo *repository.Repository, peerID string, request Request) (*quic.Conn, *quic.Stream, *bufio.Reader, Response, error) {
-	connection, err := dialTrustedMember(ctx, repo, target)
+	connection, _, err := Dial(ctx, repo, peerID)
 	if err != nil {
 		return nil, nil, nil, Response{}, err
 	}
@@ -1311,7 +1311,7 @@ func (pool *contentSessionPool) connection(ctx context.Context, repo *repository
 		_ = session.connection.CloseWithError(0, "membership changed")
 		session.connection = nil
 	}
-	connection, _, err := Dial(ctx, repo, peerID)
+	connection, err := dialTrustedMember(ctx, repo, target)
 	if err != nil {
 		return nil, false, err
 	}
