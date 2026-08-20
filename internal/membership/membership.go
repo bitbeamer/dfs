@@ -549,6 +549,17 @@ func LoadTrusted(repositoryPath string) (map[string]string, error) {
 	return trusted, nil
 }
 
+// IsRevoked checks the locally persisted set of cryptographically accepted
+// membership revocations. The set is refreshed whenever Accepted processes
+// shared membership state and is safe to consult on latency-sensitive paths.
+func IsRevoked(repositoryPath, peerID string) (bool, error) {
+	revoked, err := loadRevoked(repositoryPath)
+	if err != nil {
+		return false, err
+	}
+	return revoked[peerID], nil
+}
+
 // Accepted returns the non-revoked records whose approval chain reaches a
 // locally trusted peer. Newly accepted peers are persisted as trust anchors so
 // offline reconciliation does not depend on record ordering.

@@ -86,10 +86,6 @@ func Start(repo *repository.Repository, address string, diagnostic func(context.
 	if err != nil {
 		return nil, err
 	}
-	filesystemID, err := repo.FileSystemID(context.Background())
-	if err != nil {
-		return nil, err
-	}
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
 		NextProtos: []string{ALPN}, ClientAuth: tls.RequireAnyClientCert}
 	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -104,7 +100,7 @@ func Start(repo *repository.Repository, address string, diagnostic func(context.
 		if !ok {
 			return errors.New("DFS managed transport peer key is not Ed25519")
 		}
-		return verifyTrustedPublicKey(repo.Config.Repository, filesystemID, public)
+		return verifyTrustedPublicKey(repo.Config.Repository, public)
 	}
 	if pairingCertificate != nil && pair != nil {
 		managedConfig := tlsConfig.Clone()
@@ -1499,22 +1495,21 @@ func trustedMember(repositoryPath, peerID string) (membership.Record, error) {
 	return membership.Record{}, fmt.Errorf("peer %s is not in trusted DFS membership", peerID)
 }
 
-func verifyTrustedPublicKey(repositoryPath, filesystemID string, public ed25519.PublicKey) error {
+func verifyTrustedPublicKey(repositoryPath string, public ed25519.PublicKey) error {
 	trusted, err := membership.LoadTrusted(repositoryPath)
 	if err != nil {
 		return err
 	}
 	wanted := base64Public(public)
-	revoked, err := membership.AcceptedRevocations(repositoryPath, filesystemID)
-	if err != nil {
-		return err
-	}
-	records, err := membership.LoadAll(repositoryPath)
-	if err != nil {
-		return err
-	}
-	for _, record := range records {
-		if record.Payload.FileSystemID == filesystemID && !revoked[record.Payload.PeerID] && trusted[record.Payload.PeerID] == wanted && record.Payload.SigningPublicKey == wanted {
+	for peerID, key := range trusted {
+		if key != wanted {
+			continue
+		}
+		revoked, err := membership.IsRevoked(repositoryPath, peerID)
+		if err != nil {
+			return err
+		}
+		if !revoked {
 			return nil
 		}
 	}
