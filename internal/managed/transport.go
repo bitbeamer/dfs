@@ -1348,6 +1348,8 @@ func openContentStream(ctx context.Context, repo *repository.Repository, peerID 
 			"duration", time.Since(started), "error", err)
 		return nil, nil, Response{}, err
 	}
+	repo.LogContentRead("content stream created", "peer_id", peerID, "operation", request.Operation,
+		"duration", time.Since(started))
 	stream, err := connection.OpenStreamSync(ctx)
 	if err != nil {
 		contentSessions.invalidate(repo.Config.Repository, peerID)
@@ -1367,6 +1369,8 @@ func openContentStream(ctx context.Context, repo *repository.Repository, peerID 
 		contentSessions.invalidate(repo.Config.Repository, peerID)
 		return nil, nil, Response{}, err
 	}
+	repo.LogContentRead("content request written", "peer_id", peerID, "operation", request.Operation,
+		"duration", time.Since(started))
 	reader := bufio.NewReader(stream)
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
