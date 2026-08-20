@@ -979,8 +979,10 @@ func fetchRangeCandidate(ctx context.Context, repo *repository.Repository, peerI
 
 func discoverContentHolders(ctx context.Context, repo *repository.Repository, key string, peerIDs []string) []string {
 	type result struct {
-		peerID string
-		has    bool
+		peerID   string
+		has      bool
+		duration time.Duration
+		err      error
 	}
 	results := make(chan result, len(peerIDs))
 	count := 0
@@ -990,6 +992,7 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 		}
 		count++
 		go func(peerID string) {
+			started := time.Now()
 			stream, _, response, err := openContentStream(ctx, repo, peerID, Request{Operation: "annex-has", Key: key})
 			if stream != nil {
 				_ = stream.Close()
@@ -997,7 +1000,7 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 			if err == nil && response.TotalSize > 0 {
 				peerAvailability.markSuccess(repo.Config.Repository, peerID)
 				unavailableContent.clear(repo.Config.Repository, peerID, key)
-				results <- result{peerID: peerID, has: true}
+				results <- result{peerID: peerID, has: true, duration: time.Since(started)}
 				return
 			}
 			if isUnavailableContent(err) {
@@ -1005,7 +1008,7 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 			} else if err != nil {
 				peerAvailability.markFailure(repo.Config.Repository, peerID)
 			}
-			results <- result{peerID: peerID}
+			results <- result{peerID: peerID, duration: time.Since(started), err: err}
 		}(peerID)
 	}
 	found := make(map[string]bool)
@@ -1014,6 +1017,10 @@ func discoverContentHolders(ctx context.Context, repo *repository.Repository, ke
 		case <-ctx.Done():
 			return orderedSubset(peerIDs, found)
 		case value := <-results:
+			if value.err != nil {
+				repo.LogContentRead("content availability check failed", "peer_id", value.peerID,
+					"duration", value.duration, "error", value.err)
+			}
 			if value.has {
 				// One verified online holder is enough to begin the demand read.
 				// Do not let an unrelated offline probe consume the interactive
