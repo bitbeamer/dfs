@@ -637,17 +637,22 @@ func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*qui
 	if err != nil {
 		return nil, membership.Record{}, err
 	}
+	connection, err := dialTrustedMember(ctx, repo, target)
+	return connection, target, err
+}
+
+func dialTrustedMember(ctx context.Context, repo *repository.Repository, target membership.Record) (*quic.Conn, error) {
 	private, _, err := membership.EnsureKey(repo.Config.Repository)
 	if err != nil {
-		return nil, membership.Record{}, err
+		return nil, err
 	}
 	clientCertificate, err := certificate(private, repo.Config.PeerID)
 	if err != nil {
-		return nil, membership.Record{}, err
+		return nil, err
 	}
 	endpoint, err := url.Parse(target.Payload.QUICEndpoint)
 	if err != nil || endpoint.Host == "" {
-		return nil, membership.Record{}, errors.New("invalid member QUIC endpoint")
+		return nil, errors.New("invalid member QUIC endpoint")
 	}
 	address := endpoint.Host
 	if ipv4, ok := localIPv4(ctx, endpoint.Hostname()); ok {
@@ -674,7 +679,7 @@ func Dial(ctx context.Context, repo *repository.Repository, peerID string) (*qui
 	connection, err := quic.DialAddr(dialContext, address, tlsConfig, &quic.Config{
 		HandshakeIdleTimeout: managedDialTimeout, MaxIdleTimeout: 2 * time.Minute, KeepAlivePeriod: 20 * time.Second,
 	})
-	return connection, target, err
+	return connection, err
 }
 
 func localIPv4(ctx context.Context, hostname string) (string, bool) {
@@ -696,7 +701,7 @@ func localIPv4WithResolver(ctx context.Context, hostname string, lookup func(con
 }
 
 func Open(ctx context.Context, repo *repository.Repository, peerID string, request Request) (*quic.Conn, *quic.Stream, *bufio.Reader, Response, error) {
-	connection, _, err := Dial(ctx, repo, peerID)
+	connection, err := dialTrustedMember(ctx, repo, target)
 	if err != nil {
 		return nil, nil, nil, Response{}, err
 	}
