@@ -3,6 +3,7 @@ package repository
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -983,6 +984,68 @@ func (r *Repository) PeerContentHints(ctx context.Context, key string, peerIDs [
 		}
 	}
 	return result
+}
+
+// PeerContentIndex builds a point-in-time key-to-peer routing index from the
+// local git-annex location log. It is intended for background refreshes; the
+// interactive read path should query the daemon's in-memory copy.
+func (r *Repository) PeerContentIndex(ctx context.Context, peerIDs []string) (map[string][]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	uuidPeers := make(map[string]string, len(peerIDs))
+	for _, peerID := range peerIDs {
+		shortID := peerID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		value, err := r.runner.Run(ctx, "git", "config", "--get", "remote.dfs-peer-"+shortID+".annex-uuid")
+		if err == nil && strings.TrimSpace(value) != "" {
+			uuidPeers[strings.TrimSpace(value)] = peerID
+		}
+	}
+	output, err := r.runner.Run(ctx, "git", "annex", "whereis", "--all", "--json")
+	if err != nil {
+		return nil, err
+	}
+	type location struct {
+		UUID string `json:"uuid"`
+	}
+	type record struct {
+		Key     string     `json:"key"`
+		Whereis []location `json:"whereis"`
+	}
+	found := make(map[string]map[string]bool)
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	scanner.Buffer(make([]byte, 64<<10), 4<<20)
+	for scanner.Scan() {
+		var value record
+		if err := json.Unmarshal(scanner.Bytes(), &value); err != nil {
+			return nil, fmt.Errorf("decode git-annex location index: %w", err)
+		}
+		if value.Key == "" {
+			continue
+		}
+		for _, item := range value.Whereis {
+			if peerID := uuidPeers[item.UUID]; peerID != "" {
+				if found[value.Key] == nil {
+					found[value.Key] = make(map[string]bool)
+				}
+				found[value.Key][peerID] = true
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	result := make(map[string][]string, len(found))
+	for key, included := range found {
+		for _, peerID := range peerIDs {
+			if included[peerID] {
+				result[key] = append(result[key], peerID)
+			}
+		}
+	}
+	return result, nil
 }
 
 // RecordPeerAnnexUUID associates an authenticated DFS peer with the annex

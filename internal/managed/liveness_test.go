@@ -20,26 +20,30 @@ func TestLiveContentPeerIDsUsesCompleteFreshLocalSnapshot(t *testing.T) {
 		_ = listener.Close()
 		_ = os.Remove(path)
 	})
-	snapshot := contentLivenessSnapshot{Version: 1, ObservedAt: time.Now().UTC(), Complete: true,
-		Peers: map[string]bool{"offline": false, "online": true}}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range 2 {
+		for index := range 2 {
 			connection, acceptErr := listener.AcceptUnix()
 			if acceptErr != nil {
 				return
 			}
+			var request contentLivenessRequest
+			_ = json.NewDecoder(connection).Decode(&request)
+			snapshot := contentLivenessSnapshot{Version: 1, ObservedAt: time.Now().UTC(), Complete: index == 0,
+				PeerIDs: []string{"offline", "online"}, Peers: map[string]bool{"offline": false, "online": true},
+				HoldersComplete: true, HolderPeerIDs: []string{"offline"}}
 			_ = json.NewEncoder(connection).Encode(snapshot)
 			_ = connection.Close()
 		}
 	}()
 
-	if got, known := liveContentPeerIDs(repositoryPath, []string{"offline", "online"}); !known || !reflect.DeepEqual(got, []string{"online"}) {
-		t.Fatalf("live peers = %v, %v, want [online], true", got, known)
+	if _, got, holders, known, holdersKnown := localContentPlan(repositoryPath, "key"); !known || !holdersKnown ||
+		!reflect.DeepEqual(got, []string{"online"}) || !reflect.DeepEqual(holders, []string{"offline"}) {
+		t.Fatalf("local plan = online %v, holders %v, known %v/%v", got, holders, known, holdersKnown)
 	}
-	if got, known := liveContentPeerIDs(repositoryPath, []string{"online", "new-member"}); known || got != nil {
-		t.Fatalf("incomplete membership snapshot = %v, %v, want nil, false", got, known)
+	if got, online, holders, known, holdersKnown := localContentPlan(repositoryPath, "key"); known || holdersKnown || got != nil || online != nil || holders != nil {
+		t.Fatalf("incomplete snapshot = %v, %v, %v, %v, %v", got, online, holders, known, holdersKnown)
 	}
 	<-done
 }

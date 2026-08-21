@@ -549,6 +549,33 @@ func LoadTrusted(repositoryPath string) (map[string]string, error) {
 	return trusted, nil
 }
 
+// TrustStateVersion fingerprints the small local inputs used to authorize and
+// route managed peers. Callers can cheaply reuse a validated membership record
+// while this value is unchanged without spawning Git on every content stream.
+func TrustStateVersion(repositoryPath string) (string, error) {
+	paths := []string{
+		filepath.Join(repositoryPath, ".git", "refs", "heads", "dfs-membership"),
+		filepath.Join(repositoryPath, ".git", "packed-refs"),
+		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), trustedMembersFile),
+		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), revokedMembersFile),
+	}
+	hash := sha256.New()
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		_, _ = hash.Write([]byte(path))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write(data)
+		_, _ = hash.Write([]byte{0})
+	}
+	return base64.RawStdEncoding.EncodeToString(hash.Sum(nil)), nil
+}
+
 // IsRevoked checks the locally persisted set of cryptographically accepted
 // membership revocations. The set is refreshed whenever Accepted processes
 // shared membership state and is safe to consult on latency-sensitive paths.

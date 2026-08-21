@@ -296,6 +296,28 @@ func TestMembershipRefSynchronizesWithoutWorktreeFiles(t *testing.T) {
 	}
 }
 
+func TestTrustStateVersionChangesWithPrivateTrustState(t *testing.T) {
+	repositoryPath := t.TempDir()
+	directory := filepath.Join(repositoryPath, filepath.FromSlash(config.Directory))
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, err := TrustStateVersion(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, trustedMembersFile), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, err := TrustStateVersion(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("trust state version did not change")
+	}
+}
+
 func TestSignedClusterPinPolicyReplicatesAndUnpins(t *testing.T) {
 	first := gitMembershipRepository(t)
 	second := filepath.Join(t.TempDir(), "second")

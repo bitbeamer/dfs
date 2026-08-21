@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -369,6 +370,13 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if output, configErr := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "config",
 		"remote."+unavailableRemote+".annex-uuid", strings.TrimSpace(string(serverUUID))).CombinedOutput(); configErr != nil {
 		t.Fatalf("seed stale holder hint: %v\n%s", configErr, output)
+	}
+	contentIndex, err := clientRepo.PeerContentIndex(ctx, []string{unavailableRecord.Payload.PeerID, serverRepo.Config.PeerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := contentIndex[strings.TrimSpace(string(keyBytes))]; !slices.Contains(got, serverRepo.Config.PeerID) {
+		t.Fatalf("background content index for fixture = %v, want server peer", got)
 	}
 	var ranged bytes.Buffer
 	rangeStarted := time.Now()

@@ -19,34 +19,45 @@ import (
 
 const (
 	contentLivenessInterval = 2 * time.Second
-	contentLivenessProbe    = 750 * time.Millisecond
-	contentLivenessMaxAge   = 5 * time.Second
+	contentLivenessProbe    = 5 * time.Second
+	contentLivenessMaxAge   = 10 * time.Second
 	contentLivenessLocalIO  = 25 * time.Millisecond
 	contentPeerRefresh      = 30 * time.Second
+	contentHolderRefresh    = 10 * time.Second
 )
 
 type contentLivenessSnapshot struct {
-	Version    int             `json:"version"`
-	ObservedAt time.Time       `json:"observed_at"`
-	Complete   bool            `json:"complete"`
-	Peers      map[string]bool `json:"peers"`
+	Version         int             `json:"version"`
+	ObservedAt      time.Time       `json:"observed_at"`
+	Complete        bool            `json:"complete"`
+	PeerIDs         []string        `json:"peer_ids"`
+	Peers           map[string]bool `json:"peers"`
+	HoldersComplete bool            `json:"holders_complete"`
+	HolderPeerIDs   []string        `json:"holder_peer_ids,omitempty"`
+}
+
+type contentLivenessRequest struct {
+	Key string `json:"key,omitempty"`
 }
 
 // ContentLivenessMonitor keeps a lightweight, authenticated view of which
 // accepted peers are reachable. It is owned by the core daemon and exposed to
 // local frontend processes over a repository-specific Unix socket.
 type ContentLivenessMonitor struct {
-	repo      *repository.Repository
-	listener  *net.UnixListener
-	path      string
-	interval  time.Duration
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	mu        sync.RWMutex
-	snapshot  contentLivenessSnapshot
-	peerIDs   []string
-	refreshed time.Time
+	repo             *repository.Repository
+	listener         *net.UnixListener
+	path             string
+	interval         time.Duration
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	mu               sync.RWMutex
+	snapshot         contentLivenessSnapshot
+	peerIDs          []string
+	refreshed        time.Time
+	holders          map[string][]string
+	holdersComplete  bool
+	holdersRefreshed time.Time
 }
 
 func contentLivenessPath(repositoryPath string) string {
@@ -82,7 +93,7 @@ func StartContentLivenessMonitor(parent context.Context, repo *repository.Reposi
 	ctx, cancel := context.WithCancel(parent)
 	monitor := &ContentLivenessMonitor{repo: repo, listener: listener, path: path,
 		interval: contentLivenessInterval, ctx: ctx, cancel: cancel,
-		snapshot: contentLivenessSnapshot{Version: 1, Peers: make(map[string]bool)}}
+		snapshot: contentLivenessSnapshot{Version: 1, Peers: make(map[string]bool)}, holders: make(map[string][]string)}
 	monitor.wg.Add(2)
 	go monitor.serve()
 	go monitor.observe()
@@ -110,9 +121,18 @@ func (monitor *ContentLivenessMonitor) serve() {
 		if err != nil {
 			return
 		}
+		_ = connection.SetReadDeadline(time.Now().Add(contentLivenessLocalIO))
+		var request contentLivenessRequest
+		if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&request); err != nil {
+			_ = connection.Close()
+			continue
+		}
 		monitor.mu.RLock()
 		snapshot := monitor.snapshot
 		snapshot.Peers = clonePeerLiveness(snapshot.Peers)
+		snapshot.PeerIDs = append([]string(nil), snapshot.PeerIDs...)
+		snapshot.HoldersComplete = monitor.holdersComplete
+		snapshot.HolderPeerIDs = append([]string(nil), monitor.holders[request.Key]...)
 		monitor.mu.RUnlock()
 		_ = connection.SetWriteDeadline(time.Now().Add(contentLivenessLocalIO))
 		_ = json.NewEncoder(connection).Encode(snapshot)
@@ -176,8 +196,22 @@ func (monitor *ContentLivenessMonitor) probeOnce() {
 	}
 	monitor.mu.Lock()
 	monitor.snapshot = contentLivenessSnapshot{Version: 1, ObservedAt: time.Now().UTC(),
-		Complete: !monitor.refreshed.IsZero(), Peers: states}
+		Complete: !monitor.refreshed.IsZero(), PeerIDs: peerIDs, Peers: states}
 	monitor.mu.Unlock()
+	if monitor.holdersRefreshed.IsZero() || time.Since(monitor.holdersRefreshed) >= contentHolderRefresh {
+		ctx, cancel := context.WithTimeout(monitor.ctx, 10*time.Second)
+		holders, err := monitor.repo.PeerContentIndex(ctx, peerIDs)
+		cancel()
+		monitor.mu.Lock()
+		if err == nil {
+			monitor.holders = holders
+			monitor.holdersComplete = true
+			monitor.holdersRefreshed = time.Now()
+		} else {
+			monitor.holdersComplete = false
+		}
+		monitor.mu.Unlock()
+	}
 }
 
 func clonePeerLiveness(source map[string]bool) map[string]bool {
@@ -188,31 +222,35 @@ func clonePeerLiveness(source map[string]bool) map[string]bool {
 	return result
 }
 
-// liveContentPeerIDs returns a complete current subset only when the local
-// daemon has observed every requested accepted peer recently. Otherwise the
-// caller must retain its bounded synchronous discovery path.
-func liveContentPeerIDs(repositoryPath string, peerIDs []string) ([]string, bool) {
+// localContentPlan returns daemon-maintained peer and holder routing only when
+// the local snapshot is complete and fresh. Otherwise the caller retains its
+// bounded synchronous discovery path.
+func localContentPlan(repositoryPath, key string) (peerIDs, online, holders []string, livenessKnown, holdersKnown bool) {
 	connection, err := net.DialTimeout("unix", contentLivenessPath(repositoryPath), contentLivenessLocalIO)
 	if err != nil {
-		return nil, false
+		return nil, nil, nil, false, false
 	}
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(contentLivenessLocalIO))
+	if err := json.NewEncoder(connection).Encode(contentLivenessRequest{Key: key}); err != nil {
+		return nil, nil, nil, false, false
+	}
 	var snapshot contentLivenessSnapshot
 	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&snapshot); err != nil || snapshot.Version != 1 ||
 		!snapshot.Complete || snapshot.ObservedAt.IsZero() || time.Since(snapshot.ObservedAt) > contentLivenessMaxAge {
-		return nil, false
+		return nil, nil, nil, false, false
 	}
-	online := make([]string, 0, len(peerIDs))
-	for _, peerID := range peerIDs {
+	online = make([]string, 0, len(snapshot.PeerIDs))
+	for _, peerID := range snapshot.PeerIDs {
 		reachable, found := snapshot.Peers[peerID]
 		if !found {
-			return nil, false
+			return nil, nil, nil, false, false
 		}
 		if reachable {
 			online = append(online, peerID)
 		}
 	}
 	sort.Strings(online)
-	return orderedIntersection(peerIDs, online), true
+	return append([]string(nil), snapshot.PeerIDs...), orderedIntersection(snapshot.PeerIDs, online),
+		append([]string(nil), snapshot.HolderPeerIDs...), true, snapshot.HoldersComplete
 }

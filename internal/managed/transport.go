@@ -804,16 +804,21 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	started := time.Now()
 	planningCtx, cancel := context.WithTimeout(ctx, contentAvailabilityBudget)
 	defer cancel()
-	allPeerIDs, err := optimizedPeerIDs(ctx, repo, "interactive")
-	if err != nil {
-		return 0, err
+	allPeerIDs, livePeerIDs, allHints, livenessKnown, holdersKnown := localContentPlan(repo.Config.Repository, key)
+	if !livenessKnown {
+		var err error
+		allPeerIDs, err = optimizedPeerIDs(ctx, repo, "interactive")
+		if err != nil {
+			return 0, err
+		}
 	}
 	if len(allPeerIDs) == 0 {
 		return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityNoTrustedPeers,
 			Detail: "no accepted remote peer can serve content"}
 	}
-	allHints := repo.PeerContentHints(planningCtx, key, allPeerIDs)
-	livePeerIDs, livenessKnown := liveContentPeerIDs(repo.Config.Repository, allPeerIDs)
+	if !holdersKnown {
+		allHints = repo.PeerContentHints(planningCtx, key, allPeerIDs)
+	}
 	if knownHoldersOffline(livenessKnown, livePeerIDs, allHints) {
 		return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityKnownHoldersOffline,
 			Detail: "every peer recorded as holding this object is currently offline"}
@@ -1280,9 +1285,11 @@ func (circuit *peerCircuit) markSuccess(repositoryPath, peerID string) {
 }
 
 type contentSession struct {
-	mu          sync.Mutex
-	connection  *quic.Conn
-	fingerprint string
+	mu           sync.Mutex
+	connection   *quic.Conn
+	fingerprint  string
+	target       membership.Record
+	trustVersion string
 }
 
 type contentSessionPool struct {
@@ -1330,20 +1337,34 @@ func (pool *contentSessionPool) session(repositoryPath, peerID string) *contentS
 
 func (pool *contentSessionPool) connection(ctx context.Context, repo *repository.Repository, peerID string) (*quic.Conn, bool, error) {
 	started := time.Now()
-	target, err := trustedMember(repo.Config.Repository, peerID)
-	repo.LogContentRead("content peer trust resolved", "peer_id", peerID,
-		"duration", time.Since(started), "error", err)
-	if err != nil {
-		pool.invalidate(repo.Config.Repository, peerID)
-		return nil, false, err
-	}
-	fingerprint := fmt.Sprintf("%s\x00%s\x00%d", target.Payload.QUICEndpoint, target.Payload.SigningPublicKey, target.Payload.Generation)
+	trustVersion, versionErr := membership.TrustStateVersion(repo.Config.Repository)
 	session := pool.session(repo.Config.Repository, peerID)
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.connection != nil && session.connection.Context().Err() == nil && session.fingerprint == fingerprint {
+	if versionErr == nil && session.connection != nil && session.connection.Context().Err() == nil && session.trustVersion == trustVersion {
 		return session.connection, true, nil
 	}
+	target := session.target
+	trustCached := versionErr == nil && target.Payload.PeerID == peerID && session.trustVersion == trustVersion
+	var err error
+	if !trustCached {
+		target, err = trustedMember(repo.Config.Repository, peerID)
+		if err == nil {
+			session.target = target
+			session.trustVersion = trustVersion
+		}
+	}
+	repo.LogContentRead("content peer trust resolved", "peer_id", peerID, "cached", trustCached,
+		"duration", time.Since(started), "error", err)
+	if err != nil {
+		if session.connection != nil {
+			_ = session.connection.CloseWithError(1, "membership invalid")
+			session.connection = nil
+			session.fingerprint = ""
+		}
+		return nil, false, err
+	}
+	fingerprint := fmt.Sprintf("%s\x00%s\x00%d", target.Payload.QUICEndpoint, target.Payload.SigningPublicKey, target.Payload.Generation)
 	if session.connection != nil {
 		_ = session.connection.CloseWithError(0, "membership changed")
 		session.connection = nil
