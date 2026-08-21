@@ -1003,8 +1003,11 @@ func (r *Repository) PeerContentIndex(ctx context.Context, peerIDs []string) (ma
 			uuidPeers[strings.TrimSpace(value)] = peerID
 		}
 	}
-	output, err := r.runner.Run(ctx, "git", "annex", "whereis", "--all", "--json")
-	if err != nil {
+	output, commandErr := r.runner.Run(ctx, "git", "annex", "whereis", "--all", "--json")
+	if commandErr != nil && strings.TrimSpace(output) == "" {
+		return nil, commandErr
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	type location struct {
@@ -1015,6 +1018,7 @@ func (r *Repository) PeerContentIndex(ctx context.Context, peerIDs []string) (ma
 		Whereis []location `json:"whereis"`
 	}
 	found := make(map[string]map[string]bool)
+	decoded := 0
 	scanner := bufio.NewScanner(strings.NewReader(output))
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
 	for scanner.Scan() {
@@ -1022,6 +1026,7 @@ func (r *Repository) PeerContentIndex(ctx context.Context, peerIDs []string) (ma
 		if err := json.Unmarshal(scanner.Bytes(), &value); err != nil {
 			return nil, fmt.Errorf("decode git-annex location index: %w", err)
 		}
+		decoded++
 		if value.Key == "" {
 			continue
 		}
@@ -1036,6 +1041,9 @@ func (r *Repository) PeerContentIndex(ctx context.Context, peerIDs []string) (ma
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
+	}
+	if commandErr != nil && decoded == 0 {
+		return nil, commandErr
 	}
 	result := make(map[string][]string, len(found))
 	for key, included := range found {
