@@ -168,6 +168,10 @@ func (r *Repository) ReadRange(ctx context.Context, path, key string, size, offs
 		if !errors.Is(ensureErr, ErrContentUnavailable) {
 			return 0, ensureErr
 		}
+		reason := ContentAvailabilityReason(ensureErr)
+		if reason == AvailabilityAcceptedPeersOffline || reason == AvailabilityKnownHoldersOffline {
+			return 0, ensureErr
+		}
 		if size > durableFallbackMaxSize {
 			return 0, &ContentUnavailableError{Reason: AvailabilityDurableLimit,
 				Detail: fmt.Sprintf("peer plan failed (%v); %d-byte object exceeds the %d-byte bounded durable hydration limit",

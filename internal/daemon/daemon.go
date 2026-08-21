@@ -89,6 +89,11 @@ func Run(repo *repository.Repository, options Options) (runErr error) {
 		return fmt.Errorf("start authenticated peer service: %w", err)
 	}
 	defer peerService.Close()
+	contentLiveness, err := managed.StartContentLivenessMonitor(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("start local content liveness monitor: %w", err)
+	}
+	defer contentLiveness.Close()
 	scheduler.Start()
 	heartbeatStop := make(chan struct{})
 	heartbeatDone := make(chan struct{}, 2)

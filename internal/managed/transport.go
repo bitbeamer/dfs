@@ -813,13 +813,26 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 			Detail: "no accepted remote peer can serve content"}
 	}
 	allHints := repo.PeerContentHints(planningCtx, key, allPeerIDs)
-	peerIDs := contentCandidates(repo.Config.Repository, key, allPeerIDs)
+	livePeerIDs, livenessKnown := liveContentPeerIDs(repo.Config.Repository, allPeerIDs)
+	if knownHoldersOffline(livenessKnown, livePeerIDs, allHints) {
+		return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityKnownHoldersOffline,
+			Detail: "every peer recorded as holding this object is currently offline"}
+	}
+	peerIDs := allPeerIDs
+	if livenessKnown {
+		peerIDs = livePeerIDs
+	}
+	peerIDs = contentCandidates(repo.Config.Repository, key, peerIDs)
 	if len(peerIDs) == 0 {
 		reason := repository.AvailabilityAcceptedPeersOffline
 		if len(allHints) > 0 {
 			reason = repository.AvailabilityKnownHoldersOffline
 		}
-		return 0, &repository.ContentUnavailableError{Reason: reason, Detail: "every candidate peer is in transfer backoff"}
+		detail := "every candidate peer is in transfer backoff"
+		if livenessKnown {
+			detail = "the local liveness monitor reports every accepted peer offline"
+		}
+		return 0, &repository.ContentUnavailableError{Reason: reason, Detail: detail}
 	}
 	hints := orderedIntersection(peerIDs, allHints)
 	candidates := hints
@@ -830,7 +843,7 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	}
 	repo.LogContentRead("content sources planned", "key", key, "accepted_peers", len(peerIDs),
 		"holder_hints", len(hints), "candidates", len(candidates), "discovery", discovery,
-		"duration", time.Since(started))
+		"liveness_known", livenessKnown, "duration", time.Since(started))
 	repo.RecordContentPlan(discovery, "")
 	total, payload, sourcePeer, failures, allUnreachable := fetchRangeCandidates(planningCtx, repo, key, offset, length, candidates)
 	if payload != nil {
@@ -879,6 +892,10 @@ func FetchRange(ctx context.Context, repo *repository.Repository, key string, of
 	}
 	return 0, &repository.ContentUnavailableError{Reason: repository.AvailabilityTransferFailed,
 		Detail: "managed range fetch failed: " + strings.Join(failures, "; ")}
+}
+
+func knownHoldersOffline(livenessKnown bool, livePeerIDs, holderHints []string) bool {
+	return livenessKnown && len(holderHints) > 0 && len(orderedIntersection(livePeerIDs, holderHints)) == 0
 }
 
 func orderedIntersection(order, included []string) []string {

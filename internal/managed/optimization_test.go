@@ -80,6 +80,21 @@ func TestContentCandidatesSkipCircuitOpenPeer(t *testing.T) {
 	}
 }
 
+func TestKnownHoldersOfflineRequiresFreshLivenessAndHolderHints(t *testing.T) {
+	if !knownHoldersOffline(true, []string{"online-non-holder"}, []string{"offline-holder"}) {
+		t.Fatal("known offline holder was not recognized")
+	}
+	if knownHoldersOffline(true, []string{"online-holder"}, []string{"online-holder"}) {
+		t.Fatal("online holder was reported offline")
+	}
+	if knownHoldersOffline(false, nil, []string{"unknown-holder"}) {
+		t.Fatal("stale or absent liveness was treated as authoritative")
+	}
+	if knownHoldersOffline(true, nil, nil) {
+		t.Fatal("missing holder metadata was treated as an offline holder")
+	}
+}
+
 func TestBenchmarkPayloadIsDeterministic(t *testing.T) {
 	const offset = int64(7919)
 	payload := make([]byte, 4096)

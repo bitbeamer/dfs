@@ -394,3 +394,18 @@ func TestContentUnavailableReasonSurvivesWrapping(t *testing.T) {
 		t.Fatalf("availability reason = %q", reason)
 	}
 }
+
+func TestRangeReadDoesNotTryDurableFallbackWhenPeersAreKnownOffline(t *testing.T) {
+	payload := bytes.Repeat([]byte("offline-content"), 1024)
+	repo := rangeTestRepository(t, t.TempDir(), 32<<20)
+	repo.SetManagedRangeFetcher(func(context.Context, *Repository, string, int64, int64, io.Writer) (int64, error) {
+		return 0, &ContentUnavailableError{Reason: AvailabilityKnownHoldersOffline, Detail: "known holder is offline"}
+	})
+	_, err := repo.ReadRange(context.Background(), "offline.bin", rangeTestKey(payload), int64(len(payload)), 0, make([]byte, 512))
+	if reason := ContentAvailabilityReason(err); reason != AvailabilityKnownHoldersOffline {
+		t.Fatalf("range read reason = %q (%v), want %q", reason, err, AvailabilityKnownHoldersOffline)
+	}
+	if diagnostics := repo.ContentReadDiagnostics(); diagnostics.LastPlan == "durable-full-hydration" {
+		t.Fatalf("known-offline range read attempted durable fallback: %#v", diagnostics)
+	}
+}
