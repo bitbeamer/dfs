@@ -155,10 +155,15 @@ func (monitor *ContentLivenessMonitor) probeOnce() {
 		go func() {
 			defer probes.Done()
 			ctx, cancel := context.WithTimeout(monitor.ctx, contentLivenessProbe)
-			stream, _, _, err := openContentStream(ctx, monitor.repo, peerID, Request{Operation: "ping"})
+			stream, _, response, err := openContentStream(ctx, monitor.repo, peerID, Request{Operation: "ping"})
 			cancel()
 			if stream != nil {
 				_ = stream.Close()
+			}
+			if err == nil && response.AnnexUUID != "" {
+				persistCtx, persistCancel := context.WithTimeout(monitor.ctx, time.Second)
+				_ = monitor.repo.RecordPeerAnnexUUID(persistCtx, peerID, response.AnnexUUID)
+				persistCancel()
 			}
 			statesMu.Lock()
 			states[peerID] = err == nil

@@ -67,6 +67,7 @@ type Response struct {
 
 type Server struct {
 	repo        *repository.Repository
+	annexUUID   string
 	listener    *quic.Listener
 	diagnostic  func(context.Context) ([]byte, error)
 	pair        func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error)
@@ -120,7 +121,9 @@ func Start(repo *repository.Repository, address string, diagnostic func(context.
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &Server{repo: repo, listener: listener, diagnostic: diagnostic, pair: pair, pairClone: pairClone, changed: changed, stop: cancel, done: make(chan struct{})}
+	annexUUID, _ := exec.Command("git", "-C", repo.Config.Repository, "config", "--get", "annex.uuid").Output()
+	server := &Server{repo: repo, annexUUID: strings.TrimSpace(string(annexUUID)), listener: listener,
+		diagnostic: diagnostic, pair: pair, pairClone: pairClone, changed: changed, stop: cancel, done: make(chan struct{})}
 	go server.serve(ctx)
 	return server, nil
 }
@@ -198,7 +201,7 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	s.repo.LogContentRead("content request received", "operation", request.Operation)
 	switch request.Operation {
 	case "ping":
-		writeResponse(stream, Response{OK: true})
+		writeResponse(stream, Response{OK: true, AnnexUUID: s.annexUUID})
 	case "diagnostic":
 		if s.diagnostic == nil {
 			writeResponse(stream, Response{Error: "diagnostics unavailable"})
@@ -270,10 +273,7 @@ func (s *Server) serveHasContent(stream *quic.Stream, key string) {
 		writeResponse(stream, Response{Error: "annex content is unavailable"})
 		return
 	}
-	uuidCommand := exec.CommandContext(stream.Context(), "git", "config", "--get", "annex.uuid")
-	uuidCommand.Dir = s.repo.Config.Repository
-	uuid, _ := uuidCommand.Output()
-	writeResponse(stream, Response{OK: true, TotalSize: info.Size(), AnnexUUID: strings.TrimSpace(string(uuid))})
+	writeResponse(stream, Response{OK: true, TotalSize: info.Size(), AnnexUUID: s.annexUUID})
 }
 
 func RequestReconcile(ctx context.Context, repo *repository.Repository, peerID string) error {

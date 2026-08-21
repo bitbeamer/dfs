@@ -287,6 +287,19 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if string(diagnostic) != `{"peer":"server"}` {
 		t.Fatalf("diagnostic = %s", diagnostic)
 	}
+	connection, stream, _, response, err = Open(ctx, clientRepo, serverRepo.Config.PeerID, Request{Operation: "ping"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAnnexUUID, err := exec.CommandContext(ctx, "git", "-C", serverRepo.Config.Repository, "config", "--get", "annex.uuid").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.AnnexUUID != strings.TrimSpace(string(serverAnnexUUID)) {
+		t.Fatalf("ping annex UUID = %q, want %q", response.AnnexUUID, strings.TrimSpace(string(serverAnnexUUID)))
+	}
+	_ = stream.Close()
+	_ = connection.CloseWithError(0, "")
 	if err := RequestReconcile(ctx, clientRepo, serverRepo.Config.PeerID); err != nil {
 		t.Fatal(err)
 	}
