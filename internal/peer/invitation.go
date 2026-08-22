@@ -63,6 +63,20 @@ func createInvitation(repo *repository.Repository, lifetime time.Duration, bound
 	if err != nil {
 		return Invitation{}, err
 	}
+	accepted, err := membership.Accepted(repo.Config.Repository, filesystemID, repo.Config.PeerID)
+	if err != nil {
+		return Invitation{}, err
+	}
+	administrator := false
+	for _, record := range accepted {
+		if record.Payload.PeerID == repo.Config.PeerID && record.Payload.Role == "admin" {
+			administrator = true
+			break
+		}
+	}
+	if !administrator {
+		return Invitation{}, errors.New("only an administrator member can create pairing invitations")
+	}
 	_, fingerprint, err := loadOrCreateCertificate(repo.Config.Repository)
 	if err != nil {
 		return Invitation{}, err

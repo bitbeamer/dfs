@@ -483,6 +483,41 @@ func (r *Repository) WithWorkTreeLock(fn func() error) error {
 	return fn()
 }
 
+// BeginWriteGuard prevents received commits from replacing the worktree while
+// a frontend write transaction is open. Multiple local writers may coexist;
+// ApplyReceived takes the corresponding exclusive lock.
+func (r *Repository) BeginWriteGuard(ctx context.Context) (func(), error) {
+	return r.lockWriterProcess(ctx, unix.LOCK_SH)
+}
+
+func (r *Repository) lockWriterProcess(ctx context.Context, mode int) (func(), error) {
+	path := filepath.Join(r.Config.Repository, filepath.FromSlash(config.Directory), "writers.lock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if err := unix.Flock(int(file.Fd()), mode|unix.LOCK_NB); err == nil {
+			return func() {
+				_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+				_ = file.Close()
+			}, nil
+		} else if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			_ = file.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			return nil, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
 func (r *Repository) CommitPending(ctx context.Context, message string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -682,6 +717,11 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 // worktree. It deliberately performs no network I/O: the peer's receive-pack
 // has completed, and unrelated or offline peers must not delay visibility.
 func (r *Repository) ApplyReceived(ctx context.Context) error {
+	writersDrained, err := r.lockWriterProcess(ctx, unix.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer writersDrained()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	unlock, err := r.lockWorkTreeProcess(ctx)

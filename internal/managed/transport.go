@@ -39,6 +39,8 @@ const ALPN = "dfs-managed-v1"
 const PairALPN = "dfs-pair-v2"
 
 const managedDialTimeout = time.Second
+const requestHeaderTimeout = 20 * time.Second
+const requestHeaderLimit = 64 << 10
 
 const (
 	contentAvailabilityBudget = 1500 * time.Millisecond
@@ -167,14 +169,11 @@ func (s *Server) serveConnection(connection *quic.Conn) {
 
 func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Addr) {
 	defer stream.Close()
-	_ = stream.SetReadDeadline(time.Now().Add(20 * time.Second))
-	reader := bufio.NewReaderSize(stream, (64<<10)+1)
-	header, err := reader.ReadSlice('\n')
-	if err != nil || len(header) > 64<<10 {
+	header, reader, err := readRequestHeader(stream, requestHeaderTimeout)
+	if err != nil {
 		writeResponse(stream, Response{Error: "read managed transport request"})
 		return
 	}
-	_ = stream.SetReadDeadline(time.Time{})
 	var request Request
 	if err := json.Unmarshal(header, &request); err != nil {
 		writeResponse(stream, Response{Error: "decode managed transport request"})
@@ -250,6 +249,26 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
+}
+
+type requestHeaderReader interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
+func readRequestHeader(stream requestHeaderReader, timeout time.Duration) ([]byte, *bufio.Reader, error) {
+	if err := stream.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, err
+	}
+	reader := bufio.NewReaderSize(stream, requestHeaderLimit+1)
+	header, err := reader.ReadSlice('\n')
+	if err != nil || len(header) > requestHeaderLimit {
+		return nil, nil, errors.New("managed transport request header exceeds its limit or deadline")
+	}
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
+		return nil, nil, err
+	}
+	return header, reader, nil
 }
 
 func (s *Server) serveHasContent(stream *quic.Stream, key string) {
@@ -540,30 +559,11 @@ func installReceiveGuard(repositoryPath string) error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	const hook = `#!/bin/sh
-set -eu
-zero=0000000000000000000000000000000000000000
-while read old new ref; do
-  case "$ref" in
-    refs/heads/dfs-*)
-      if [ "$new" = "$zero" ]; then
-        echo "DFS control refs cannot be deleted" >&2
-        exit 1
-      fi
-      if [ "$old" != "$zero" ] && ! git merge-base --is-ancestor "$old" "$new"; then
-        echo "DFS control refs cannot be rewound" >&2
-        exit 1
-      fi
-      ;;
-  esac
-  if [ "$ref" = "refs/heads/dfs-membership" ] && [ "$old" != "$zero" ]; then
-    if git diff --name-only --diff-filter=DM "$old" "$new" -- members revocations | grep -q .; then
-      echo "DFS membership and revocation records are immutable" >&2
-      exit 1
-    fi
-  fi
-done
-`
+	executable, err := receiveGuardExecutable()
+	if err != nil {
+		return err
+	}
+	hook := "#!/bin/sh\nset -eu\nexec " + shellArgument(executable) + " --repo " + shellArgument(repositoryPath) + " internal receive-guard\n"
 	path := filepath.Join(directory, "pre-receive")
 	temporary, err := os.CreateTemp(directory, "pre-receive-*")
 	if err != nil {
@@ -587,6 +587,64 @@ done
 		return err
 	}
 	return os.Rename(name, path)
+}
+
+var receiveGuardExecutable = os.Executable
+
+func shellArgument(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+// ValidateReceiveUpdates validates pre-receive input for managed control refs.
+func ValidateReceiveUpdates(repositoryPath string, input io.Reader) error {
+	updates := make(map[string]membership.RefUpdate)
+	scanner := bufio.NewScanner(input)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 3 {
+			return errors.New("invalid managed pre-receive update")
+		}
+		old, next, ref := fields[0], fields[1], fields[2]
+		if ref != membership.SharedRef && ref != membership.PinRef && ref != membership.ConfigRef {
+			continue
+		}
+		if zeroObjectID(next) {
+			return fmt.Errorf("DFS control ref %s cannot be deleted", ref)
+		}
+		if !zeroObjectID(old) {
+			command := exec.Command("git", "-C", repositoryPath, "merge-base", "--is-ancestor", old, next)
+			command.Env = managedReceiveGitEnvironment(os.Environ())
+			if output, err := command.CombinedOutput(); err != nil {
+				return fmt.Errorf("DFS control ref %s cannot be rewound: %s", ref, strings.TrimSpace(string(output)))
+			}
+		}
+		updates[ref] = membership.RefUpdate{Old: old, New: next}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return membership.ValidateControlUpdates(repositoryPath, updates)
+}
+
+func managedReceiveGitEnvironment(environment []string) []string {
+	result := make([]string, 0, len(environment))
+	for _, value := range environment {
+		name := value
+		if index := strings.IndexByte(name, '='); index >= 0 {
+			name = name[:index]
+		}
+		switch name {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX":
+			continue
+		default:
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func zeroObjectID(value string) bool {
+	return value != "" && strings.Trim(value, "0") == ""
 }
 
 func gitRefsValue(ctx context.Context, repositoryPath string) (string, bool) {

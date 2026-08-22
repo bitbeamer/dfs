@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bitbeamer/dfs/internal/config"
+	"golang.org/x/sys/unix"
 )
 
 func TestWithWorkTreeLockSerializesAccess(t *testing.T) {
@@ -68,4 +69,36 @@ func TestRecoverWorkTreeWaitsForCrossProcessLockBeforeRecovery(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) || prepared {
 		t.Fatalf("recovery under live worktree lock = prepared %t, error %v", prepared, err)
 	}
+}
+
+func TestReceivedChangesWaitForOpenWriterGuard(t *testing.T) {
+	root := t.TempDir()
+	writer := &Repository{Config: config.Default("writer", root)}
+	receiver := &Repository{Config: config.Default("receiver", root)}
+	unlock, err := writer.BeginWriteGuard(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		release, lockErr := receiver.lockWriterProcess(context.Background(), unix.LOCK_EX)
+		if lockErr == nil {
+			close(entered)
+			release()
+		}
+	}()
+	select {
+	case <-entered:
+		t.Fatal("received-change guard entered while a writer was open")
+	case <-time.After(75 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("received-change guard did not proceed after the writer closed")
+	}
+	<-done
 }

@@ -680,22 +680,24 @@ func (a *adapterFile) GetAttr(out *fuse.Attr) fuse.Status {
 }
 
 func (a *adapterFile) Flush() fuse.Status {
-	a.session.mu.Lock()
-	defer a.session.mu.Unlock()
-	return status(a.session.failure)
+	return a.commitDirty("flush")
 }
 
 func (a *adapterFile) Fsync(int) fuse.Status {
+	return a.commitDirty("fsync")
+}
+
+func (a *adapterFile) commitDirty(reason string) fuse.Status {
 	a.session.mu.Lock()
 	defer a.session.mu.Unlock()
-	if a.session.failure != nil || !a.session.dirty {
+	if a.session.failure != nil || !a.session.dirty || a.session.removed {
 		return status(a.session.failure)
 	}
 	if err := a.session.transaction.Commit(a.filesystem.lifetime); err != nil {
 		a.session.failure = err
 		return status(err)
 	}
-	a.filesystem.changed("fsync", "path", a.session.path)
+	a.filesystem.changed(reason, "path", a.session.path)
 	replacement, err := a.filesystem.core.BeginWrite(a.filesystem.lifetime, core.WriteRequest{Path: a.session.path})
 	if err != nil {
 		a.session.failure = err
@@ -729,12 +731,18 @@ func (f *FileSystem) releaseWrite(session *writeSession) {
 
 	session.mu.Lock()
 	var err error
-	if session.removed || session.failure != nil || !session.dirty {
+	if session.failure != nil {
+		err = session.failure
+		_ = session.transaction.Abort(context.Background())
+	} else if session.removed || !session.dirty {
 		err = session.transaction.Abort(context.Background())
 	} else {
 		commitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = session.transaction.Commit(commitCtx)
 		cancel()
+		if err != nil {
+			session.failure = err
+		}
 	}
 	changed := err == nil && session.dirty && !session.removed
 	session.mu.Unlock()

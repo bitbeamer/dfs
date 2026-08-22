@@ -198,12 +198,45 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build DFS helper: %v\n%s", err, output)
 	}
+	previousGuardExecutable := receiveGuardExecutable
+	receiveGuardExecutable = func() (string, error) { return binary, nil }
+	defer func() { receiveGuardExecutable = previousGuardExecutable }()
 	if _, err := clientRepo.AdoptClonedPeer(ctx, serverRepo.Config.PeerID); err != nil {
 		t.Fatalf("adopt cloned peer: %v", err)
 	}
 	remoteName, err := clientRepo.AddManagedRemote(ctx, serverRepo.Config.PeerID, binary)
 	if err != nil {
 		t.Fatal(err)
+	}
+	clientRecord.Payload.Generation++
+	clientRecord.Payload.UpdatedAt = time.Now().UTC().Add(time.Second)
+	clientRecord, err = membership.Sign(clientRecord.Payload, clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRecord, err = membership.Approve(clientRecord, serverRepo.Config.PeerID, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := membership.Save(clientRepo.Config.Repository, clientRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := membership.Sync(ctx, clientRepo.Config.Repository, []string{remoteName}); err != nil {
+		t.Fatalf("authorized membership update over managed receive: %v", err)
+	}
+	controlPush := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "push", remoteName,
+		membership.SharedRef+":"+membership.SharedRef)
+	if output, err := controlPush.CombinedOutput(); err != nil {
+		t.Fatalf("push authorized membership update over managed receive: %v\n%s", err, output)
+	}
+	serverMembers, err := membership.LoadAll(serverRepo.Config.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(serverMembers, func(record membership.Record) bool {
+		return record.Payload.PeerID == clientRecord.Payload.PeerID && record.Payload.Generation == clientRecord.Payload.Generation
+	}) {
+		t.Fatalf("authorized membership generation did not reach server: %#v", serverMembers)
 	}
 	if err := clientRepo.Sync(ctx, true); err != nil {
 		t.Fatalf("identify managed annex remote: %v", err)
@@ -494,21 +527,37 @@ func TestManagedReceiveGuardRejectsControlRefRewrites(t *testing.T) {
 	}
 	newBytes, _ := run("", "rev-parse", "HEAD")
 	oldID, newID := strings.TrimSpace(string(oldBytes)), strings.TrimSpace(string(newBytes))
-	if err := installReceiveGuard(repositoryPath); err != nil {
-		t.Fatal(err)
+	if err := ValidateReceiveUpdates(repositoryPath, strings.NewReader(newID+" "+oldID+" refs/heads/dfs-membership\n")); err == nil || !strings.Contains(err.Error(), "cannot be rewound") {
+		t.Fatalf("rewind result = %v", err)
 	}
-	hook := filepath.Join(repositoryPath, ".git", "dfs", "managed-hooks", "pre-receive")
-	command := exec.Command(hook)
-	command.Dir = repositoryPath
-	command.Stdin = strings.NewReader(newID + " " + oldID + " refs/heads/dfs-membership\n")
-	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "cannot be rewound") {
-		t.Fatalf("rewind result = %v, %q", err, output)
+	if err := ValidateReceiveUpdates(repositoryPath, strings.NewReader(newID+" "+strings.Repeat("0", 40)+" refs/heads/dfs-pins\n")); err == nil || !strings.Contains(err.Error(), "cannot be deleted") {
+		t.Fatalf("delete result = %v", err)
 	}
-	command = exec.Command(hook)
-	command.Dir = repositoryPath
-	command.Stdin = strings.NewReader(newID + " " + strings.Repeat("0", 40) + " refs/heads/dfs-pins\n")
-	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "cannot be deleted") {
-		t.Fatalf("delete result = %v, %q", err, output)
+}
+
+func TestRequestHeaderIsBoundedAndDeadlineLimited(t *testing.T) {
+	server, client := net.Pipe()
+	writeDone := make(chan struct{})
+	go func() {
+		_, _ = client.Write(bytes.Repeat([]byte{'x'}, requestHeaderLimit+1))
+		_ = client.Close()
+		close(writeDone)
+	}()
+	if _, _, err := readRequestHeader(server, time.Second); err == nil {
+		t.Fatal("oversized request header was accepted")
+	}
+	_ = server.Close()
+	<-writeDone
+
+	server, client = net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	started := time.Now()
+	if _, _, err := readRequestHeader(server, 25*time.Millisecond); err == nil {
+		t.Fatal("stalled request header was accepted")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled request header exceeded its deadline: %v", elapsed)
 	}
 }
 

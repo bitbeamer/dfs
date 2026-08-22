@@ -89,6 +89,13 @@ func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
 	if policies, err := LoadPinPolicies(shared, filesystemID); err != nil || len(policies) != 0 {
 		t.Fatalf("revoked issuer pin policies = %#v, %v", policies, err)
 	}
+	signers, err := acceptedSigningKeys(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validPinDocument(pinPolicyPath(policy.Path), data, signers) {
+		t.Fatal("revoked issuer retained pin synchronization authority")
+	}
 	if err := removeSharedFile(shared, revocationsPrefix+"bob-peer.json"); err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +151,111 @@ func TestAcceptedRequiresAdministratorForAdmissionsAndRoleChanges(t *testing.T) 
 	}
 }
 
+func TestAcceptedRevocationsRejectsTrustedSelfEscalation(t *testing.T) {
+	repositoryPath := gitMembershipRepository(t)
+	filesystemID := strings.Repeat("d", 40)
+	rootKey, rootPublic, _ := EnsureKey(t.TempDir())
+	memberKey, memberPublic, _ := EnsureKey(t.TempDir())
+	root := signedTestRecord(t, filesystemID, "root-peer", "admin", rootPublic, rootKey)
+	root, _ = Approve(root, "root-peer", rootKey)
+	member := signedTestRecord(t, filesystemID, "member-peer", "member", memberPublic, memberKey)
+	member, _ = Approve(member, "root-peer", rootKey)
+	for _, record := range []Record{root, member} {
+		if err := Save(repositoryPath, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := TrustBootstrapAdmin(repositoryPath, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Accepted(repositoryPath, filesystemID); err != nil {
+		t.Fatal(err)
+	}
+	escalated := member
+	escalated.Payload.Role = "admin"
+	escalated.Payload.Generation++
+	escalated.Payload.UpdatedAt = time.Now().UTC().Add(time.Second)
+	escalated, _ = Sign(escalated.Payload, memberKey)
+	escalated, _ = Approve(escalated, escalated.Payload.PeerID, memberKey)
+	if err := Save(repositoryPath, escalated); err != nil {
+		t.Fatal(err)
+	}
+	revocation, _ := Revoke(filesystemID, root.Payload.PeerID, escalated.Payload.PeerID, 2, memberKey)
+	if err := SaveRevocation(repositoryPath, revocation); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := AcceptedRevocations(repositoryPath, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked[root.Payload.PeerID] {
+		t.Fatal("trusted member used self-escalation to issue a sticky revocation")
+	}
+}
+
+func TestControlUpdateAllowsAuthorizedGenerationAndRejectsEscalationAndDeletion(t *testing.T) {
+	repositoryPath := gitMembershipRepository(t)
+	filesystemID := strings.Repeat("e", 40)
+	rootKey, rootPublic, _ := EnsureKey(t.TempDir())
+	memberKey, memberPublic, _ := EnsureKey(t.TempDir())
+	root := signedTestRecord(t, filesystemID, "root-peer", "admin", rootPublic, rootKey)
+	root, _ = Approve(root, "root-peer", rootKey)
+	member := signedTestRecord(t, filesystemID, "member-peer", "member", memberPublic, memberKey)
+	member, _ = Approve(member, "root-peer", rootKey)
+	for _, record := range []Record{root, member} {
+		if err := Save(repositoryPath, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := TrustBootstrapAdmin(repositoryPath, root); err != nil {
+		t.Fatal(err)
+	}
+	old := strings.TrimSpace(gitMembershipRunOutput(t, repositoryPath, "rev-parse", SharedRef))
+	root.Payload.Generation++
+	root.Payload.UpdatedAt = time.Now().UTC().Add(time.Second)
+	root.Payload.QUICEndpoint = "quic://root.local:9000"
+	root, _ = Sign(root.Payload, rootKey)
+	root, _ = Approve(root, root.Payload.PeerID, rootKey)
+	if err := Save(repositoryPath, root); err != nil {
+		t.Fatal(err)
+	}
+	next := strings.TrimSpace(gitMembershipRunOutput(t, repositoryPath, "rev-parse", SharedRef))
+	if err := ValidateControlUpdates(repositoryPath, map[string]RefUpdate{SharedRef: {Old: old, New: next}}); err != nil {
+		t.Fatalf("authorized membership generation was rejected: %v", err)
+	}
+
+	beforeEscalation := next
+	escalated := member
+	escalated.Payload.Role = "admin"
+	escalated.Payload.Generation++
+	escalated.Payload.UpdatedAt = time.Now().UTC().Add(2 * time.Second)
+	escalated, _ = Sign(escalated.Payload, memberKey)
+	escalated, _ = Approve(escalated, escalated.Payload.PeerID, memberKey)
+	if err := Save(repositoryPath, escalated); err != nil {
+		t.Fatal(err)
+	}
+	afterEscalation := strings.TrimSpace(gitMembershipRunOutput(t, repositoryPath, "rev-parse", SharedRef))
+	if err := ValidateControlUpdates(repositoryPath, map[string]RefUpdate{SharedRef: {Old: beforeEscalation, New: afterEscalation}}); err == nil {
+		t.Fatal("managed receive accepted self-approved administrator escalation")
+	}
+
+	member.Payload.Generation = 3
+	member.Payload.UpdatedAt = time.Now().UTC().Add(3 * time.Second)
+	member, _ = Sign(member.Payload, memberKey)
+	member, _ = Approve(member, root.Payload.PeerID, rootKey)
+	if err := Save(repositoryPath, member); err != nil {
+		t.Fatal(err)
+	}
+	beforeDelete := strings.TrimSpace(gitMembershipRunOutput(t, repositoryPath, "rev-parse", SharedRef))
+	if err := removeSharedFile(repositoryPath, membersPrefix+member.Payload.PeerID+".json"); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete := strings.TrimSpace(gitMembershipRunOutput(t, repositoryPath, "rev-parse", SharedRef))
+	if err := ValidateControlUpdates(repositoryPath, map[string]RefUpdate{SharedRef: {Old: beforeDelete, New: afterDelete}}); err == nil {
+		t.Fatal("managed receive accepted membership document deletion")
+	}
+}
+
 func TestRevokedApproverCannotKeepAdmissionChainAlive(t *testing.T) {
 	repositoryPath := gitMembershipRepository(t)
 	filesystemID := strings.Repeat("c", 40)
@@ -168,12 +280,23 @@ func TestRevokedApproverCannotKeepAdmissionChainAlive(t *testing.T) {
 	if err := SaveRevocation(repositoryPath, revocation); err != nil {
 		t.Fatal(err)
 	}
+	unauthorized, _ := Revoke(filesystemID, member.Payload.PeerID, admin.Payload.PeerID, 2, adminKey)
+	if err := SaveRevocation(repositoryPath, unauthorized); err != nil {
+		t.Fatal(err)
+	}
 	accepted, err := Accepted(repositoryPath, filesystemID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(accepted) != 1 || accepted[0].Payload.PeerID != "root-peer" {
 		t.Fatalf("revoked approver chain remained accepted: %#v", accepted)
+	}
+	revoked, err := AcceptedRevocations(repositoryPath, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked[member.Payload.PeerID] {
+		t.Fatal("revoked administrator issued a new sticky revocation")
 	}
 }
 

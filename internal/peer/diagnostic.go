@@ -289,14 +289,7 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 		}
 	}
 	if offers, discoverErr := Discover(ctx, discoveryTimeout); discoverErr == nil {
-		for _, offer := range offers {
-			if offer.FileSystemID == filesystemID && offer.PeerID != repo.Config.PeerID {
-				if member, accepted := peers[offer.PeerID]; accepted {
-					member.Online = true
-					peers[offer.PeerID] = member
-				}
-			}
-		}
+		markDiscoveredAcceptedPeers(peers, offers, filesystemID, repo.Config.PeerID)
 	}
 	remotes, err := repo.Remotes(ctx)
 	if err != nil {
@@ -359,6 +352,18 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 		reports[report.PeerID] = report
 	}
 	return evaluateMesh(peers, reports, reportErrors), nil
+}
+
+func markDiscoveredAcceptedPeers(peers map[string]MeshPeer, offers []Offer, filesystemID, localPeerID string) {
+	for _, offer := range offers {
+		if offer.FileSystemID != filesystemID || offer.PeerID == localPeerID {
+			continue
+		}
+		if member, accepted := peers[offer.PeerID]; accepted {
+			member.Online = true
+			peers[offer.PeerID] = member
+		}
+	}
 }
 
 func meshPeerIDForRemote(peers map[string]MeshPeer, remoteName string) string {

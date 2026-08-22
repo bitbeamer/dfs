@@ -96,6 +96,23 @@ func TestReachableOffersDropsStaleAdvertisements(t *testing.T) {
 	}
 }
 
+func TestMeshDiscoveryCannotIntroduceUnacceptedPeer(t *testing.T) {
+	filesystemID := strings.Repeat("a", 40)
+	peers := map[string]MeshPeer{
+		"accepted-peer": {PeerID: "accepted-peer", PeerName: "accepted"},
+	}
+	markDiscoveredAcceptedPeers(peers, []Offer{
+		{FileSystemID: filesystemID, PeerID: "accepted-peer"},
+		{FileSystemID: filesystemID, PeerID: "unknown-peer"},
+	}, filesystemID, "local-peer")
+	if !peers["accepted-peer"].Online {
+		t.Fatal("accepted discovered peer was not marked online")
+	}
+	if _, found := peers["unknown-peer"]; found {
+		t.Fatal("unauthenticated discovery introduced an unknown mesh peer")
+	}
+}
+
 func TestValidatePairingMembershipRejectsAdminClaim(t *testing.T) {
 	filesystemID := strings.Repeat("a", 40)
 	private, draft, err := newMembershipDraft(filepath.Join(t.TempDir(), "draft"), filesystemID, "joining-peer", "joining", 7843)
@@ -270,6 +287,11 @@ func TestPairAndJoinConfiguresBothPeers(t *testing.T) {
 	}
 	if joinedID != existingID || result.Repository.Config.PeerID == existing.Config.PeerID {
 		t.Fatalf("paired identities existing=%q joined=%q peers=%q/%q", existingID, joinedID, existing.Config.PeerID, result.Repository.Config.PeerID)
+	}
+	if _, record, err := ensureLocalMembership(ctx, result.Repository, joinedID, DefaultPairingPort); err != nil {
+		t.Fatalf("restart paired member service: %v", err)
+	} else if record.Payload.Role != "member" {
+		t.Fatalf("restarted paired role = %q, want member", record.Payload.Role)
 	}
 	remotes, err := existing.Remotes(ctx)
 	if err != nil {
@@ -477,11 +499,21 @@ func TestVerifyMembershipApprovalChainAcceptsNonFounderApprover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	root.Payload.Role = "admin"
+	root, err = membership.Sign(root.Payload, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	root, err = membership.Approve(root, root.Payload.PeerID, rootKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, approver, err := newMembershipDraft(filepath.Join(t.TempDir(), "approver"), filesystemID, "approver-peer", "approver", 7844)
+	approverKey, approver, err := newMembershipDraft(filepath.Join(t.TempDir(), "approver"), filesystemID, "approver-peer", "approver", 7844)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approver.Payload.Role = "admin"
+	approver, err = membership.Sign(approver.Payload, approverKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,6 +523,9 @@ func TestVerifyMembershipApprovalChainAcceptsNonFounderApprover(t *testing.T) {
 	}
 	if err := verifyMembershipApprovalChain(approver, []membership.Record{root, approver}, filesystemID); err != nil {
 		t.Fatalf("valid non-founder approval chain rejected: %v", err)
+	}
+	if bootstrap, err := membershipApprovalRoot(approver, []membership.Record{root, approver}, filesystemID); err != nil || bootstrap.Payload.PeerID != root.Payload.PeerID {
+		t.Fatalf("approval root = %#v, %v", bootstrap, err)
 	}
 	if err := verifyMembershipApprovalChain(approver, []membership.Record{approver}, filesystemID); err == nil || !strings.Contains(err.Error(), "missing peer") {
 		t.Fatalf("incomplete approval chain error = %v", err)

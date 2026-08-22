@@ -32,7 +32,7 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 		}
 		if payload.FileSystemID == filesystemID && payload.Name == repo.Config.Name && payload.Hostname == hostname &&
 			payload.QUICEndpoint == quicEndpoint && membership.VerifySelf(existing) == nil {
-			if err := membership.TrustBootstrapAdmin(repo.Config.Repository, existing); err != nil {
+			if err := membership.Trust(repo.Config.Repository, payload.PeerID, payload.SigningPublicKey); err != nil {
 				return nil, membership.Record{}, err
 			}
 			return private, existing, nil
@@ -197,17 +197,25 @@ func RevokeMembership(ctx context.Context, repo *repository.Repository, remote s
 	if err != nil {
 		return err
 	}
-	var local, target membership.Record
+	var target membership.Record
 	for _, record := range records {
-		if record.Payload.PeerID == repo.Config.PeerID {
-			local = record
-		}
 		if strings.HasPrefix(record.Payload.PeerID, peerPrefix) {
 			target = record
 		}
 	}
 	if target.Payload.PeerID == "" {
 		return fmt.Errorf("membership for %s was not found", remote)
+	}
+	accepted, err := membership.Accepted(repo.Config.Repository, filesystemID, repo.Config.PeerID)
+	if err != nil {
+		return err
+	}
+	var local membership.Record
+	for _, record := range accepted {
+		if record.Payload.PeerID == repo.Config.PeerID {
+			local = record
+			break
+		}
 	}
 	if local.Payload.Role != "admin" {
 		return errors.New("only an administrator member can revoke a DFS peer")

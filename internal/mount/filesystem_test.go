@@ -149,6 +149,36 @@ func TestCreateIsVisibleBeforeCloseAndPublishedAtomically(t *testing.T) {
 	}
 }
 
+func TestFlushReportsPublishFailureAndQuarantinesPayload(t *testing.T) {
+	root := t.TempDir()
+	filesystem, _, _ := testFileSystem(t, root)
+	if err := os.Mkdir(filepath.Join(root, "parent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	handle, code := filesystem.Create("parent/item.txt", syscall.O_WRONLY, 0o644, nil)
+	if code != fuse.OK {
+		t.Fatal(code)
+	}
+	if _, code := handle.Write([]byte("recover me"), 0); code != fuse.OK {
+		t.Fatal(code)
+	}
+	if err := os.Remove(filepath.Join(root, "parent")); err != nil {
+		t.Fatal(err)
+	}
+	if code := handle.Flush(); code == fuse.OK {
+		t.Fatal("flush hid the failed final publication")
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".git", "dfs", "recovery", "*", "writes", "write-*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("quarantined writes = %q, %v", matches, err)
+	}
+	payload, err := os.ReadFile(matches[0])
+	if err != nil || string(payload) != "recover me" {
+		t.Fatalf("quarantined payload = %q, %v", payload, err)
+	}
+	handle.Release()
+}
+
 func TestMultipleHandlesShareOneWriteUntilFinalRelease(t *testing.T) {
 	root := t.TempDir()
 	filesystem, _, _ := testFileSystem(t, root)
