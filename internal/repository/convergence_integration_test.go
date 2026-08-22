@@ -211,7 +211,8 @@ func newConvergencePeers(t *testing.T, path, content string) (*Repository, *Repo
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
 
-	linux, err := Init(ctx, filepath.Join(root, "linux"), "linux", 10<<20)
+	identity := GitIdentity{Name: "DFS Convergence Test", Email: "convergence@example.invalid"}
+	linux, err := InitWithIdentity(ctx, filepath.Join(root, "linux"), "linux", 10<<20, identity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +220,7 @@ func newConvergencePeers(t *testing.T, path, content string) (*Repository, *Repo
 	writePeerFile(t, ctx, linux, path, content)
 	commitPeerChange(t, ctx, linux)
 
-	mac, err := Join(ctx, linux.Config.Repository, filepath.Join(root, "mac"), "mac", 10<<20)
+	mac, err := JoinWithIdentity(ctx, linux.Config.Repository, filepath.Join(root, "mac"), "mac", 10<<20, identity)
 	if err != nil {
 		t.Fatal(err)
 	}
