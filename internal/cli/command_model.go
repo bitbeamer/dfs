@@ -1027,7 +1027,6 @@ func (a *App) consolidatedSyncCommand() *cobra.Command {
 			return fmt.Errorf("unsupported sync mode %q; use metadata or full", mode)
 		}
 	}
-	a.addDryRun(command, "sync")
 	return command
 }
 

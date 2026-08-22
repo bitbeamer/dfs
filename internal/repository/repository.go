@@ -79,8 +79,8 @@ func (e *RemoteSyncError) Error() string {
 }
 
 type Remote struct {
-	Name string
-	URL  string
+	Name string `json:"name"`
+	URL  string `json:"url"`
 }
 
 type StorageRemote struct {

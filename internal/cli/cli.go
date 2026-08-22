@@ -1737,7 +1737,7 @@ func printHealthIssues(output io.Writer, issues []peer.HealthIssue, skip map[str
 }
 
 func (a *App) syncCommand() *cobra.Command {
-	var metadataOnly bool
+	var metadataOnly, dryRun bool
 	cmd := &cobra.Command{
 		Use: "sync", Args: cobra.NoArgs, Short: "Synchronize immediately",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1748,6 +1748,13 @@ func (a *App) syncCommand() *cobra.Command {
 			defer repo.Close()
 			ctx, cancel := commandContext(cmd)
 			defer cancel()
+			if dryRun {
+				plan, err := repo.SyncPlan(ctx, metadataOnly)
+				if err != nil {
+					return err
+				}
+				return a.writeSyncPlan(plan, metadataOnly)
+			}
 			if err := repo.Sync(ctx, true); err != nil {
 				return err
 			}
@@ -1773,7 +1780,60 @@ func (a *App) syncCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&metadataOnly, "metadata-only", false, "skip pin refresh and quota enforcement")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show the synchronization plan without applying it")
 	return cmd
+}
+
+func (a *App) writeSyncPlan(plan *repository.SyncPlan, metadataOnly bool) error {
+	mode := "full"
+	if metadataOnly {
+		mode = "metadata"
+	}
+	if a.output == "json" {
+		return writeJSON(a.Out, map[string]any{"action": "sync", "mode": mode, "dry_run": true, "plan": plan})
+	}
+	if a.quiet {
+		return nil
+	}
+	fmt.Fprintf(a.Out, "Dry run: sync (mode %s); no changes will be applied\n", mode)
+	fmt.Fprintf(a.Out, "Metadata: bidirectional sync with %d remote(s)\n", len(plan.Remotes))
+	for _, remote := range plan.Remotes {
+		fmt.Fprintf(a.Out, "  %s\t%s\n", remote.Name, remote.URL)
+	}
+	if metadataOnly {
+		fmt.Fprintln(a.Out, "Metadata mode skips pin refresh and cache enforcement")
+		return nil
+	}
+	if len(plan.Pins) == 0 {
+		fmt.Fprintln(a.Out, "Pins: none configured")
+	} else {
+		fmt.Fprintf(a.Out, "Pins: refresh %d pinned path(s)\n", len(plan.Pins))
+		for _, pin := range plan.Pins {
+			if pin.MissingFiles == 0 {
+				fmt.Fprintf(a.Out, "  %s\talready hydrated (%d file(s), %s)\n", displayPinnedPath(pin.Path), pin.LogicalFiles, config.FormatSize(pin.LogicalBytes))
+			} else {
+				fmt.Fprintf(a.Out, "  %s\twould fetch %d missing file(s), %s\n", displayPinnedPath(pin.Path), pin.MissingFiles, config.FormatSize(pin.MissingBytes))
+			}
+		}
+	}
+	fmt.Fprintf(a.Out, "Cache: %s / %s\n", config.FormatSize(plan.CacheBytes), config.FormatSize(plan.CacheLimit))
+	switch {
+	case plan.CacheBytes <= plan.CacheLimit:
+		fmt.Fprintln(a.Out, "  within limit; no eviction needed")
+	case len(plan.Evictions) == 0:
+		fmt.Fprintln(a.Out, "  over limit, but every cached file is pinned; nothing can be evicted")
+	default:
+		var bytes int64
+		for _, candidate := range plan.Evictions {
+			bytes += candidate.Size
+		}
+		fmt.Fprintf(a.Out, "  would evict %d file(s), %s, least recently used first:\n", len(plan.Evictions), config.FormatSize(bytes))
+		for _, candidate := range plan.Evictions {
+			fmt.Fprintf(a.Out, "    %s\t%s\n", candidate.Path, config.FormatSize(candidate.Size))
+		}
+		fmt.Fprintln(a.Out, "  inactive range-cache extents are reclaimed first; git-annex may keep candidates that lack another verified copy")
+	}
+	return nil
 }
 
 func (a *App) statusCommand() *cobra.Command {
