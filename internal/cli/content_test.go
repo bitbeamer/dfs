@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,11 +93,13 @@ func TestContentListShowsLocalResidency(t *testing.T) {
 	}
 }
 
-func git(t *testing.T, ctx context.Context, directory string, args ...string) {
+func git(t *testing.T, ctx context.Context, directory string, args ...string) string {
 	t.Helper()
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = directory
-	if output, err := command.CombinedOutput(); err != nil {
+	output, err := command.CombinedOutput()
+	if err != nil {
 		t.Fatalf("git %s: %s: %v", args[0], output, err)
 	}
+	return strings.TrimSpace(string(output))
 }

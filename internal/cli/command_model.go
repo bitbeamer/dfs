@@ -1027,7 +1027,6 @@ func (a *App) consolidatedSyncCommand() *cobra.Command {
 			return fmt.Errorf("unsupported sync mode %q; use metadata or full", mode)
 		}
 	}
-	a.addDryRun(command, "sync")
 	return command
 }
 
@@ -1090,6 +1089,14 @@ func (a *App) internalCommand() *cobra.Command {
 	pairing := &cobra.Command{Use: "pairing", Hidden: true}
 	pairing.AddCommand(detachChildren(completeParent, "complete")...)
 	command.AddCommand(pairing)
+	receiveGuard := &cobra.Command{Use: "receive-guard", Args: cobra.NoArgs, Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(a.repo) == "" {
+				return errors.New("managed receive guard requires --repo")
+			}
+			return managed.ValidateReceiveUpdates(a.repo, cmd.InOrStdin())
+		}}
+	command.AddCommand(receiveGuard)
 	return command
 }
 

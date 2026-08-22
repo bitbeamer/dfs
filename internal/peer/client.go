@@ -164,7 +164,8 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if start.Approver.Payload.PeerID != start.PeerID || start.Membership.Payload.PeerID != peerID {
 		return nil, errors.New("pairing peer returned mismatched membership identities")
 	}
-	if err := verifyMembershipApprovalChain(start.Approver, start.Members, invitation.FileSystemID); err != nil {
+	bootstrapAdmin, err := membershipApprovalRoot(start.Approver, start.Members, invitation.FileSystemID)
+	if err != nil {
 		return nil, fmt.Errorf("verify approving DFS membership: %w", err)
 	}
 	if err := membership.VerifyApproval(start.Membership, start.Approver); err != nil {
@@ -210,6 +211,9 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	}
 	if err := membership.Save(repo.Config.Repository, start.Approver); err != nil {
 		return nil, fmt.Errorf("save approving DFS membership: %w", err)
+	}
+	if err := membership.TrustBootstrapAdmin(repo.Config.Repository, bootstrapAdmin); err != nil {
+		return nil, fmt.Errorf("trust bootstrap DFS administrator: %w", err)
 	}
 	if err := membership.Save(repo.Config.Repository, start.Membership); err != nil {
 		return nil, fmt.Errorf("save local DFS membership: %w", err)
@@ -286,13 +290,18 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 }
 
 func verifyMembershipApprovalChain(record membership.Record, members []membership.Record, filesystemID string) error {
+	_, err := membershipApprovalRoot(record, members, filesystemID)
+	return err
+}
+
+func membershipApprovalRoot(record membership.Record, members []membership.Record, filesystemID string) (membership.Record, error) {
 	byID := make(map[string]membership.Record, len(members)+1)
 	for _, member := range append(append([]membership.Record(nil), members...), record) {
 		if member.Payload.FileSystemID != filesystemID {
 			continue
 		}
 		if existing, found := byID[member.Payload.PeerID]; found && existing.Payload.SigningPublicKey != member.Payload.SigningPublicKey {
-			return fmt.Errorf("membership chain contains conflicting records for peer %s", member.Payload.PeerID)
+			return membership.Record{}, fmt.Errorf("membership chain contains conflicting records for peer %s", member.Payload.PeerID)
 		}
 		byID[member.Payload.PeerID] = member
 	}
@@ -301,21 +310,24 @@ func verifyMembershipApprovalChain(record membership.Record, members []membershi
 	for {
 		peerID := current.Payload.PeerID
 		if current.Payload.FileSystemID != filesystemID {
-			return errors.New("approving membership belongs to another filesystem")
+			return membership.Record{}, errors.New("approving membership belongs to another filesystem")
 		}
 		if visited[peerID] {
-			return errors.New("membership approval chain contains a cycle")
+			return membership.Record{}, errors.New("membership approval chain contains a cycle")
 		}
 		visited[peerID] = true
 		approver, found := byID[current.ApprovedBy]
 		if !found {
-			return fmt.Errorf("membership approval chain is missing peer %s", current.ApprovedBy)
+			return membership.Record{}, fmt.Errorf("membership approval chain is missing peer %s", current.ApprovedBy)
 		}
 		if err := membership.VerifyApproval(current, approver); err != nil {
-			return err
+			return membership.Record{}, err
+		}
+		if approver.Payload.Role != "admin" {
+			return membership.Record{}, fmt.Errorf("membership approver %s is not an administrator", approver.Payload.PeerID)
 		}
 		if current.ApprovedBy == peerID {
-			return nil
+			return current, nil
 		}
 		current = approver
 	}

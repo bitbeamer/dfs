@@ -37,8 +37,8 @@ type Options struct {
 type daemonNotifier struct{ repository string }
 
 func (n daemonNotifier) Notify(reason string) { _ = wakeup.Notify(n.repository, reason) }
-func (daemonNotifier) BeginWrite()            {}
-func (daemonNotifier) EndWrite()              {}
+func (n daemonNotifier) BeginWrite()          { _ = wakeup.Notify(n.repository, wakeup.WriterBegin) }
+func (n daemonNotifier) EndWrite()            { _ = wakeup.Notify(n.repository, wakeup.WriterEnd) }
 
 type fuseLogWriter struct{ logger *slog.Logger }
 

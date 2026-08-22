@@ -319,6 +319,10 @@ func (s *Service) handlePairStart(response http.ResponseWriter, request *http.Re
 		writeProtocolError(response, http.StatusInternalServerError, "cannot create pairing session")
 		return
 	}
+	if s.membershipRecord.Payload.Role != "admin" {
+		writeProtocolError(response, http.StatusForbidden, "pairing approval requires an administrator")
+		return
+	}
 	approvedMembership, err := membership.Approve(input.Membership, s.repo.Config.PeerID, s.membershipKey)
 	if err != nil {
 		writeProtocolError(response, http.StatusInternalServerError, "cannot approve peer membership")

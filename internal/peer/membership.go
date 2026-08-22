@@ -53,7 +53,7 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	if err := membership.Save(repo.Config.Repository, record); err != nil {
 		return nil, membership.Record{}, err
 	}
-	if err := membership.Trust(repo.Config.Repository, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
+	if err := membership.TrustBootstrapAdmin(repo.Config.Repository, record); err != nil {
 		return nil, membership.Record{}, err
 	}
 	return private, record, nil
@@ -87,6 +87,9 @@ func validatePairingMembership(record membership.Record, filesystemID, peerID, n
 	payload := record.Payload
 	if payload.FileSystemID != filesystemID || payload.PeerID != peerID || payload.Name != strings.TrimSpace(name) {
 		return errors.New("pairing membership does not match the authenticated peer")
+	}
+	if payload.Role != "member" {
+		return errors.New("new peers must request the member role")
 	}
 	if !strings.HasPrefix(payload.QUICEndpoint, "quic://") {
 		return errors.New("pairing membership has an invalid QUIC endpoint")
@@ -194,17 +197,25 @@ func RevokeMembership(ctx context.Context, repo *repository.Repository, remote s
 	if err != nil {
 		return err
 	}
-	var local, target membership.Record
+	var target membership.Record
 	for _, record := range records {
-		if record.Payload.PeerID == repo.Config.PeerID {
-			local = record
-		}
 		if strings.HasPrefix(record.Payload.PeerID, peerPrefix) {
 			target = record
 		}
 	}
 	if target.Payload.PeerID == "" {
 		return fmt.Errorf("membership for %s was not found", remote)
+	}
+	accepted, err := membership.Accepted(repo.Config.Repository, filesystemID, repo.Config.PeerID)
+	if err != nil {
+		return err
+	}
+	var local membership.Record
+	for _, record := range accepted {
+		if record.Payload.PeerID == repo.Config.PeerID {
+			local = record
+			break
+		}
 	}
 	if local.Payload.Role != "admin" {
 		return errors.New("only an administrator member can revoke a DFS peer")

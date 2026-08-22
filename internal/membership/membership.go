@@ -29,6 +29,7 @@ const (
 	ConfigRef            = "refs/heads/dfs-config"
 	privateKeyFile       = "membership-key.pem"
 	trustedMembersFile   = "trusted-members.json"
+	bootstrapAdminsFile  = "bootstrap-admins.json"
 	revokedMembersFile   = "revoked-members.json"
 	membersPrefix        = "members/"
 	revocationsPrefix    = "revocations/"
@@ -233,9 +234,13 @@ func SetPinPolicy(repositoryPath, filesystemID, peerID, path string, pinned bool
 }
 
 func LoadPinPolicies(repositoryPath, filesystemID string) ([]PinPolicy, error) {
-	trusted, err := LoadTrusted(repositoryPath)
+	records, err := Accepted(repositoryPath, filesystemID)
 	if err != nil {
 		return nil, err
+	}
+	trusted := make(map[string]string, len(records))
+	for _, record := range records {
+		trusted[record.Payload.PeerID] = record.Payload.SigningPublicKey
 	}
 	files, err := loadSharedPrefix(repositoryPath, PinRef, pinsPrefix)
 	if err != nil {
@@ -557,6 +562,7 @@ func TrustStateVersion(repositoryPath string) (string, error) {
 		filepath.Join(repositoryPath, ".git", "refs", "heads", "dfs-membership"),
 		filepath.Join(repositoryPath, ".git", "packed-refs"),
 		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), trustedMembersFile),
+		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), bootstrapAdminsFile),
 		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), revokedMembersFile),
 	}
 	hash := sha256.New()
@@ -588,8 +594,8 @@ func IsRevoked(repositoryPath, peerID string) (bool, error) {
 }
 
 // Accepted returns the non-revoked records whose approval chain reaches a
-// locally trusted peer. Newly accepted peers are persisted as trust anchors so
-// offline reconciliation does not depend on record ordering.
+// locally pinned, self-approved bootstrap administrator. Every subsequent
+// admission and role change must be approved by an accepted administrator.
 func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]Record, error) {
 	for _, peerID := range legacyPeerIDs {
 		if err := Trust(repositoryPath, peerID, ""); err != nil {
@@ -610,7 +616,6 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 			byID[record.Payload.PeerID] = record
 		}
 	}
-	changed := true
 	for id, key := range trusted {
 		if key == "" {
 			if record, ok := byID[id]; ok {
@@ -618,24 +623,32 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 			}
 		}
 	}
-	for changed {
-		changed = false
-		for id, record := range byID {
-			if trusted[id] != "" || trusted[record.ApprovedBy] == "" {
-				continue
-			}
-			approver, ok := byID[record.ApprovedBy]
-			if ok && approver.Payload.SigningPublicKey == trusted[record.ApprovedBy] && VerifyApproval(record, approver) == nil {
-				trusted[id] = record.Payload.SigningPublicKey
-				changed = true
-			}
-		}
-	}
-	revoked, err := acceptedRevocations(repositoryPath, filesystemID, byID, trusted)
+	bootstrap, err := loadBootstrapAdmins(repositoryPath)
 	if err != nil {
 		return nil, err
 	}
+	if len(bootstrap) == 0 {
+		// One-time migration for repositories created before bootstrap roots
+		// were stored separately. Only a pinned generation-one administrator
+		// with a valid self-approval can seed the authority chain.
+		for id, record := range byID {
+			if trusted[id] == record.Payload.SigningPublicKey && record.Payload.Generation == 1 &&
+				record.Payload.Role == "admin" && record.ApprovedBy == id && VerifyApproval(record, record) == nil {
+				bootstrap[id] = record.Payload.SigningPublicKey
+			}
+		}
+		if len(bootstrap) > 0 {
+			if err := saveBootstrapAdmins(repositoryPath, bootstrap); err != nil {
+				return nil, err
+			}
+		}
+	}
 	persistedRevoked, err := loadRevoked(repositoryPath)
+	if err != nil {
+		return nil, err
+	}
+	authorized := authorizeRecords(byID, bootstrap, persistedRevoked)
+	revoked, err := acceptedRevocations(repositoryPath, filesystemID, byID, authorized)
 	if err != nil {
 		return nil, err
 	}
@@ -652,13 +665,14 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 		}
 	}
 	revoked = persistedRevoked
+	authorized = authorizeRecords(byID, bootstrap, revoked)
 	var accepted []Record
-	for id, key := range trusted {
+	for id, key := range authorized {
 		if record, ok := byID[id]; ok && record.Payload.SigningPublicKey == key && !record.Payload.Revoked && !revoked[id] {
 			accepted = append(accepted, record)
 		}
 	}
-	for id, key := range trusted {
+	for id, key := range authorized {
 		if key != "" {
 			if err := Trust(repositoryPath, id, key); err != nil {
 				return nil, err
@@ -667,6 +681,88 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 	}
 	sort.Slice(accepted, func(i, j int) bool { return accepted[i].Payload.PeerID < accepted[j].Payload.PeerID })
 	return accepted, nil
+}
+
+// TrustBootstrapAdmin pins an administrator delivered through an authenticated
+// bootstrap path, such as initial filesystem creation or pairing. The local pin
+// is the root of the later signed approval chain.
+func TrustBootstrapAdmin(repositoryPath string, record Record) error {
+	if err := VerifySelf(record); err != nil {
+		return err
+	}
+	if record.Payload.Role != "admin" {
+		return errors.New("bootstrap membership is not an administrator")
+	}
+	if err := Trust(repositoryPath, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
+		return err
+	}
+	bootstrap, err := loadBootstrapAdmins(repositoryPath)
+	if err != nil {
+		return err
+	}
+	if key := bootstrap[record.Payload.PeerID]; key != "" && key != record.Payload.SigningPublicKey {
+		return errors.New("bootstrap administrator key replacement was rejected")
+	}
+	bootstrap[record.Payload.PeerID] = record.Payload.SigningPublicKey
+	return saveBootstrapAdmins(repositoryPath, bootstrap)
+}
+
+func authorizeRecords(byID map[string]Record, bootstrap map[string]string, revoked map[string]bool) map[string]string {
+	authorized := make(map[string]string)
+	for id, key := range bootstrap {
+		record, ok := byID[id]
+		if !ok || key == "" || record.Payload.SigningPublicKey != key || record.Payload.Role != "admin" ||
+			revoked[id] || VerifySelf(record) != nil {
+			continue
+		}
+		authorized[id] = key
+	}
+	for changed := true; changed; {
+		changed = false
+		for id, record := range byID {
+			if authorized[id] != "" || revoked[id] || revoked[record.ApprovedBy] {
+				continue
+			}
+			approver, ok := byID[record.ApprovedBy]
+			if !ok || approver.Payload.Role != "admin" || approver.Payload.SigningPublicKey != authorized[record.ApprovedBy] {
+				continue
+			}
+			if VerifyApproval(record, approver) == nil {
+				authorized[id] = record.Payload.SigningPublicKey
+				changed = true
+			}
+		}
+	}
+	return authorized
+}
+
+func loadBootstrapAdmins(repositoryPath string) (map[string]string, error) {
+	path := filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), bootstrapAdminsFile)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]string), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func saveBootstrapAdmins(repositoryPath string, roots map[string]string) error {
+	data, err := json.MarshalIndent(roots, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	path := filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), bootstrapAdminsFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return replacePrivateFile(path, data)
 }
 
 // CurrentMachines collapses accepted records left behind by peer reinstalls to
@@ -704,39 +800,10 @@ func CurrentMachines(records []Record) ([]Record, map[string]bool) {
 }
 
 func AcceptedRevocations(repositoryPath, filesystemID string) (map[string]bool, error) {
-	trusted, err := LoadTrusted(repositoryPath)
-	if err != nil {
+	if _, err := Accepted(repositoryPath, filesystemID); err != nil {
 		return nil, err
 	}
-	records, err := LoadAll(repositoryPath)
-	if err != nil {
-		return nil, err
-	}
-	byID := make(map[string]Record)
-	for _, record := range records {
-		byID[record.Payload.PeerID] = record
-	}
-	revoked, err := acceptedRevocations(repositoryPath, filesystemID, byID, trusted)
-	if err != nil {
-		return nil, err
-	}
-	persisted, err := loadRevoked(repositoryPath)
-	if err != nil {
-		return nil, err
-	}
-	changed := false
-	for id := range revoked {
-		if !persisted[id] {
-			persisted[id] = true
-			changed = true
-		}
-	}
-	if changed {
-		if err := saveRevoked(repositoryPath, persisted); err != nil {
-			return nil, err
-		}
-	}
-	return persisted, nil
+	return loadRevoked(repositoryPath)
 }
 
 func canonicalPayload(payload Payload) ([]byte, error) { return json.Marshal(payload) }
@@ -833,11 +900,12 @@ func validateRevocation(revocation Revocation) error {
 }
 
 func acceptedRevocations(repositoryPath, filesystemID string, records map[string]Record, trusted map[string]string) (map[string]bool, error) {
-	result := make(map[string]bool)
 	files, err := loadSharedPrefix(repositoryPath, SharedRef, revocationsPrefix)
 	if err != nil {
 		return nil, err
 	}
+	var candidates []Revocation
+	revokedAt := make(map[string]time.Time)
 	for path, data := range files {
 		name := strings.TrimPrefix(path, revocationsPrefix)
 		var revocation Revocation
@@ -846,6 +914,18 @@ func acceptedRevocations(repositoryPath, filesystemID string, records map[string
 		}
 		approver, ok := records[revocation.RevokedBy]
 		if ok && approver.Payload.SigningPublicKey == trusted[revocation.RevokedBy] && VerifyRevocation(revocation, approver) == nil {
+			candidates = append(candidates, revocation)
+			if current, found := revokedAt[revocation.PeerID]; !found || revocation.UpdatedAt.Before(current) {
+				revokedAt[revocation.PeerID] = revocation.UpdatedAt
+			}
+		}
+	}
+	result := make(map[string]bool)
+	for _, revocation := range candidates {
+		// Preserve revocations issued before an administrator was removed, but
+		// reject claims issued at or after that administrator's revocation.
+		issuerRevokedAt, issuerRevoked := revokedAt[revocation.RevokedBy]
+		if !issuerRevoked || revocation.UpdatedAt.Before(issuerRevokedAt) {
 			result[revocation.PeerID] = true
 		}
 	}
@@ -1095,7 +1175,33 @@ func Sync(ctx context.Context, repositoryPath string, remotes []string) error {
 	if err := syncFilesystemConfig(ctx, repositoryPath, remotes); err != nil {
 		return err
 	}
-	return syncPinPolicies(ctx, repositoryPath, remotes, trusted)
+	pinSigners, err := acceptedSigningKeys(repositoryPath)
+	if err != nil {
+		return err
+	}
+	return syncPinPolicies(ctx, repositoryPath, remotes, pinSigners)
+}
+
+func acceptedSigningKeys(repositoryPath string) (map[string]string, error) {
+	records, err := LoadAll(repositoryPath)
+	if err != nil {
+		return nil, err
+	}
+	filesystems := make(map[string]bool)
+	for _, record := range records {
+		filesystems[record.Payload.FileSystemID] = true
+	}
+	result := make(map[string]string)
+	for filesystemID := range filesystems {
+		accepted, err := Accepted(repositoryPath, filesystemID)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range accepted {
+			result[record.Payload.PeerID] = record.Payload.SigningPublicKey
+		}
+	}
+	return result, nil
 }
 
 func syncFilesystemConfig(ctx context.Context, repositoryPath string, remotes []string) error {
@@ -1396,6 +1502,202 @@ func validPinDocument(path string, data []byte, trusted map[string]string) bool 
 	return verifyPinPolicy(policy, trusted[policy.IssuedBy]) == nil
 }
 
+// RefUpdate describes one proposed managed-transport control-ref update.
+type RefUpdate struct {
+	Old string
+	New string
+}
+
+// ValidateControlUpdates validates the complete proposed control-plane state
+// before receive-pack updates any refs. It accepts legitimate generation
+// updates while rejecting deletion, rollback, invalid signatures, and records
+// whose authorization chain does not reach a locally pinned administrator.
+func ValidateControlUpdates(repositoryPath string, updates map[string]RefUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	membershipRef := SharedRef
+	previousMembershipRef := SharedRef
+	if update, ok := updates[SharedRef]; ok {
+		membershipRef = update.New
+		previousMembershipRef = update.Old
+	}
+	authorized, revoked, err := authorizedRecordsAtRef(repositoryPath, membershipRef, previousMembershipRef)
+	if err != nil {
+		return fmt.Errorf("validate proposed membership: %w", err)
+	}
+	for ref, update := range updates {
+		if ref != SharedRef && ref != PinRef && ref != ConfigRef {
+			continue
+		}
+		if err := validateDocumentContinuity(repositoryPath, ref, update.Old, update.New); err != nil {
+			return err
+		}
+		switch ref {
+		case SharedRef:
+			// authorizedRecordsAtRef validated every proposed document.
+		case PinRef:
+			files, err := loadSharedPrefix(repositoryPath, update.New, "")
+			if err != nil {
+				return err
+			}
+			for path, data := range files {
+				var policy PinPolicy
+				if json.Unmarshal(data, &policy) != nil || path != pinPolicyPath(policy.Path) || revoked[policy.IssuedBy] {
+					return fmt.Errorf("invalid cluster pin document %s", path)
+				}
+				record, ok := authorized[policy.IssuedBy]
+				if !ok || policy.FileSystemID != record.Payload.FileSystemID || verifyPinPolicy(policy, record.Payload.SigningPublicKey) != nil {
+					return fmt.Errorf("cluster pin document %s was not signed by an accepted member", path)
+				}
+			}
+		case ConfigRef:
+			files, err := loadSharedPrefix(repositoryPath, update.New, "")
+			if err != nil {
+				return err
+			}
+			for path, data := range files {
+				if path != filesystemConfigPath {
+					return fmt.Errorf("unexpected filesystem configuration document %s", path)
+				}
+				var value FilesystemConfig
+				if json.Unmarshal(data, &value) != nil {
+					return errors.New("invalid filesystem configuration document")
+				}
+				record, ok := authorized[value.IssuedBy]
+				if !ok || record.Payload.Role != "admin" || value.FileSystemID != record.Payload.FileSystemID || revoked[value.IssuedBy] ||
+					verifyFilesystemConfig(value, record.Payload.SigningPublicKey) != nil {
+					return errors.New("filesystem configuration was not signed by an accepted administrator")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func authorizedRecordsAtRef(repositoryPath, ref, previousRef string) (map[string]Record, map[string]bool, error) {
+	files, err := loadSharedPrefix(repositoryPath, ref, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	byID := make(map[string]Record)
+	filesystemID := ""
+	for path, data := range files {
+		if strings.HasPrefix(path, revocationsPrefix) {
+			continue
+		}
+		if !strings.HasPrefix(path, membersPrefix) {
+			return nil, nil, fmt.Errorf("unexpected membership document %s", path)
+		}
+		var record Record
+		if json.Unmarshal(data, &record) != nil || VerifySelf(record) != nil || path != membersPrefix+record.Payload.PeerID+".json" {
+			return nil, nil, fmt.Errorf("invalid membership document %s", path)
+		}
+		if filesystemID != "" && filesystemID != record.Payload.FileSystemID {
+			return nil, nil, errors.New("membership ref contains multiple filesystem identities")
+		}
+		filesystemID = record.Payload.FileSystemID
+		byID[record.Payload.PeerID] = record
+	}
+	bootstrap, err := loadBootstrapAdmins(repositoryPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	persisted, err := loadRevoked(repositoryPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	preRevocation := authorizeRecords(byID, bootstrap, persisted)
+	revoked := make(map[string]bool, len(persisted))
+	for id := range persisted {
+		revoked[id] = true
+	}
+	var proposed []Revocation
+	previousFiles := make(map[string][]byte)
+	if previousRef != "" && strings.Trim(previousRef, "0") != "" {
+		previousFiles, err = loadSharedPrefix(repositoryPath, previousRef, revocationsPrefix)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	for path, data := range files {
+		if !strings.HasPrefix(path, revocationsPrefix) {
+			continue
+		}
+		var value Revocation
+		if json.Unmarshal(data, &value) != nil || path != revocationsPrefix+value.PeerID+".json" {
+			return nil, nil, fmt.Errorf("invalid revocation document %s", path)
+		}
+		if bytes.Equal(previousFiles[path], data) {
+			revoked[value.PeerID] = true
+			continue
+		}
+		approver, ok := byID[value.RevokedBy]
+		if !ok || preRevocation[value.RevokedBy] != approver.Payload.SigningPublicKey ||
+			approver.Payload.Role != "admin" || VerifyRevocation(value, approver) != nil {
+			return nil, nil, fmt.Errorf("revocation of %s was not signed by an accepted administrator", value.PeerID)
+		}
+		proposed = append(proposed, value)
+		revoked[value.PeerID] = true
+	}
+	for _, value := range proposed {
+		if revoked[value.RevokedBy] {
+			return nil, nil, fmt.Errorf("revoked administrator %s cannot issue revocations", value.RevokedBy)
+		}
+	}
+	authorizedKeys := authorizeRecords(byID, bootstrap, revoked)
+	authorized := make(map[string]Record, len(authorizedKeys))
+	for id, record := range byID {
+		if revoked[id] {
+			continue
+		}
+		if authorizedKeys[id] != record.Payload.SigningPublicKey {
+			return nil, nil, fmt.Errorf("membership record %s has no accepted administrator approval", id)
+		}
+		authorized[id] = record
+	}
+	return authorized, revoked, nil
+}
+
+func validateDocumentContinuity(repositoryPath, ref, old, new string) error {
+	if strings.TrimSpace(new) == "" || strings.Trim(new, "0") == "" {
+		return fmt.Errorf("DFS control ref %s cannot be deleted", ref)
+	}
+	if strings.TrimSpace(old) == "" || strings.Trim(old, "0") == "" {
+		return nil
+	}
+	before, err := loadSharedPrefix(repositoryPath, old, "")
+	if err != nil {
+		return err
+	}
+	after, err := loadSharedPrefix(repositoryPath, new, "")
+	if err != nil {
+		return err
+	}
+	for path, previous := range before {
+		candidate, ok := after[path]
+		if !ok {
+			return fmt.Errorf("DFS control document %s cannot be deleted", path)
+		}
+		if !bytes.Equal(previous, candidate) && !controlDocumentAdvances(ref, path, candidate, previous) {
+			return fmt.Errorf("DFS control document %s did not advance its generation", path)
+		}
+	}
+	return nil
+}
+
+func controlDocumentAdvances(ref, path string, candidate, previous []byte) bool {
+	if ref != ConfigRef {
+		return newerSharedDocument(path, candidate, previous)
+	}
+	var next, current FilesystemConfig
+	if json.Unmarshal(candidate, &next) != nil || json.Unmarshal(previous, &current) != nil {
+		return false
+	}
+	return next.Generation > current.Generation ||
+		(next.Generation == current.Generation && next.UpdatedAt.After(current.UpdatedAt))
+}
+
 func newerSharedDocument(path string, candidate, current []byte) bool {
 	var candidateGeneration, currentGeneration uint64
 	var candidateTime, currentTime time.Time
@@ -1480,7 +1782,7 @@ func runGit(ctx context.Context, repositoryPath string, input []byte, arguments 
 
 func runGitEnv(ctx context.Context, repositoryPath string, environment []string, input []byte, arguments ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", repositoryPath}, arguments...)...)
-	command.Env = append(os.Environ(), environment...)
+	command.Env = append(cleanGitRepositoryEnvironment(os.Environ()), environment...)
 	command.Env = append(command.Env,
 		"GIT_AUTHOR_NAME=DFS", "GIT_AUTHOR_EMAIL=dfs@localhost",
 		"GIT_COMMITTER_NAME=DFS", "GIT_COMMITTER_EMAIL=dfs@localhost",
@@ -1491,4 +1793,21 @@ func runGitEnv(ctx context.Context, repositoryPath string, environment []string,
 		return output, fmt.Errorf("git %s: %s", strings.Join(arguments, " "), strings.TrimSpace(string(output)))
 	}
 	return output, nil
+}
+
+func cleanGitRepositoryEnvironment(environment []string) []string {
+	result := make([]string, 0, len(environment))
+	for _, value := range environment {
+		name := value
+		if index := strings.IndexByte(name, '='); index >= 0 {
+			name = name[:index]
+		}
+		switch name {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX":
+			continue
+		default:
+			result = append(result, value)
+		}
+	}
+	return result
 }

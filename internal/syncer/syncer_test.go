@@ -6,7 +6,84 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 )
+
+func TestEndWriteRequeuesDeferredReason(t *testing.T) {
+	scheduler := &Scheduler{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		events: make(chan string, 1),
+	}
+	scheduler.BeginWrite()
+	scheduler.deferredReason = "completed write"
+	scheduler.EndWrite()
+	select {
+	case reason := <-scheduler.events:
+		if reason != "completed write" {
+			t.Fatalf("deferred reason = %q", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deferred synchronization was not requeued")
+	}
+}
+
+func TestOpenWriterOnlyDefersWorktreeChangingPasses(t *testing.T) {
+	for _, reason := range []string{"managed Git receive", "periodic", receiveAndPublishReason, maintenanceReceiveReason} {
+		if !requiresWriterDrain(reason) {
+			t.Errorf("%q does not wait for open writers", reason)
+		}
+	}
+	for _, reason := range []string{"completed write", "rename", "pin policy changed"} {
+		if requiresWriterDrain(reason) {
+			t.Errorf("push-only reason %q unnecessarily waits for open writers", reason)
+		}
+	}
+}
+
+func TestContinuousEventsCannotStarveDebounce(t *testing.T) {
+	runs := make(chan string, 4)
+	scheduler := &Scheduler{
+		interval:     time.Hour,
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		events:       make(chan string, 128),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		syncOverride: func(reason string) { runs <- reason },
+	}
+	go scheduler.loop()
+	deadline := time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		scheduler.Notify("filesystem change")
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case <-runs:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("continuous events postponed synchronization indefinitely")
+	}
+	close(scheduler.stop)
+	<-scheduler.done
+}
+
+func TestShutdownDoesNotStartFreshSynchronization(t *testing.T) {
+	runs := make(chan string, 1)
+	scheduler := &Scheduler{
+		interval:     time.Hour,
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		events:       make(chan string, 1),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		syncOverride: func(reason string) { runs <- reason },
+	}
+	go scheduler.loop()
+	close(scheduler.stop)
+	<-scheduler.done
+	select {
+	case reason := <-runs:
+		t.Fatalf("shutdown started a fresh %q synchronization", reason)
+	default:
+	}
+}
 
 func TestBeginWritePreemptsOutgoingSync(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

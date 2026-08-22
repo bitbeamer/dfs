@@ -165,6 +165,34 @@ func TestWriteCommitIsAtomicAndRetryIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestFailedWritePublishQuarantinesStagedPayload(t *testing.T) {
+	service, root := testService(t, 16)
+	if err := os.Mkdir(filepath.Join(root, "parent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := service.BeginWrite(context.Background(), WriteRequest{Path: "parent/item.txt", Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.WriteAt([]byte("recover me"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "parent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(context.Background()); err == nil {
+		t.Fatal("commit unexpectedly succeeded after parent removal")
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".git", "dfs", "recovery", "*", "writes", "write-*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("quarantined writes = %q, %v", matches, err)
+	}
+	payload, err := os.ReadFile(matches[0])
+	if err != nil || string(payload) != "recover me" {
+		t.Fatalf("quarantined payload = %q, %v", payload, err)
+	}
+}
+
 func TestConcurrentIdempotentMutationExecutesOnce(t *testing.T) {
 	service, _ := testService(t, 16)
 	ctx := context.Background()

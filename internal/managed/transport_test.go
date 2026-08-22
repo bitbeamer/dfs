@@ -59,6 +59,15 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	}
 	serverKey, serverRecord := managedTestRecord(t, serverRepo, filesystemID, "quic://127.0.0.1:1")
 	clientKey, clientRecord := managedTestRecord(t, clientRepo, filesystemID, "quic://127.0.0.1:1")
+	clientRecord.Payload.Role = "member"
+	clientRecord, err = membership.Sign(clientRecord.Payload, clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRecord, err = membership.Approve(clientRecord, serverRepo.Config.PeerID, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, repo := range []*repository.Repository{serverRepo, clientRepo} {
 		for _, record := range []membership.Record{serverRecord, clientRecord} {
 			if err := membership.Save(repo.Config.Repository, record); err != nil {
@@ -67,6 +76,9 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 			if err := membership.Trust(repo.Config.Repository, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
 				t.Fatal(err)
 			}
+		}
+		if err := membership.TrustBootstrapAdmin(repo.Config.Repository, serverRecord); err != nil {
+			t.Fatal(err)
 		}
 	}
 	payload := []byte("managed content over quic\n")
@@ -186,12 +198,45 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build DFS helper: %v\n%s", err, output)
 	}
+	previousGuardExecutable := receiveGuardExecutable
+	receiveGuardExecutable = func() (string, error) { return binary, nil }
+	defer func() { receiveGuardExecutable = previousGuardExecutable }()
 	if _, err := clientRepo.AdoptClonedPeer(ctx, serverRepo.Config.PeerID); err != nil {
 		t.Fatalf("adopt cloned peer: %v", err)
 	}
 	remoteName, err := clientRepo.AddManagedRemote(ctx, serverRepo.Config.PeerID, binary)
 	if err != nil {
 		t.Fatal(err)
+	}
+	clientRecord.Payload.Generation++
+	clientRecord.Payload.UpdatedAt = time.Now().UTC().Add(time.Second)
+	clientRecord, err = membership.Sign(clientRecord.Payload, clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRecord, err = membership.Approve(clientRecord, serverRepo.Config.PeerID, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := membership.Save(clientRepo.Config.Repository, clientRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := membership.Sync(ctx, clientRepo.Config.Repository, []string{remoteName}); err != nil {
+		t.Fatalf("authorized membership update over managed receive: %v", err)
+	}
+	controlPush := exec.CommandContext(ctx, "git", "-C", clientRepo.Config.Repository, "push", remoteName,
+		membership.SharedRef+":"+membership.SharedRef)
+	if output, err := controlPush.CombinedOutput(); err != nil {
+		t.Fatalf("push authorized membership update over managed receive: %v\n%s", err, output)
+	}
+	serverMembers, err := membership.LoadAll(serverRepo.Config.Repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(serverMembers, func(record membership.Record) bool {
+		return record.Payload.PeerID == clientRecord.Payload.PeerID && record.Payload.Generation == clientRecord.Payload.Generation
+	}) {
+		t.Fatalf("authorized membership generation did not reach server: %#v", serverMembers)
 	}
 	if err := clientRepo.Sync(ctx, true); err != nil {
 		t.Fatalf("identify managed annex remote: %v", err)
@@ -444,6 +489,75 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	}
 	if _, err := os.Stat(rsyncMarker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("offline QUIC content fetch invoked rsync: %v", err)
+	}
+}
+
+func TestManagedReceiveGuardRejectsControlRefRewrites(t *testing.T) {
+	repositoryPath := t.TempDir()
+	run := func(input string, args ...string) ([]byte, error) {
+		command := exec.Command("git", args...)
+		command.Dir = repositoryPath
+		command.Stdin = strings.NewReader(input)
+		return command.CombinedOutput()
+	}
+	if output, err := run("", "init", "-b", "main"); err != nil {
+		t.Fatalf("init: %v\n%s", err, output)
+	}
+	if _, err := run("", "config", "user.name", "Guard Test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("", "config", "user.email", "guard@example.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repositoryPath, "value"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("", "add", "value"); err != nil {
+		t.Fatalf("add: %v\n%s", err, output)
+	}
+	if output, err := run("", "commit", "-m", "one"); err != nil {
+		t.Fatalf("commit: %v\n%s", err, output)
+	}
+	oldBytes, _ := run("", "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repositoryPath, "value"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("", "commit", "-am", "two"); err != nil {
+		t.Fatal(err)
+	}
+	newBytes, _ := run("", "rev-parse", "HEAD")
+	oldID, newID := strings.TrimSpace(string(oldBytes)), strings.TrimSpace(string(newBytes))
+	if err := ValidateReceiveUpdates(repositoryPath, strings.NewReader(newID+" "+oldID+" refs/heads/dfs-membership\n")); err == nil || !strings.Contains(err.Error(), "cannot be rewound") {
+		t.Fatalf("rewind result = %v", err)
+	}
+	if err := ValidateReceiveUpdates(repositoryPath, strings.NewReader(newID+" "+strings.Repeat("0", 40)+" refs/heads/dfs-pins\n")); err == nil || !strings.Contains(err.Error(), "cannot be deleted") {
+		t.Fatalf("delete result = %v", err)
+	}
+}
+
+func TestRequestHeaderIsBoundedAndDeadlineLimited(t *testing.T) {
+	server, client := net.Pipe()
+	writeDone := make(chan struct{})
+	go func() {
+		_, _ = client.Write(bytes.Repeat([]byte{'x'}, requestHeaderLimit+1))
+		_ = client.Close()
+		close(writeDone)
+	}()
+	if _, _, err := readRequestHeader(server, time.Second); err == nil {
+		t.Fatal("oversized request header was accepted")
+	}
+	_ = server.Close()
+	<-writeDone
+
+	server, client = net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	started := time.Now()
+	if _, _, err := readRequestHeader(server, 25*time.Millisecond); err == nil {
+		t.Fatal("stalled request header was accepted")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled request header exceeded its deadline: %v", elapsed)
 	}
 }
 

@@ -248,6 +248,16 @@ func (s *Service) BeginWrite(ctx context.Context, request WriteRequest) (WriteTr
 		}
 		s.operationMu.Unlock()
 	}
+	writerUnlock, err := s.repo.BeginWriteGuard(ctx)
+	if err != nil {
+		return nil, classify("begin write", cleaned, err)
+	}
+	keepWriterLock := false
+	defer func() {
+		if !keepWriterLock {
+			writerUnlock()
+		}
+	}()
 	info, statErr := os.Stat(destination)
 	exists := statErr == nil
 	if errors.Is(statErr, os.ErrNotExist) {
@@ -328,8 +338,9 @@ func (s *Service) BeginWrite(ctx context.Context, request WriteRequest) (WriteTr
 			return cleanup(err)
 		}
 	}
+	keepWriterLock = true
 	return &writeTransaction{service: s, file: staging, destination: destination, path: cleaned,
-		operationID: request.OperationID, fingerprint: fingerprint}, nil
+		operationID: request.OperationID, fingerprint: fingerprint, writerUnlock: writerUnlock}, nil
 }
 
 func copyReaderAt(ctx context.Context, destination io.Writer, source io.ReaderAt, size int64) (int64, error) {
@@ -380,14 +391,15 @@ func syncDirectory(path string) error {
 }
 
 type writeTransaction struct {
-	service     *Service
-	file        *os.File
-	destination string
-	path        string
-	operationID string
-	fingerprint string
-	mu          sync.Mutex
-	finished    bool
+	service      *Service
+	file         *os.File
+	destination  string
+	path         string
+	operationID  string
+	fingerprint  string
+	writerUnlock func()
+	mu           sync.Mutex
+	finished     bool
 }
 
 func (t *writeTransaction) ReadAt(data []byte, offset int64) (int, error) {
@@ -530,6 +542,7 @@ func (t *writeTransaction) Commit(ctx context.Context) error {
 		return classify("commit", t.path, err)
 	}
 	t.finished = true
+	defer t.releaseWriterLock()
 	err := t.service.repo.WithWorkTreeLock(func() error {
 		if err := os.Rename(t.file.Name(), t.destination); err != nil {
 			return err
@@ -537,8 +550,11 @@ func (t *writeTransaction) Commit(ctx context.Context) error {
 		return syncDirectory(filepath.Dir(t.destination))
 	})
 	if err != nil {
-		_ = os.Remove(t.file.Name())
-		err = classify("commit", t.path, err)
+		publishErr := err
+		if quarantineErr := t.quarantine(); quarantineErr != nil {
+			publishErr = errors.Join(publishErr, fmt.Errorf("quarantine staged write: %w", quarantineErr))
+		}
+		err = classify("commit", t.path, publishErr)
 	} else if t.service.repo.Store != nil {
 		if info, statErr := os.Stat(t.destination); statErr != nil {
 			err = classify("commit metadata", t.path, statErr)
@@ -568,6 +584,21 @@ func (t *writeTransaction) Commit(ctx context.Context) error {
 	return err
 }
 
+func (t *writeTransaction) quarantine() error {
+	directory := filepath.Join(t.service.root, ".git", "dfs", "recovery", time.Now().UTC().Format("20060102T150405.000000000Z"), "writes")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	destination := filepath.Join(directory, filepath.Base(t.file.Name()))
+	if err := os.Rename(t.file.Name(), destination); err != nil {
+		return err
+	}
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(t.file.Name()))
+}
+
 func (t *writeTransaction) Abort(context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -575,9 +606,17 @@ func (t *writeTransaction) Abort(context.Context) error {
 		return nil
 	}
 	t.finished = true
+	defer t.releaseWriterLock()
 	err := errors.Join(t.file.Close(), os.Remove(t.file.Name()))
 	t.service.releasePending(t.operationID, t.fingerprint)
 	return classify("abort", t.path, err)
+}
+
+func (t *writeTransaction) releaseWriterLock() {
+	if t.writerUnlock != nil {
+		t.writerUnlock()
+		t.writerUnlock = nil
+	}
 }
 
 func (t *writeTransaction) Close() error { return t.Abort(context.Background()) }

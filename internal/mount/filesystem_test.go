@@ -34,6 +34,22 @@ type blockingCommitTransaction struct {
 	finish  chan struct{}
 }
 
+type blockingBeginAPI struct {
+	core.API
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a blockingBeginAPI) BeginWrite(ctx context.Context, request core.WriteRequest) (core.WriteTransaction, error) {
+	close(a.started)
+	select {
+	case <-a.release:
+		return a.API.BeginWrite(ctx, request)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (t *blockingCommitTransaction) Commit(ctx context.Context) error {
 	close(t.started)
 	select {
@@ -133,6 +149,36 @@ func TestCreateIsVisibleBeforeCloseAndPublishedAtomically(t *testing.T) {
 	}
 }
 
+func TestFlushReportsPublishFailureAndQuarantinesPayload(t *testing.T) {
+	root := t.TempDir()
+	filesystem, _, _ := testFileSystem(t, root)
+	if err := os.Mkdir(filepath.Join(root, "parent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	handle, code := filesystem.Create("parent/item.txt", syscall.O_WRONLY, 0o644, nil)
+	if code != fuse.OK {
+		t.Fatal(code)
+	}
+	if _, code := handle.Write([]byte("recover me"), 0); code != fuse.OK {
+		t.Fatal(code)
+	}
+	if err := os.Remove(filepath.Join(root, "parent")); err != nil {
+		t.Fatal(err)
+	}
+	if code := handle.Flush(); code == fuse.OK {
+		t.Fatal("flush hid the failed final publication")
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".git", "dfs", "recovery", "*", "writes", "write-*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("quarantined writes = %q, %v", matches, err)
+	}
+	payload, err := os.ReadFile(matches[0])
+	if err != nil || string(payload) != "recover me" {
+		t.Fatalf("quarantined payload = %q, %v", payload, err)
+	}
+	handle.Release()
+}
+
 func TestMultipleHandlesShareOneWriteUntilFinalRelease(t *testing.T) {
 	root := t.TempDir()
 	filesystem, _, _ := testFileSystem(t, root)
@@ -190,6 +236,45 @@ func TestSlowWriteCommitDoesNotBlockUnrelatedDirectoryReads(t *testing.T) {
 	case <-released:
 	case <-time.After(time.Second):
 		t.Fatal("write release did not complete")
+	}
+}
+
+func TestSlowBeginWriteDoesNotHoldGlobalSessionLock(t *testing.T) {
+	root := t.TempDir()
+	filesystem, _, service := testFileSystem(t, root)
+	if err := os.WriteFile(filepath.Join(root, "existing.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	filesystem.core = blockingBeginAPI{API: service, started: started, release: release}
+	opened := make(chan fuse.Status, 1)
+	go func() {
+		_, status := filesystem.Open("existing.txt", syscall.O_RDWR, nil)
+		opened <- status
+	}()
+	<-started
+	readDone := make(chan fuse.Status, 1)
+	go func() {
+		_, status := filesystem.GetAttr("other.txt", nil)
+		readDone <- status
+	}()
+	select {
+	case status := <-readDone:
+		if status != fuse.ENOENT {
+			t.Fatalf("unrelated lookup status = %v", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow BeginWrite held the global write-session lock")
+	}
+	close(release)
+	select {
+	case status := <-opened:
+		if status != fuse.OK {
+			t.Fatal(status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write open did not finish")
 	}
 }
 

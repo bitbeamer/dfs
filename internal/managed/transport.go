@@ -39,6 +39,8 @@ const ALPN = "dfs-managed-v1"
 const PairALPN = "dfs-pair-v2"
 
 const managedDialTimeout = time.Second
+const requestHeaderTimeout = 20 * time.Second
+const requestHeaderLimit = 64 << 10
 
 const (
 	contentAvailabilityBudget = 1500 * time.Millisecond
@@ -77,6 +79,8 @@ type Server struct {
 	done        chan struct{}
 	once        sync.Once
 	connections atomic.Int64
+	hookOnce    sync.Once
+	hookErr     error
 }
 
 func Start(repo *repository.Repository, address string, diagnostic func(context.Context) ([]byte, error), pairingCertificate *tls.Certificate, pair func(context.Context, string, net.Addr, json.RawMessage) (json.RawMessage, error), pairClone func(context.Context, string, string) error, changed func(string, []string)) (*Server, error) {
@@ -165,9 +169,8 @@ func (s *Server) serveConnection(connection *quic.Conn) {
 
 func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Addr) {
 	defer stream.Close()
-	reader := bufio.NewReaderSize(stream, 64<<10)
-	header, err := reader.ReadBytes('\n')
-	if err != nil || len(header) > 64<<10 {
+	header, reader, err := readRequestHeader(stream, requestHeaderTimeout)
+	if err != nil {
 		writeResponse(stream, Response{Error: "read managed transport request"})
 		return
 	}
@@ -246,6 +249,26 @@ func (s *Server) serveStream(stream *quic.Stream, protocol string, remote net.Ad
 	default:
 		writeResponse(stream, Response{Error: "unsupported managed transport operation"})
 	}
+}
+
+type requestHeaderReader interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
+func readRequestHeader(stream requestHeaderReader, timeout time.Duration) ([]byte, *bufio.Reader, error) {
+	if err := stream.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, err
+	}
+	reader := bufio.NewReaderSize(stream, requestHeaderLimit+1)
+	header, err := reader.ReadSlice('\n')
+	if err != nil || len(header) > requestHeaderLimit {
+		return nil, nil, errors.New("managed transport request header exceeds its limit or deadline")
+	}
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
+		return nil, nil, err
+	}
+	return header, reader, nil
 }
 
 func (s *Server) serveHasContent(stream *quic.Stream, key string) {
@@ -486,7 +509,18 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		treeBefore = worktreeTree(stream.Context(), s.repo.Config.Repository)
 		pinRefBefore = gitRefValue(stream.Context(), s.repo.Config.Repository, membership.PinRef)
 	}
-	command := exec.CommandContext(stream.Context(), service, s.repo.Config.Repository)
+	commandName := service
+	commandArgs := []string{s.repo.Config.Repository}
+	if service == "git-receive-pack" {
+		s.hookOnce.Do(func() { s.hookErr = installReceiveGuard(s.repo.Config.Repository) })
+		if s.hookErr != nil {
+			writeResponse(stream, Response{Error: "prepare guarded Git receive"})
+			return
+		}
+		commandName = "git"
+		commandArgs = []string{"-c", "core.hooksPath=" + filepath.Join(s.repo.Config.Repository, ".git", "dfs", "managed-hooks"), "receive-pack", s.repo.Config.Repository}
+	}
+	command := exec.CommandContext(stream.Context(), commandName, commandArgs...)
 	processcommand.ConfigureCancellation(command)
 	command.Stdin, command.Stdout, command.Stderr = input, stream, io.Discard
 	if err := command.Start(); err != nil {
@@ -518,6 +552,99 @@ func (s *Server) serveGit(stream *quic.Stream, input io.Reader, service string) 
 		}
 		s.changed(reason, changedPaths(stream.Context(), s.repo.Config.Repository, treeBefore, treeAfter))
 	}
+}
+
+func installReceiveGuard(repositoryPath string) error {
+	directory := filepath.Join(repositoryPath, ".git", "dfs", "managed-hooks")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	executable, err := receiveGuardExecutable()
+	if err != nil {
+		return err
+	}
+	hook := "#!/bin/sh\nset -eu\nexec " + shellArgument(executable) + " --repo " + shellArgument(repositoryPath) + " internal receive-guard\n"
+	path := filepath.Join(directory, "pre-receive")
+	temporary, err := os.CreateTemp(directory, "pre-receive-*")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer os.Remove(name)
+	if _, err := temporary.WriteString(hook); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Chmod(0o700); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+var receiveGuardExecutable = os.Executable
+
+func shellArgument(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+// ValidateReceiveUpdates validates pre-receive input for managed control refs.
+func ValidateReceiveUpdates(repositoryPath string, input io.Reader) error {
+	updates := make(map[string]membership.RefUpdate)
+	scanner := bufio.NewScanner(input)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 3 {
+			return errors.New("invalid managed pre-receive update")
+		}
+		old, next, ref := fields[0], fields[1], fields[2]
+		if ref != membership.SharedRef && ref != membership.PinRef && ref != membership.ConfigRef {
+			continue
+		}
+		if zeroObjectID(next) {
+			return fmt.Errorf("DFS control ref %s cannot be deleted", ref)
+		}
+		if !zeroObjectID(old) {
+			command := exec.Command("git", "-C", repositoryPath, "merge-base", "--is-ancestor", old, next)
+			command.Env = managedReceiveGitEnvironment(os.Environ())
+			if output, err := command.CombinedOutput(); err != nil {
+				return fmt.Errorf("DFS control ref %s cannot be rewound: %s", ref, strings.TrimSpace(string(output)))
+			}
+		}
+		updates[ref] = membership.RefUpdate{Old: old, New: next}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return membership.ValidateControlUpdates(repositoryPath, updates)
+}
+
+func managedReceiveGitEnvironment(environment []string) []string {
+	result := make([]string, 0, len(environment))
+	for _, value := range environment {
+		name := value
+		if index := strings.IndexByte(name, '='); index >= 0 {
+			name = name[:index]
+		}
+		switch name {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX":
+			continue
+		default:
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func zeroObjectID(value string) bool {
+	return value != "" && strings.Trim(value, "0") == ""
 }
 
 func gitRefsValue(ctx context.Context, repositoryPath string) (string, bool) {

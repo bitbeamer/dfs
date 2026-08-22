@@ -11,8 +11,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/wakeup"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
+
+func TestDaemonNotifierCarriesWriterLifecycle(t *testing.T) {
+	repositoryPath := t.TempDir()
+	listener, err := wakeup.Listen(repositoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	notifier := daemonNotifier{repository: repositoryPath}
+	messages := make(chan string, 2)
+	go func() {
+		for range 2 {
+			message, _ := listener.Receive()
+			messages <- message
+		}
+	}()
+	notifier.BeginWrite()
+	notifier.EndWrite()
+	for _, want := range []string{wakeup.WriterBegin, wakeup.WriterEnd} {
+		select {
+		case got := <-messages:
+			if got != want {
+				t.Fatalf("writer lifecycle message = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("writer lifecycle message %q was not delivered", want)
+		}
+	}
+}
 
 type entryNotifyCall struct {
 	directory string

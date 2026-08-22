@@ -79,8 +79,8 @@ func (e *RemoteSyncError) Error() string {
 }
 
 type Remote struct {
-	Name string
-	URL  string
+	Name string `json:"name"`
+	URL  string `json:"url"`
 }
 
 type StorageRemote struct {
@@ -483,6 +483,41 @@ func (r *Repository) WithWorkTreeLock(fn func() error) error {
 	return fn()
 }
 
+// BeginWriteGuard prevents received commits from replacing the worktree while
+// a frontend write transaction is open. Multiple local writers may coexist;
+// ApplyReceived takes the corresponding exclusive lock.
+func (r *Repository) BeginWriteGuard(ctx context.Context) (func(), error) {
+	return r.lockWriterProcess(ctx, unix.LOCK_SH)
+}
+
+func (r *Repository) lockWriterProcess(ctx context.Context, mode int) (func(), error) {
+	path := filepath.Join(r.Config.Repository, filepath.FromSlash(config.Directory), "writers.lock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if err := unix.Flock(int(file.Fd()), mode|unix.LOCK_NB); err == nil {
+			return func() {
+				_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+				_ = file.Close()
+			}, nil
+		} else if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			_ = file.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			return nil, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
 func (r *Repository) CommitPending(ctx context.Context, message string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -545,8 +580,49 @@ func (r *Repository) CheckConsistency(ctx context.Context) error {
 	return nil
 }
 
+// RecoverWorkTree runs startup recovery and the follow-up Git repair as one
+// cross-process critical section, so recovery never quarantines locks or annex
+// state belonging to a live daemon operation.
+func (r *Repository) RecoverWorkTree(ctx context.Context, prepare func() error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	unlock, err := r.lockWorkTreeProcess(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := prepare(); err != nil {
+		return err
+	}
+	if err := r.repairLegacyPrivateStateLocked(ctx); err != nil {
+		return fmt.Errorf("remove legacy DFS state from Git: %w", err)
+	}
+	if _, err := r.commitPendingLocked(ctx, "Recover interrupted DFS update"); err != nil {
+		return fmt.Errorf("finish pending repository update: %w", err)
+	}
+	if _, err := r.runner.Run(ctx, "git", "fsck", "--no-dangling"); err != nil {
+		return err
+	}
+	if _, err := r.runner.Run(ctx, "git", "annex", "fsck", "--fast"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *Repository) commitPendingLocked(ctx context.Context, message string) (bool, error) {
 	if err := r.repairLegacyPrivateStateLocked(ctx); err != nil {
+		return false, err
+	}
+	unmerged, err := r.runner.Run(ctx, "git", "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(unmerged) != "" {
+		return false, fmt.Errorf("refuse to commit with unresolved merge conflicts: %s", strings.Join(strings.Fields(unmerged), ", "))
+	}
+	if _, err := os.Stat(filepath.Join(r.Config.Repository, ".git", "MERGE_HEAD")); err == nil {
+		return false, errors.New("refuse to commit while a merge is in progress")
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
 	// git-annex handles new and modified user files. Git then records deletions,
@@ -641,6 +717,11 @@ func (r *Repository) Sync(ctx context.Context, metadataOnly bool) error {
 // worktree. It deliberately performs no network I/O: the peer's receive-pack
 // has completed, and unrelated or offline peers must not delay visibility.
 func (r *Repository) ApplyReceived(ctx context.Context) error {
+	writersDrained, err := r.lockWriterProcess(ctx, unix.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer writersDrained()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	unlock, err := r.lockWorkTreeProcess(ctx)
@@ -653,8 +734,22 @@ func (r *Repository) ApplyReceived(ctx context.Context) error {
 		return err
 	}
 	for _, ref := range strings.Fields(refs) {
-		if _, err := r.runner.Run(ctx, "git", "-c", "merge.renames=false", "merge", "--no-edit", ref); err != nil {
-			return err
+		if _, mergeErr := r.runner.Run(ctx, "git", "-c", "merge.renames=false", "merge", "--no-edit", ref); mergeErr != nil {
+			// Resolve the active merge before any later commit path can observe it.
+			// git-annex retains concurrent file edits under distinct filenames.
+			if _, resolveErr := r.runner.Run(ctx, "git", "annex", "resolvemerge"); resolveErr != nil {
+				if _, abortErr := r.runner.Run(ctx, "git", "merge", "--abort"); abortErr != nil {
+					return errors.Join(mergeErr, resolveErr, fmt.Errorf("abort conflicting inbox merge: %w", abortErr))
+				}
+				return errors.Join(mergeErr, resolveErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(r.Config.Repository, ".git", "MERGE_HEAD")); statErr == nil {
+				if _, commitErr := r.runner.Run(ctx, "git", "commit", "--no-edit"); commitErr != nil {
+					return fmt.Errorf("commit resolved inbox merge: %w", commitErr)
+				}
+			} else if !os.IsNotExist(statErr) {
+				return statErr
+			}
 		}
 	}
 	_, err = r.runner.Run(ctx, "git", "-c", "merge.renames=false", "annex", "sync", "--no-content", "--no-pull", "--no-push")
