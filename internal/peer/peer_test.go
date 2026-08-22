@@ -96,6 +96,22 @@ func TestReachableOffersDropsStaleAdvertisements(t *testing.T) {
 	}
 }
 
+func TestValidatePairingMembershipRejectsAdminClaim(t *testing.T) {
+	filesystemID := strings.Repeat("a", 40)
+	private, draft, err := newMembershipDraft(filepath.Join(t.TempDir(), "draft"), filesystemID, "joining-peer", "joining", 7843)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft.Payload.Role = "admin"
+	draft, err = membership.Sign(draft.Payload, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePairingMembership(draft, filesystemID, "joining-peer", "joining"); err == nil {
+		t.Fatal("pairing accepted an administrator role claim")
+	}
+}
+
 func TestMDNSHostname(t *testing.T) {
 	for input, expected := range map[string]string{
 		"cachyos":     "cachyos.local.",

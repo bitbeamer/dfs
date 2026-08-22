@@ -59,6 +59,15 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	}
 	serverKey, serverRecord := managedTestRecord(t, serverRepo, filesystemID, "quic://127.0.0.1:1")
 	clientKey, clientRecord := managedTestRecord(t, clientRepo, filesystemID, "quic://127.0.0.1:1")
+	clientRecord.Payload.Role = "member"
+	clientRecord, err = membership.Sign(clientRecord.Payload, clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRecord, err = membership.Approve(clientRecord, serverRepo.Config.PeerID, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, repo := range []*repository.Repository{serverRepo, clientRepo} {
 		for _, record := range []membership.Record{serverRecord, clientRecord} {
 			if err := membership.Save(repo.Config.Repository, record); err != nil {
@@ -67,6 +76,9 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 			if err := membership.Trust(repo.Config.Repository, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
 				t.Fatal(err)
 			}
+		}
+		if err := membership.TrustBootstrapAdmin(repo.Config.Repository, serverRecord); err != nil {
+			t.Fatal(err)
 		}
 	}
 	payload := []byte("managed content over quic\n")
@@ -444,6 +456,59 @@ func TestMutuallyAuthenticatedQUICDiagnosticAndContent(t *testing.T) {
 	}
 	if _, err := os.Stat(rsyncMarker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("offline QUIC content fetch invoked rsync: %v", err)
+	}
+}
+
+func TestManagedReceiveGuardRejectsControlRefRewrites(t *testing.T) {
+	repositoryPath := t.TempDir()
+	run := func(input string, args ...string) ([]byte, error) {
+		command := exec.Command("git", args...)
+		command.Dir = repositoryPath
+		command.Stdin = strings.NewReader(input)
+		return command.CombinedOutput()
+	}
+	if output, err := run("", "init", "-b", "main"); err != nil {
+		t.Fatalf("init: %v\n%s", err, output)
+	}
+	if _, err := run("", "config", "user.name", "Guard Test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("", "config", "user.email", "guard@example.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repositoryPath, "value"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run("", "add", "value"); err != nil {
+		t.Fatalf("add: %v\n%s", err, output)
+	}
+	if output, err := run("", "commit", "-m", "one"); err != nil {
+		t.Fatalf("commit: %v\n%s", err, output)
+	}
+	oldBytes, _ := run("", "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repositoryPath, "value"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run("", "commit", "-am", "two"); err != nil {
+		t.Fatal(err)
+	}
+	newBytes, _ := run("", "rev-parse", "HEAD")
+	oldID, newID := strings.TrimSpace(string(oldBytes)), strings.TrimSpace(string(newBytes))
+	if err := installReceiveGuard(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	hook := filepath.Join(repositoryPath, ".git", "dfs", "managed-hooks", "pre-receive")
+	command := exec.Command(hook)
+	command.Dir = repositoryPath
+	command.Stdin = strings.NewReader(newID + " " + oldID + " refs/heads/dfs-membership\n")
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "cannot be rewound") {
+		t.Fatalf("rewind result = %v, %q", err, output)
+	}
+	command = exec.Command(hook)
+	command.Dir = repositoryPath
+	command.Stdin = strings.NewReader(newID + " " + strings.Repeat("0", 40) + " refs/heads/dfs-pins\n")
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "cannot be deleted") {
+		t.Fatalf("delete result = %v, %q", err, output)
 	}
 }
 

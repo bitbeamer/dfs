@@ -537,8 +537,11 @@ func (t *writeTransaction) Commit(ctx context.Context) error {
 		return syncDirectory(filepath.Dir(t.destination))
 	})
 	if err != nil {
-		_ = os.Remove(t.file.Name())
-		err = classify("commit", t.path, err)
+		publishErr := err
+		if quarantineErr := t.quarantine(); quarantineErr != nil {
+			publishErr = errors.Join(publishErr, fmt.Errorf("quarantine staged write: %w", quarantineErr))
+		}
+		err = classify("commit", t.path, publishErr)
 	} else if t.service.repo.Store != nil {
 		if info, statErr := os.Stat(t.destination); statErr != nil {
 			err = classify("commit metadata", t.path, statErr)
@@ -566,6 +569,21 @@ func (t *writeTransaction) Commit(ctx context.Context) error {
 		t.service.events.publish("write", t.operationID, t.path)
 	}
 	return err
+}
+
+func (t *writeTransaction) quarantine() error {
+	directory := filepath.Join(t.service.root, ".git", "dfs", "recovery", time.Now().UTC().Format("20060102T150405.000000000Z"), "writes")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	destination := filepath.Join(directory, filepath.Base(t.file.Name()))
+	if err := os.Rename(t.file.Name(), destination); err != nil {
+		return err
+	}
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(t.file.Name()))
 }
 
 func (t *writeTransaction) Abort(context.Context) error {

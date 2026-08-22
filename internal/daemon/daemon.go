@@ -74,7 +74,13 @@ func Run(repo *repository.Repository, options Options) (runErr error) {
 			if receiveErr != nil {
 				return
 			}
-			if reason != "" {
+			switch reason {
+			case wakeup.WriterBegin:
+				scheduler.BeginWrite()
+			case wakeup.WriterEnd:
+				scheduler.EndWrite()
+			case "":
+			default:
 				scheduler.Notify(reason)
 			}
 		}

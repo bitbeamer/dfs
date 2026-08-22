@@ -32,7 +32,7 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 		}
 		if payload.FileSystemID == filesystemID && payload.Name == repo.Config.Name && payload.Hostname == hostname &&
 			payload.QUICEndpoint == quicEndpoint && membership.VerifySelf(existing) == nil {
-			if err := membership.Trust(repo.Config.Repository, payload.PeerID, payload.SigningPublicKey); err != nil {
+			if err := membership.TrustBootstrapAdmin(repo.Config.Repository, existing); err != nil {
 				return nil, membership.Record{}, err
 			}
 			return private, existing, nil
@@ -53,7 +53,7 @@ func ensureLocalMembership(ctx context.Context, repo *repository.Repository, fil
 	if err := membership.Save(repo.Config.Repository, record); err != nil {
 		return nil, membership.Record{}, err
 	}
-	if err := membership.Trust(repo.Config.Repository, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
+	if err := membership.TrustBootstrapAdmin(repo.Config.Repository, record); err != nil {
 		return nil, membership.Record{}, err
 	}
 	return private, record, nil
@@ -87,6 +87,9 @@ func validatePairingMembership(record membership.Record, filesystemID, peerID, n
 	payload := record.Payload
 	if payload.FileSystemID != filesystemID || payload.PeerID != peerID || payload.Name != strings.TrimSpace(name) {
 		return errors.New("pairing membership does not match the authenticated peer")
+	}
+	if payload.Role != "member" {
+		return errors.New("new peers must request the member role")
 	}
 	if !strings.HasPrefix(payload.QUICEndpoint, "quic://") {
 		return errors.New("pairing membership has an invalid QUIC endpoint")

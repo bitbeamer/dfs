@@ -34,6 +34,22 @@ type blockingCommitTransaction struct {
 	finish  chan struct{}
 }
 
+type blockingBeginAPI struct {
+	core.API
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a blockingBeginAPI) BeginWrite(ctx context.Context, request core.WriteRequest) (core.WriteTransaction, error) {
+	close(a.started)
+	select {
+	case <-a.release:
+		return a.API.BeginWrite(ctx, request)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (t *blockingCommitTransaction) Commit(ctx context.Context) error {
 	close(t.started)
 	select {
@@ -190,6 +206,45 @@ func TestSlowWriteCommitDoesNotBlockUnrelatedDirectoryReads(t *testing.T) {
 	case <-released:
 	case <-time.After(time.Second):
 		t.Fatal("write release did not complete")
+	}
+}
+
+func TestSlowBeginWriteDoesNotHoldGlobalSessionLock(t *testing.T) {
+	root := t.TempDir()
+	filesystem, _, service := testFileSystem(t, root)
+	if err := os.WriteFile(filepath.Join(root, "existing.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	filesystem.core = blockingBeginAPI{API: service, started: started, release: release}
+	opened := make(chan fuse.Status, 1)
+	go func() {
+		_, status := filesystem.Open("existing.txt", syscall.O_RDWR, nil)
+		opened <- status
+	}()
+	<-started
+	readDone := make(chan fuse.Status, 1)
+	go func() {
+		_, status := filesystem.GetAttr("other.txt", nil)
+		readDone <- status
+	}()
+	select {
+	case status := <-readDone:
+		if status != fuse.ENOENT {
+			t.Fatalf("unrelated lookup status = %v", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow BeginWrite held the global write-session lock")
+	}
+	close(release)
+	select {
+	case status := <-opened:
+		if status != fuse.OK {
+			t.Fatal(status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write open did not finish")
 	}
 }
 

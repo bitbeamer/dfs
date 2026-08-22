@@ -29,6 +29,7 @@ const (
 	ConfigRef            = "refs/heads/dfs-config"
 	privateKeyFile       = "membership-key.pem"
 	trustedMembersFile   = "trusted-members.json"
+	bootstrapAdminsFile  = "bootstrap-admins.json"
 	revokedMembersFile   = "revoked-members.json"
 	membersPrefix        = "members/"
 	revocationsPrefix    = "revocations/"
@@ -233,9 +234,13 @@ func SetPinPolicy(repositoryPath, filesystemID, peerID, path string, pinned bool
 }
 
 func LoadPinPolicies(repositoryPath, filesystemID string) ([]PinPolicy, error) {
-	trusted, err := LoadTrusted(repositoryPath)
+	records, err := Accepted(repositoryPath, filesystemID)
 	if err != nil {
 		return nil, err
+	}
+	trusted := make(map[string]string, len(records))
+	for _, record := range records {
+		trusted[record.Payload.PeerID] = record.Payload.SigningPublicKey
 	}
 	files, err := loadSharedPrefix(repositoryPath, PinRef, pinsPrefix)
 	if err != nil {
@@ -557,6 +562,7 @@ func TrustStateVersion(repositoryPath string) (string, error) {
 		filepath.Join(repositoryPath, ".git", "refs", "heads", "dfs-membership"),
 		filepath.Join(repositoryPath, ".git", "packed-refs"),
 		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), trustedMembersFile),
+		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), bootstrapAdminsFile),
 		filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), revokedMembersFile),
 	}
 	hash := sha256.New()
@@ -588,8 +594,8 @@ func IsRevoked(repositoryPath, peerID string) (bool, error) {
 }
 
 // Accepted returns the non-revoked records whose approval chain reaches a
-// locally trusted peer. Newly accepted peers are persisted as trust anchors so
-// offline reconciliation does not depend on record ordering.
+// locally pinned, self-approved bootstrap administrator. Every subsequent
+// admission and role change must be approved by an accepted administrator.
 func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]Record, error) {
 	for _, peerID := range legacyPeerIDs {
 		if err := Trust(repositoryPath, peerID, ""); err != nil {
@@ -610,7 +616,6 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 			byID[record.Payload.PeerID] = record
 		}
 	}
-	changed := true
 	for id, key := range trusted {
 		if key == "" {
 			if record, ok := byID[id]; ok {
@@ -618,20 +623,28 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 			}
 		}
 	}
-	for changed {
-		changed = false
+	bootstrap, err := loadBootstrapAdmins(repositoryPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(bootstrap) == 0 {
+		// One-time migration for repositories created before bootstrap roots
+		// were stored separately. Only a pinned generation-one administrator
+		// with a valid self-approval can seed the authority chain.
 		for id, record := range byID {
-			if trusted[id] != "" || trusted[record.ApprovedBy] == "" {
-				continue
+			if trusted[id] == record.Payload.SigningPublicKey && record.Payload.Generation == 1 &&
+				record.Payload.Role == "admin" && record.ApprovedBy == id && VerifyApproval(record, record) == nil {
+				bootstrap[id] = record.Payload.SigningPublicKey
 			}
-			approver, ok := byID[record.ApprovedBy]
-			if ok && approver.Payload.SigningPublicKey == trusted[record.ApprovedBy] && VerifyApproval(record, approver) == nil {
-				trusted[id] = record.Payload.SigningPublicKey
-				changed = true
+		}
+		if len(bootstrap) > 0 {
+			if err := saveBootstrapAdmins(repositoryPath, bootstrap); err != nil {
+				return nil, err
 			}
 		}
 	}
-	revoked, err := acceptedRevocations(repositoryPath, filesystemID, byID, trusted)
+	authorized := authorizeRecords(byID, bootstrap, nil)
+	revoked, err := acceptedRevocations(repositoryPath, filesystemID, byID, authorized)
 	if err != nil {
 		return nil, err
 	}
@@ -652,13 +665,14 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 		}
 	}
 	revoked = persistedRevoked
+	authorized = authorizeRecords(byID, bootstrap, revoked)
 	var accepted []Record
-	for id, key := range trusted {
+	for id, key := range authorized {
 		if record, ok := byID[id]; ok && record.Payload.SigningPublicKey == key && !record.Payload.Revoked && !revoked[id] {
 			accepted = append(accepted, record)
 		}
 	}
-	for id, key := range trusted {
+	for id, key := range authorized {
 		if key != "" {
 			if err := Trust(repositoryPath, id, key); err != nil {
 				return nil, err
@@ -667,6 +681,88 @@ func Accepted(repositoryPath, filesystemID string, legacyPeerIDs ...string) ([]R
 	}
 	sort.Slice(accepted, func(i, j int) bool { return accepted[i].Payload.PeerID < accepted[j].Payload.PeerID })
 	return accepted, nil
+}
+
+// TrustBootstrapAdmin pins an administrator delivered through an authenticated
+// bootstrap path, such as initial filesystem creation or pairing. The local pin
+// is the root of the later signed approval chain.
+func TrustBootstrapAdmin(repositoryPath string, record Record) error {
+	if err := VerifySelf(record); err != nil {
+		return err
+	}
+	if record.Payload.Role != "admin" {
+		return errors.New("bootstrap membership is not an administrator")
+	}
+	if err := Trust(repositoryPath, record.Payload.PeerID, record.Payload.SigningPublicKey); err != nil {
+		return err
+	}
+	bootstrap, err := loadBootstrapAdmins(repositoryPath)
+	if err != nil {
+		return err
+	}
+	if key := bootstrap[record.Payload.PeerID]; key != "" && key != record.Payload.SigningPublicKey {
+		return errors.New("bootstrap administrator key replacement was rejected")
+	}
+	bootstrap[record.Payload.PeerID] = record.Payload.SigningPublicKey
+	return saveBootstrapAdmins(repositoryPath, bootstrap)
+}
+
+func authorizeRecords(byID map[string]Record, bootstrap map[string]string, revoked map[string]bool) map[string]string {
+	authorized := make(map[string]string)
+	for id, key := range bootstrap {
+		record, ok := byID[id]
+		if !ok || key == "" || record.Payload.SigningPublicKey != key || record.Payload.Role != "admin" ||
+			revoked[id] || VerifySelf(record) != nil {
+			continue
+		}
+		authorized[id] = key
+	}
+	for changed := true; changed; {
+		changed = false
+		for id, record := range byID {
+			if authorized[id] != "" || revoked[id] || revoked[record.ApprovedBy] {
+				continue
+			}
+			approver, ok := byID[record.ApprovedBy]
+			if !ok || approver.Payload.Role != "admin" || approver.Payload.SigningPublicKey != authorized[record.ApprovedBy] {
+				continue
+			}
+			if VerifyApproval(record, approver) == nil {
+				authorized[id] = record.Payload.SigningPublicKey
+				changed = true
+			}
+		}
+	}
+	return authorized
+}
+
+func loadBootstrapAdmins(repositoryPath string) (map[string]string, error) {
+	path := filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), bootstrapAdminsFile)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]string), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func saveBootstrapAdmins(repositoryPath string, roots map[string]string) error {
+	data, err := json.MarshalIndent(roots, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	path := filepath.Join(repositoryPath, filepath.FromSlash(config.Directory), bootstrapAdminsFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return replacePrivateFile(path, data)
 }
 
 // CurrentMachines collapses accepted records left behind by peer reinstalls to

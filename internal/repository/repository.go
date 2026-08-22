@@ -545,8 +545,49 @@ func (r *Repository) CheckConsistency(ctx context.Context) error {
 	return nil
 }
 
+// RecoverWorkTree runs startup recovery and the follow-up Git repair as one
+// cross-process critical section, so recovery never quarantines locks or annex
+// state belonging to a live daemon operation.
+func (r *Repository) RecoverWorkTree(ctx context.Context, prepare func() error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	unlock, err := r.lockWorkTreeProcess(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := prepare(); err != nil {
+		return err
+	}
+	if err := r.repairLegacyPrivateStateLocked(ctx); err != nil {
+		return fmt.Errorf("remove legacy DFS state from Git: %w", err)
+	}
+	if _, err := r.commitPendingLocked(ctx, "Recover interrupted DFS update"); err != nil {
+		return fmt.Errorf("finish pending repository update: %w", err)
+	}
+	if _, err := r.runner.Run(ctx, "git", "fsck", "--no-dangling"); err != nil {
+		return err
+	}
+	if _, err := r.runner.Run(ctx, "git", "annex", "fsck", "--fast"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *Repository) commitPendingLocked(ctx context.Context, message string) (bool, error) {
 	if err := r.repairLegacyPrivateStateLocked(ctx); err != nil {
+		return false, err
+	}
+	unmerged, err := r.runner.Run(ctx, "git", "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(unmerged) != "" {
+		return false, fmt.Errorf("refuse to commit with unresolved merge conflicts: %s", strings.Join(strings.Fields(unmerged), ", "))
+	}
+	if _, err := os.Stat(filepath.Join(r.Config.Repository, ".git", "MERGE_HEAD")); err == nil {
+		return false, errors.New("refuse to commit while a merge is in progress")
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
 	// git-annex handles new and modified user files. Git then records deletions,
@@ -653,8 +694,22 @@ func (r *Repository) ApplyReceived(ctx context.Context) error {
 		return err
 	}
 	for _, ref := range strings.Fields(refs) {
-		if _, err := r.runner.Run(ctx, "git", "-c", "merge.renames=false", "merge", "--no-edit", ref); err != nil {
-			return err
+		if _, mergeErr := r.runner.Run(ctx, "git", "-c", "merge.renames=false", "merge", "--no-edit", ref); mergeErr != nil {
+			// Resolve the active merge before any later commit path can observe it.
+			// git-annex retains concurrent file edits under distinct filenames.
+			if _, resolveErr := r.runner.Run(ctx, "git", "annex", "resolvemerge"); resolveErr != nil {
+				if _, abortErr := r.runner.Run(ctx, "git", "merge", "--abort"); abortErr != nil {
+					return errors.Join(mergeErr, resolveErr, fmt.Errorf("abort conflicting inbox merge: %w", abortErr))
+				}
+				return errors.Join(mergeErr, resolveErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(r.Config.Repository, ".git", "MERGE_HEAD")); statErr == nil {
+				if _, commitErr := r.runner.Run(ctx, "git", "commit", "--no-edit"); commitErr != nil {
+					return fmt.Errorf("commit resolved inbox merge: %w", commitErr)
+				}
+			} else if !os.IsNotExist(statErr) {
+				return statErr
+			}
 		}
 	}
 	_, err = r.runner.Run(ctx, "git", "-c", "merge.renames=false", "annex", "sync", "--no-content", "--no-pull", "--no-push")

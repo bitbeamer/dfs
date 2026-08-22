@@ -69,6 +69,16 @@ func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
 	if err := SaveRevocation(shared, revocation); err != nil {
 		t.Fatal(err)
 	}
+	policy := PinPolicy{Version: Version, FileSystemID: filesystemID, Path: "shared", Pinned: true,
+		Generation: 1, UpdatedAt: time.Now().UTC(), IssuedBy: "bob-peer"}
+	policy.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(bobKey, pinPolicyBytes(policy)))
+	data, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePinPolicyFile(shared, pinPolicyPath(policy.Path), data); err != nil {
+		t.Fatal(err)
+	}
 	accepted, err = Accepted(shared, filesystemID)
 	if err != nil {
 		t.Fatal(err)
@@ -76,12 +86,94 @@ func TestAcceptedFollowsSignedApprovalChain(t *testing.T) {
 	if len(accepted) != 1 || accepted[0].Payload.PeerID != "alice-peer" {
 		t.Fatalf("membership after revocation = %#v", accepted)
 	}
+	if policies, err := LoadPinPolicies(shared, filesystemID); err != nil || len(policies) != 0 {
+		t.Fatalf("revoked issuer pin policies = %#v, %v", policies, err)
+	}
 	if err := removeSharedFile(shared, revocationsPrefix+"bob-peer.json"); err != nil {
 		t.Fatal(err)
 	}
 	accepted, err = Accepted(shared, filesystemID)
 	if err != nil || len(accepted) != 1 || accepted[0].Payload.PeerID != "alice-peer" {
 		t.Fatalf("locally persisted revocation was undone: %#v, %v", accepted, err)
+	}
+}
+
+func TestAcceptedRequiresAdministratorForAdmissionsAndRoleChanges(t *testing.T) {
+	repositoryPath := gitMembershipRepository(t)
+	filesystemID := strings.Repeat("b", 40)
+	adminKey, adminPublic, _ := EnsureKey(t.TempDir())
+	memberKey, memberPublic, _ := EnsureKey(t.TempDir())
+	joinerKey, joinerPublic, _ := EnsureKey(t.TempDir())
+
+	admin := signedTestRecord(t, filesystemID, "admin-peer", "admin", adminPublic, adminKey)
+	admin, _ = Approve(admin, "admin-peer", adminKey)
+	member := signedTestRecord(t, filesystemID, "member-peer", "member", memberPublic, memberKey)
+	member, _ = Approve(member, "admin-peer", adminKey)
+	joiner := signedTestRecord(t, filesystemID, "joiner-peer", "member", joinerPublic, joinerKey)
+	joiner, _ = Approve(joiner, "member-peer", memberKey)
+	for _, record := range []Record{admin, member, joiner} {
+		if err := Save(repositoryPath, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Trust(repositoryPath, admin.Payload.PeerID, adminPublic); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := Accepted(repositoryPath, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 2 {
+		t.Fatalf("non-admin admission accepted: %#v", accepted)
+	}
+
+	escalated := signedTestRecord(t, filesystemID, "member-peer", "admin", memberPublic, memberKey)
+	escalated.Payload.Generation = 2
+	escalated.Payload.UpdatedAt = time.Now().UTC().Add(time.Second)
+	escalated, _ = Sign(escalated.Payload, memberKey)
+	escalated, _ = Approve(escalated, "member-peer", memberKey)
+	if err := Save(repositoryPath, escalated); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err = Accepted(repositoryPath, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 1 || accepted[0].Payload.PeerID != "admin-peer" {
+		t.Fatalf("self-approved role escalation accepted: %#v", accepted)
+	}
+}
+
+func TestRevokedApproverCannotKeepAdmissionChainAlive(t *testing.T) {
+	repositoryPath := gitMembershipRepository(t)
+	filesystemID := strings.Repeat("c", 40)
+	rootKey, rootPublic, _ := EnsureKey(t.TempDir())
+	adminKey, adminPublic, _ := EnsureKey(t.TempDir())
+	memberKey, memberPublic, _ := EnsureKey(t.TempDir())
+	root := signedTestRecord(t, filesystemID, "root-peer", "admin", rootPublic, rootKey)
+	root, _ = Approve(root, "root-peer", rootKey)
+	admin := signedTestRecord(t, filesystemID, "other-admin", "admin", adminPublic, adminKey)
+	admin, _ = Approve(admin, "root-peer", rootKey)
+	member := signedTestRecord(t, filesystemID, "member-peer", "member", memberPublic, memberKey)
+	member, _ = Approve(member, "other-admin", adminKey)
+	for _, record := range []Record{root, admin, member} {
+		if err := Save(repositoryPath, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Trust(repositoryPath, root.Payload.PeerID, rootPublic); err != nil {
+		t.Fatal(err)
+	}
+	revocation, _ := Revoke(filesystemID, admin.Payload.PeerID, root.Payload.PeerID, 2, rootKey)
+	if err := SaveRevocation(repositoryPath, revocation); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := Accepted(repositoryPath, filesystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 1 || accepted[0].Payload.PeerID != "root-peer" {
+		t.Fatalf("revoked approver chain remained accepted: %#v", accepted)
 	}
 }
 

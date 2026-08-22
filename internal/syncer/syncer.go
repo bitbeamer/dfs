@@ -21,19 +21,22 @@ const (
 )
 
 type Scheduler struct {
-	repo      *repository.Repository
-	interval  time.Duration
-	logger    *slog.Logger
-	events    chan string
-	stop      chan struct{}
-	done      chan struct{}
-	once      sync.Once
-	writers   atomic.Int64
-	activeMu  sync.Mutex
-	active    string
-	cancel    context.CancelFunc
-	entries   EntryInvalidator
-	reconcile func(context.Context) error
+	repo           *repository.Repository
+	interval       time.Duration
+	logger         *slog.Logger
+	events         chan string
+	stop           chan struct{}
+	done           chan struct{}
+	once           sync.Once
+	writers        atomic.Int64
+	activeMu       sync.Mutex
+	active         string
+	cancel         context.CancelFunc
+	entries        EntryInvalidator
+	reconcile      func(context.Context) error
+	syncOverride   func(string)
+	deferredMu     sync.Mutex
+	deferredReason string
 }
 
 type EntryInvalidator interface {
@@ -135,6 +138,15 @@ func (s *Scheduler) EndWrite() {
 		writers = 0
 	}
 	s.logger.Debug("writer closed", "open_writers", writers)
+	if writers == 0 {
+		s.deferredMu.Lock()
+		reason := s.deferredReason
+		s.deferredReason = ""
+		s.deferredMu.Unlock()
+		if reason != "" {
+			s.Notify(reason)
+		}
+	}
 }
 
 func (s *Scheduler) loop() {
@@ -150,12 +162,22 @@ func (s *Scheduler) loop() {
 			if debounce != nil {
 				debounce.Stop()
 			}
-			s.sync("shutdown")
 			s.logger.Info("sync scheduler stopped")
 			return
 		case <-ticker.C:
-			if debounceC == nil {
-				s.sync("periodic")
+			if debounceC != nil {
+				if !debounce.Stop() {
+					select {
+					case <-debounce.C:
+					default:
+					}
+				}
+				debounceC = nil
+				pendingReason = mergeReasons(pendingReason, "periodic")
+				s.runSync(pendingReason)
+				pendingReason = ""
+			} else {
+				s.runSync("periodic")
 			}
 		case reason := <-s.events:
 			if debounceC == nil {
@@ -163,30 +185,38 @@ func (s *Scheduler) loop() {
 			} else {
 				pendingReason = mergeReasons(pendingReason, reason)
 			}
+			if debounceC != nil {
+				continue
+			}
 			if debounce == nil {
 				debounce = time.NewTimer(eventDebounce)
 			} else {
-				if !debounce.Stop() {
-					select {
-					case <-debounce.C:
-					default:
-					}
-				}
 				debounce.Reset(eventDebounce)
 			}
 			debounceC = debounce.C
 		case <-debounceC:
 			debounceC = nil
-			s.sync(pendingReason)
+			s.runSync(pendingReason)
 			pendingReason = ""
 		}
 	}
 }
 
+func (s *Scheduler) runSync(reason string) {
+	if s.syncOverride != nil {
+		s.syncOverride(reason)
+		return
+	}
+	s.sync(reason)
+}
+
 func (s *Scheduler) sync(reason string) {
 	writers := s.writers.Load()
-	if writers > 0 {
+	if writers > 0 && requiresWriterDrain(reason) {
 		s.logger.Debug("automatic sync skipped", "reason", reason, "open_writers", writers)
+		s.deferredMu.Lock()
+		s.deferredReason = mergeReasons(s.deferredReason, reason)
+		s.deferredMu.Unlock()
 		return
 	}
 	started := time.Now()
@@ -302,6 +332,15 @@ func (s *Scheduler) sync(reason string) {
 			"pins_refreshed", refreshed,
 			"files_evicted", len(dropped),
 		)
+	}
+}
+
+func requiresWriterDrain(reason string) bool {
+	switch reason {
+	case "managed Git receive", receiveAndPublishReason, maintenanceReceiveReason, "startup", "periodic", "shutdown":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -149,30 +149,26 @@ func recoverStartup(ctx context.Context, repo *repository.Repository, mountpoint
 		}
 		run.logger.Warn("abrupt prior mount detected", "recovery_directory", run.batch)
 	}
-	if err := run.recoverWrites(); err != nil {
+	if err := repo.RecoverWorkTree(ctx, func() error {
+		if err := run.recoverWrites(); err != nil {
+			return err
+		}
+		if err := run.quarantineGitLocks(); err != nil {
+			return err
+		}
+		if err := run.quarantineAnnexTemps(); err != nil {
+			return err
+		}
+		operation, err := run.snapshotIncompleteGitOperation()
+		if err != nil {
+			return err
+		}
+		if operation != "" {
+			return fmt.Errorf("incomplete Git operation %s was preserved in %s; resolve or abort it before mounting", operation, run.batch)
+		}
+		return nil
+	}); err != nil {
 		return fail(err)
-	}
-	if err := run.quarantineGitLocks(); err != nil {
-		return fail(err)
-	}
-	if err := run.quarantineAnnexTemps(); err != nil {
-		return fail(err)
-	}
-	if err := repo.RepairLegacyPrivateState(ctx); err != nil {
-		return fail(fmt.Errorf("remove legacy DFS state from Git: %w", err))
-	}
-	operation, err := run.snapshotIncompleteGitOperation()
-	if err != nil {
-		return fail(err)
-	}
-	if operation != "" {
-		return fail(fmt.Errorf("incomplete Git operation %s was preserved in %s; resolve or abort it before mounting", operation, run.batch))
-	}
-	if _, err := repo.CommitPending(ctx, "Recover interrupted DFS update"); err != nil {
-		return fail(fmt.Errorf("finish pending repository update: %w", err))
-	}
-	if err := repo.CheckConsistency(ctx); err != nil {
-		return fail(fmt.Errorf("repository consistency check failed: %w", err))
 	}
 	if run.quarantined > 0 {
 		run.logger.Warn("startup recovery completed", "quarantined", run.quarantined, "directory", run.batch)

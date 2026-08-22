@@ -12,6 +12,11 @@ import (
 	"strings"
 )
 
+const (
+	WriterBegin = "dfs-internal:writer-begin"
+	WriterEnd   = "dfs-internal:writer-end"
+)
+
 type Listener struct {
 	connection *net.UnixConn
 	path       string

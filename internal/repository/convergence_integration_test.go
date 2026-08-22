@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -142,6 +143,65 @@ func TestTwoPeerConcurrentChangesConverge(t *testing.T) {
 		assertPeerContents(t, ctx, linux, paths, append([]string(nil), wantContents...))
 		assertPeerContents(t, ctx, mac, paths, append([]string(nil), wantContents...))
 	})
+}
+
+func TestApplyReceivedRetainsBothConflictingInboxEdits(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	linux, mac, ctx := newConvergencePeers(t, "inbox.txt", "baseline\n")
+	writePeerFile(t, ctx, linux, "inbox.txt", "linux edit\n")
+	writePeerFile(t, ctx, mac, "inbox.txt", "mac edit\n")
+	commitPeerChange(t, ctx, linux)
+	commitPeerChange(t, ctx, mac)
+	wantKeys := []string{
+		gitOutput(t, ctx, linux, "show", "HEAD:inbox.txt"),
+		gitOutput(t, ctx, mac, "show", "HEAD:inbox.txt"),
+	}
+	inbox := "refs/heads/dfs-incoming/" + linux.Config.PeerID + "/main"
+	if _, err := mac.runner.Run(ctx, "git", "fetch", "--no-tags", linux.Config.Repository, "main:"+inbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := mac.ApplyReceived(ctx); err != nil {
+		t.Fatal(err)
+	}
+	paths := pathsForConflict(trackedPaths(t, ctx, mac), "inbox.txt")
+	if len(paths) != 2 {
+		t.Fatalf("inbox conflict paths = %q, want original and one variant", paths)
+	}
+	gotKeys := []string{
+		gitOutput(t, ctx, mac, "show", "HEAD:"+paths[0]),
+		gitOutput(t, ctx, mac, "show", "HEAD:"+paths[1]),
+	}
+	sort.Strings(gotKeys)
+	sort.Strings(wantKeys)
+	if !slices.Equal(gotKeys, wantKeys) {
+		t.Fatalf("inbox conflict keys = %q, want %q", gotKeys, wantKeys)
+	}
+}
+
+func TestCommitPendingRefusesUnresolvedMerge(t *testing.T) {
+	if _, err := exec.LookPath("git-annex"); err != nil {
+		t.Skip("git-annex is not installed")
+	}
+	first, second, ctx := newConvergencePeers(t, "conflict.txt", "baseline\n")
+	writePeerFile(t, ctx, first, "conflict.txt", "first edit\n")
+	writePeerFile(t, ctx, second, "conflict.txt", "second edit\n")
+	commitPeerChange(t, ctx, first)
+	commitPeerChange(t, ctx, second)
+	other := "refs/heads/test-conflicting-peer"
+	if _, err := second.runner.Run(ctx, "git", "fetch", "--no-tags", first.Config.Repository, "main:"+other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.runner.Run(ctx, "git", "merge", "--no-edit", other); err == nil {
+		t.Fatal("conflicting merge unexpectedly succeeded")
+	}
+	if _, err := second.CommitPending(ctx, "must not resolve conflict"); err == nil {
+		t.Fatal("CommitPending accepted an unresolved merge")
+	}
+	if _, err := os.Stat(filepath.Join(second.Config.Repository, ".git", "MERGE_HEAD")); err != nil {
+		t.Fatalf("CommitPending destroyed merge evidence: %v", err)
+	}
 }
 
 func newConvergencePeers(t *testing.T, path, content string) (*Repository, *Repository, context.Context) {

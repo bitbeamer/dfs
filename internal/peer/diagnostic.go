@@ -291,7 +291,10 @@ func CheckMesh(ctx context.Context, repo *repository.Repository, discoveryTimeou
 	if offers, discoverErr := Discover(ctx, discoveryTimeout); discoverErr == nil {
 		for _, offer := range offers {
 			if offer.FileSystemID == filesystemID && offer.PeerID != repo.Config.PeerID {
-				peers[offer.PeerID] = MeshPeer{PeerID: offer.PeerID, PeerName: offer.PeerName, Online: true}
+				if member, accepted := peers[offer.PeerID]; accepted {
+					member.Online = true
+					peers[offer.PeerID] = member
+				}
 			}
 		}
 	}

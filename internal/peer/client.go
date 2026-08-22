@@ -211,6 +211,9 @@ func PairAndJoinWithOptions(ctx context.Context, encodedInvitation, destination,
 	if err := membership.Save(repo.Config.Repository, start.Approver); err != nil {
 		return nil, fmt.Errorf("save approving DFS membership: %w", err)
 	}
+	if err := membership.TrustBootstrapAdmin(repo.Config.Repository, start.Approver); err != nil {
+		return nil, fmt.Errorf("trust bootstrap DFS administrator: %w", err)
+	}
 	if err := membership.Save(repo.Config.Repository, start.Membership); err != nil {
 		return nil, fmt.Errorf("save local DFS membership: %w", err)
 	}
