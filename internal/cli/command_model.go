@@ -7,14 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/bitbeamer/dfs/internal/config"
 	dfsinstance "github.com/bitbeamer/dfs/internal/instance"
 	"github.com/bitbeamer/dfs/internal/managed"
 	"github.com/bitbeamer/dfs/internal/membership"
 	dfspeer "github.com/bitbeamer/dfs/internal/peer"
+	"github.com/bitbeamer/dfs/internal/repository"
 	"github.com/spf13/cobra"
 )
 
@@ -688,7 +691,162 @@ func (a *App) contentCommand() *cobra.Command {
 		a.addDryRun(child, "content "+child.Name())
 		command.AddCommand(child)
 	}
+	command.AddCommand(a.contentListCommand())
 	return command
+}
+
+func (a *App) contentListCommand() *cobra.Command {
+	var scope string
+	command := &cobra.Command{
+		Use: "list [path]", Args: cobra.MaximumNArgs(1),
+		Short: "List logical files and where their content is available",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if scope != "local" && scope != "cluster" {
+				return fmt.Errorf("unsupported scope %q; use local or cluster", scope)
+			}
+			repo, err := a.open()
+			if err != nil {
+				return err
+			}
+			defer repo.Close()
+			ctx, cancel := commandContext(cmd)
+			defer cancel()
+			filter := ""
+			if len(args) == 1 {
+				filter = strings.Trim(filepath.ToSlash(args[0]), "/")
+			}
+			var peerIDs []string
+			var storages []repository.StorageRemote
+			names := make(map[string]string)
+			if scope == "cluster" {
+				filesystemID, err := repo.FileSystemID(ctx)
+				if err != nil {
+					return err
+				}
+				records, err := membership.Accepted(repo.Config.Repository, filesystemID, repo.Config.PeerID)
+				if err != nil {
+					return err
+				}
+				for _, record := range records {
+					if record.Payload.PeerID == repo.Config.PeerID {
+						continue
+					}
+					peerIDs = append(peerIDs, record.Payload.PeerID)
+					names[record.Payload.PeerID] = record.Payload.Name
+				}
+				storages, err = repo.Storages(ctx)
+				if err != nil {
+					return err
+				}
+			}
+			files, err := repo.ContentFiles(ctx, peerIDs, storages)
+			if err != nil {
+				return err
+			}
+			listing := make([]repository.ContentFile, 0, len(files))
+			for _, file := range files {
+				if filter == "" || file.Path == filter || strings.HasPrefix(file.Path, filter+"/") {
+					listing = append(listing, file)
+				}
+			}
+			if a.output == "json" {
+				return writeJSON(a.Out, map[string]any{"files": contentListEntries(listing, names)})
+			}
+			if a.quiet {
+				return nil
+			}
+			if len(listing) == 0 {
+				if filter != "" {
+					fmt.Fprintf(a.Out, "No files match %q\n", filter)
+				} else {
+					fmt.Fprintln(a.Out, "No files in the DFS namespace")
+				}
+				return nil
+			}
+			writer := tabwriter.NewWriter(a.Out, 0, 4, 2, ' ', 0)
+			if scope == "cluster" {
+				fmt.Fprintln(writer, "PATH\tSIZE\tAVAILABLE ON")
+				for _, file := range listing {
+					fmt.Fprintf(writer, "%s\t%s\t%s\n", file.Path, config.FormatSize(file.Size), contentHoldersText(file, names, repo.Config.Name))
+				}
+				_ = writer.Flush()
+				fmt.Fprintln(a.Out, "\nAvailability reflects synced location metadata and can be stale until the next metadata sync.")
+				return nil
+			}
+			fmt.Fprintln(writer, "PATH\tSIZE\tSTATE")
+			for _, file := range listing {
+				fmt.Fprintf(writer, "%s\t%s\t%s\n", file.Path, config.FormatSize(file.Size), contentStateText(file))
+			}
+			return writer.Flush()
+		},
+	}
+	command.Flags().StringVar(&scope, "scope", "local", "listing scope: local or cluster")
+	return command
+}
+
+func contentStateText(file repository.ContentFile) string {
+	switch {
+	case file.Git:
+		return "git"
+	case file.Local:
+		return "hydrated"
+	default:
+		return "not local"
+	}
+}
+
+func contentHoldersText(file repository.ContentFile, names map[string]string, selfName string) string {
+	if file.Git {
+		return "git metadata"
+	}
+	var holders []string
+	if file.Local {
+		label := selfName
+		if label == "" {
+			label = "this peer"
+		}
+		holders = append(holders, label+" (here)")
+	}
+	for _, peerID := range file.Peers {
+		name := names[peerID]
+		if name == "" {
+			name = shortID(peerID)
+		}
+		holders = append(holders, name)
+	}
+	for _, storage := range file.Storage {
+		holders = append(holders, storage+" (storage)")
+	}
+	if len(holders) == 0 {
+		return "-"
+	}
+	return strings.Join(holders, ", ")
+}
+
+type contentListPeerJSON struct {
+	PeerID string `json:"peer_id"`
+	Name   string `json:"name,omitempty"`
+}
+
+type contentListEntryJSON struct {
+	Path    string                `json:"path"`
+	Size    int64                 `json:"size_bytes"`
+	Git     bool                  `json:"git,omitempty"`
+	Local   bool                  `json:"local"`
+	Peers   []contentListPeerJSON `json:"peers,omitempty"`
+	Storage []string              `json:"storage,omitempty"`
+}
+
+func contentListEntries(files []repository.ContentFile, names map[string]string) []contentListEntryJSON {
+	entries := make([]contentListEntryJSON, 0, len(files))
+	for _, file := range files {
+		entry := contentListEntryJSON{Path: file.Path, Size: file.Size, Git: file.Git, Local: file.Local, Storage: file.Storage}
+		for _, peerID := range file.Peers {
+			entry.Peers = append(entry.Peers, contentListPeerJSON{PeerID: peerID, Name: names[peerID]})
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func (a *App) consolidatedCacheCommand() *cobra.Command {

@@ -284,6 +284,9 @@ Control local or cluster-wide content placement explicitly:
 
 ```sh
 dfs content fetch Documents/report.pdf
+dfs content list
+dfs content list Documents
+dfs content list --scope cluster
 dfs content pin Photos/Vacation --scope local
 dfs content pin Shared/Reference --scope cluster --yes
 dfs content unpin Photos/Vacation --scope local
@@ -305,6 +308,16 @@ are independent, so removing one does not remove the other. `evict` delegates
 safety checks to git-annex and refuses to remove content protected by either
 scope. Open or pinned files and copy-safety rules can temporarily keep usage
 above the configured limit.
+
+`content list` inventories the logical namespace with each file's size and
+state: `hydrated` when the annex object is in the local cache, `not local`
+when only the namespace entry is present, and `git` for content stored in Git
+metadata itself. An optional path limits the listing to a file or directory.
+`--scope cluster` adds the recorded holders of each file—peer names, the local
+peer marked `(here)`, and durable storage—resolved from synced git-annex
+location metadata, which is advisory and can lag actual peer content until the
+next metadata sync. `--output json` emits one entry per file with `local`,
+`peers`, and `storage` fields.
 
 ### Optimize content sources
 

@@ -154,7 +154,7 @@ func TestConsolidatedPublicLeafCommands(t *testing.T) {
 		"filesystem": {"rename", "show"},
 		"service":    {"list", "repair", "restart", "show", "start", "stop", "uninstall"},
 		"peer":       {"approve", "check", "invite", "list", "optimize", "reject", "relay", "remove", "requests"},
-		"content":    {"evict", "fetch", "pin", "unpin"},
+		"content":    {"evict", "fetch", "list", "pin", "unpin"},
 		"cache":      {"limit", "prune", "show"},
 		"storage":    {"add", "copy", "enable", "list", "remove", "show"},
 		"history":    {"conflicts", "list", "restore"},
