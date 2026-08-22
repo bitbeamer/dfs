@@ -113,6 +113,25 @@ make build
 ./bin/dfs health
 ```
 
+### Published releases
+
+Maintainers publish versioned Linux and macOS archives for amd64 and arm64 by
+creating a GitHub release from `main`:
+
+```sh
+gh release create v0.1.0-alpha.1 \
+  --repo bitbeamer/dfs \
+  --target main \
+  --prerelease \
+  --generate-notes
+```
+
+Publishing the release runs the full test suite on Linux and macOS, then adds
+the four archives and their SHA-256 checksum files to that release. Extract an
+archive and run `./bin/dfs`; keep its `scripts` directory beside `bin` so that
+`dfs setup` can find the platform installer. Git, git-annex, and FUSE 3 or
+macFUSE remain runtime prerequisites.
+
 The binary uses the native Go FUSE protocol implementation and does not link
 against libfuse, but FUSE 3 or macFUSE is still required at runtime. See
 [INSTALL.md](INSTALL.md) for complete platform setup, macOS permissions,
